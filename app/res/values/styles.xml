@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#79E7C9</item>
+        <item name="android:windowBackground">#0D131A</item>
+        <item name="android:colorBackground">#17212B</item>
+        <item name="android:textColorPrimary">#EDF4F7</item>
+        <item name="android:textColorSecondary">#9BAEBC</item>
+        <item name="android:statusBarColor">#0D131A</item>
+        <item name="android:navigationBarColor">#17212B</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:alertDialogTheme">@style/AppDialog</item>
+    </style>
+    <style name="AppDialog" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#79E7C9</item>
+        <item name="android:colorBackground">#17212B</item>
+        <item name="android:windowBackground">@drawable/dialog_background</item>
+        <item name="android:windowMinWidthMinor">88%</item>
+        <item name="android:windowMinWidthMajor">70%</item>
+        <item name="android:textColorPrimary">#EDF4F7</item>
+        <item name="android:textColorSecondary">#9BAEBC</item>
+    </style>
+</resources>

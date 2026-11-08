@@ -1,0 +1,5 @@
+# 可导入 App，用于确认 TUN 和直连规则。
+mode: rule
+log-level: info
+rules:
+  - MATCH,DIRECT
