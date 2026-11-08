@@ -64,6 +64,7 @@ public final class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable poll = this::pollStatus;
     private Module.Status status;
+    private BundledModule.Info bundledModule = new BundledModule.Info("", 0, 0);
     private boolean busy;
     private boolean polling;
     private boolean visible;
@@ -80,6 +81,8 @@ public final class MainActivity extends Activity {
     private Button routingButton;
     private int routingFilter;
     private String routingQuery = "";
+    private final AppRouting.Loader routingLoader = new AppRouting.Loader();
+    private AppIconLoader routingIcons;
     private TextView proxyHint;
     private Button refreshButton;
     private Button logsButton;
@@ -96,6 +99,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        routingIcons = new AppIconLoader(this);
         LinearLayout root = column();
         root.setBackgroundColor(BG);
         root.setOnApplyWindowInsetsListener((view, insets) -> {
@@ -287,6 +291,8 @@ public final class MainActivity extends Activity {
             bar.addView(item, params);
         }
         root.addView(bar);
+        try { bundledModule = BundledModule.info(this); }
+        catch (IOException error) { showMessage("无法读取内置模块信息，现有模块仍可继续运行。"); }
         selectPage(savedInstanceState == null ? 0 : savedInstanceState.getInt("page", 0));
         render();
     }
@@ -298,6 +304,9 @@ public final class MainActivity extends Activity {
 
     @Override protected void onStart() {
         super.onStart();
+        // Permissions and installed packages may have changed while outside the app.
+        routingLoader.invalidate();
+        routingIcons.invalidate();
         visible = true;
         if (getPreferences(MODE_PRIVATE).getBoolean("connected", false)) main.post(poll);
     }
@@ -310,6 +319,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         main.removeCallbacks(poll);
+        routingIcons.close();
         worker.shutdown();
         super.onDestroy();
     }
@@ -368,7 +378,7 @@ public final class MainActivity extends Activity {
     }
 
     private void confirmInstall() {
-        new AlertDialog.Builder(this).setTitle("安装内置模块 " + appVersion())
+        new AlertDialog.Builder(this).setTitle("安装内置模块 " + bundledModule.version())
             .setMessage("通过 Root 管理器安装模块，保留已有配置。安装完成后，请手动重启手机使其生效。")
             .setNegativeButton("取消", null).setPositiveButton("安装", (dialog, which) -> {
                 showMessage("正在安装内置模块，请稍候…");
@@ -383,7 +393,7 @@ public final class MainActivity extends Activity {
         Intent picker = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         picker.setType("application/zip");
         picker.addCategory(Intent.CATEGORY_OPENABLE);
-        picker.putExtra(Intent.EXTRA_TITLE, "MinClash-Root-v" + appVersion() + ".zip");
+        picker.putExtra(Intent.EXTRA_TITLE, "MinClash-Root-v" + bundledModule.version() + ".zip");
         startActivityForResult(picker, EXPORT_MODULE);
     }
 
@@ -433,7 +443,7 @@ public final class MainActivity extends Activity {
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (request == APP_LIST_SETTINGS) {
-            loadAppRouting(false);
+            refreshAppRouting(getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
             return;
         }
         if (request == EXPORT_MODULE && result == RESULT_OK && data != null && data.getData() != null) {
@@ -661,11 +671,43 @@ public final class MainActivity extends Activity {
 
     @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(request, permissions, results);
-        if (request == REQUEST_APP_LIST) loadAppRouting(false);
+        if (request == REQUEST_APP_LIST) refreshAppRouting(getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
     }
 
     private void loadAppRouting(boolean allowRoot) {
-        execute("", () -> AppRouting.load(this, allowRoot));
+        Module.Status current = status;
+        execute("", () -> routingLoader.load(this, allowRoot, current));
+    }
+
+    private void refreshAppRouting(boolean allowRoot) {
+        routingLoader.invalidate();
+        routingIcons.invalidate();
+        loadAppRouting(allowRoot);
+    }
+
+    private void enableRootRouting() {
+        routingLoader.invalidate();
+        routingIcons.invalidate();
+        Module.Status current = status;
+        execute("", () -> {
+            AppRouting.Screen loaded = routingLoader.load(this, true, current);
+            getPreferences(MODE_PRIVATE).edit().putBoolean(ROOT_INVENTORY, true).apply();
+            return loaded;
+        });
+    }
+
+    private String iconSummary(AppRouting.Screen screen) {
+        int loaded = 0, missing = 0;
+        boolean denied = false;
+        for (AppRouting.Entry app : screen.applications()) {
+            if (!app.installed()) continue;
+            AppIconLoader.Result icon = routingIcons.get(app.packageName());
+            if (icon == null) continue;
+            if (icon.bitmap() != null) loaded++;
+            else { missing++; denied |= icon.issue().equals("permission"); }
+        }
+        return "已加载 " + loaded + " 个，按列表显示需要继续读取"
+            + (missing == 0 ? "。" : "；" + missing + " 个读取失败" + (denied ? "，存在权限拒绝。" : "。"));
     }
 
     private void showAppPermissions(AppRouting.Screen screen, AlertDialog listDialog) {
@@ -675,10 +717,12 @@ public final class MainActivity extends Activity {
                 ? "已授予（普通权限，无需弹窗）" : "未授予";
         String runtime = !InstalledAppsAccess.supportsRequest(this) ? "此系统未提供动态申请入口"
             : requestable ? "尚未授予，可点击下方申请" : "已授予";
-        String icons = screen.missingIcons() == 0 ? "已全部读取" : screen.missingIcons() + " 个图标未能读取";
+        boolean rootOption = !requestable && !screen.allowRoot() && screen.applications().stream().anyMatch(app -> {
+            AppIconLoader.Result icon = routingIcons.get(app.packageName());
+            return icon != null && icon.bitmap() == null;
+        });
         new AlertDialog.Builder(this).setTitle("应用列表与图标权限")
-            .setMessage("查询已安装应用：" + query + "\n\n系统动态权限：" + runtime + "\n\n应用图标：" + icons
-                + (screen.iconPermissionDenied() ? "，存在明确的权限拒绝。" : "。")
+            .setMessage("查询已安装应用：" + query + "\n\n系统动态权限：" + runtime + "\n\n应用图标：" + iconSummary(screen)
                 + "\n\n系统“应用权限”页主要展示可动态申请的权限，“未请求任何权限”不代表查询权限未声明。"
                 + "\n\n图标读取失败也可能是应用被隐藏、已卸载或资源不可用；这里会按实际结果提示。")
             .setNegativeButton("关闭", null)
@@ -689,10 +733,11 @@ public final class MainActivity extends Activity {
                         Uri.parse("package:" + getPackageName())), APP_LIST_SETTINGS);
                 } catch (android.content.ActivityNotFoundException error) { showMessage("无法打开系统应用设置。"); }
             })
-            .setPositiveButton(requestable ? "申请权限" : "重新读取", (dialog, which) -> {
+            .setPositiveButton(requestable ? "申请权限" : rootOption ? "用 Root 补充读取" : "重新读取", (dialog, which) -> {
                 listDialog.dismiss();
                 if (requestable) requestPermissions(new String[] {InstalledAppsAccess.RUNTIME_PERMISSION}, REQUEST_APP_LIST);
-                else loadAppRouting(getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
+                else if (rootOption) enableRootRouting();
+                else refreshAppRouting(getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
             }).show();
     }
 
@@ -711,11 +756,7 @@ public final class MainActivity extends Activity {
                             Uri.parse("package:" + getPackageName())), APP_LIST_SETTINGS);
                     } catch (android.content.ActivityNotFoundException error) { showMessage("无法打开系统应用设置。"); }
                 })
-                .setPositiveButton("用 Root 读取", (dialog, which) -> execute("", () -> {
-                    AppRouting.Screen loaded = AppRouting.load(this, true);
-                    getPreferences(MODE_PRIVATE).edit().putBoolean(ROOT_INVENTORY, true).apply();
-                    return loaded;
-                })).show();
+                .setPositiveButton("用 Root 读取", (dialog, which) -> enableRootRouting()).show();
             return;
         }
         LinearLayout content = column();
@@ -740,19 +781,16 @@ public final class MainActivity extends Activity {
             .setMessage("• 个人选择优先于订阅规则，仅在规则模式下生效。\n\n"
                 + "• 选择“跟随订阅规则”可移除个人设置。运行中保存会短暂重连。\n\n"
                 + "• “应用”显示用户安装的应用和可打开的系统应用；系统组件可在“全部”中查找。\n\n"
-                + (screen.rootInventory() ? "读取方式：普通接口优先，已使用你选择的 Root 补充读取应用或图标。" : "读取方式：系统应用查询接口。"))
+                + "• 图标按列表显示需要在后台加载，应用列表会短暂缓存；从系统设置返回后重新读取。\n\n"
+                + (screen.allowRoot() ? "读取方式：普通接口优先，必要时使用你选择的 Root 补充读取应用或图标。" : "读取方式：系统应用查询接口。"))
             .setPositiveButton("知道了", null).show());
         heading.addView(info, new LinearLayout.LayoutParams(-2, -2));
         add(content, heading, 0);
         TextView count = label("", 12, MUTED, false);
         add(content, count, 8);
-        if (screen.missingIcons() > 0) {
-            TextView warning = label(screen.iconPermissionDenied() ? "部分图标读取无权限 · 点此检查权限"
-                : "部分图标无法读取 · 点此查看权限与原因", 11, AMBER, false);
-            warning.setPadding(0, dp(6), 0, dp(6));
-            warning.setOnClickListener(view -> showAppPermissions(screen, listDialog[0]));
-            add(content, warning, 4);
-        }
+        TextView iconHint = label("图标按需加载 · 点此查看权限与读取状态", 11, MUTED, false);
+        iconHint.setOnClickListener(view -> showAppPermissions(screen, listDialog[0]));
+        add(content, iconHint, 4);
         EditText search = new EditText(this);
         search.setHint("搜索应用名称或包名");
         search.setSingleLine(true);
@@ -777,7 +815,7 @@ public final class MainActivity extends Activity {
             tabs.addView(filters[i], params);
         }
         add(content, tabs, 12);
-        RoutingAdapter adapter = new RoutingAdapter();
+        RoutingAdapter adapter = new RoutingAdapter(screen.allowRoot());
         Runnable filter = () -> {
             String query = search.getText().toString().trim().toLowerCase(Locale.ROOT);
             routingQuery = search.getText().toString();
@@ -813,6 +851,11 @@ public final class MainActivity extends Activity {
         AlertDialog dialog = new AlertDialog.Builder(this).setCustomTitle(content)
             .setAdapter(adapter, null).setNegativeButton("关闭", null).create();
         listDialog[0] = dialog;
+        routingIcons.observe(() -> {
+            iconHint.setText(iconSummary(screen));
+            adapter.notifyDataSetChanged();
+        });
+        dialog.setOnDismissListener(ignored -> routingIcons.stopObserving());
         filter.run();
         dialog.show();
         dialog.getListView().setDivider(null);
@@ -830,6 +873,9 @@ public final class MainActivity extends Activity {
 
     private final class RoutingAdapter extends BaseAdapter {
         final List<AppRouting.Entry> entries = new ArrayList<>();
+        private final boolean allowRoot;
+
+        RoutingAdapter(boolean allowRoot) { this.allowRoot = allowRoot; }
 
         @Override public int getCount() { return Math.max(1, entries.size()); }
         @Override public AppRouting.Entry getItem(int index) { return index < entries.size() ? entries.get(index) : null; }
@@ -903,14 +949,21 @@ public final class MainActivity extends Activity {
                 row.setTag(holder);
             }
             String name = app.label().isEmpty() ? app.packageName() : app.label();
-            holder.icon().setImageBitmap(app.icon());
+            AppIconLoader.Result icon = routingIcons.get(app.packageName());
+            boolean loaded = icon != null && icon.bitmap() != null;
+            if (icon == null && app.installed()) routingIcons.request(app.packageName(), allowRoot);
+            holder.icon().setImageBitmap(loaded ? icon.bitmap() : null);
             holder.icon().setContentDescription(name + "图标");
-            holder.icon().setVisibility(app.icon() == null ? View.GONE : View.VISIBLE);
-            holder.missingIcon().setVisibility(app.icon() == null ? View.VISIBLE : View.GONE);
-            holder.missingIcon().setContentDescription(app.iconIssue().equals("permission") ? "图标读取无权限" : "图标未能读取");
+            holder.icon().setVisibility(loaded ? View.VISIBLE : View.GONE);
+            holder.missingIcon().setVisibility(loaded ? View.GONE : View.VISIBLE);
+            holder.missingIcon().setText(icon == null && app.installed() ? "…" : "!");
+            holder.missingIcon().setTextColor(icon == null && app.installed() ? MUTED : AMBER);
+            boolean denied = icon != null && icon.issue().equals("permission");
+            holder.missingIcon().setContentDescription(loaded ? "" : icon == null && app.installed()
+                ? "图标正在加载" : denied ? "图标读取无权限" : "图标未能读取");
             holder.name().setText(name);
             holder.packageName().setText(!app.installed() ? "未在应用列表中找到 · " + app.packageName()
-                : app.iconIssue().equals("permission") ? "图标读取无权限 · " + app.packageName() : app.packageName());
+                : denied ? "图标读取无权限 · " + app.packageName() : app.packageName());
             holder.policy().setText(app.target().isEmpty() ? "跟随规则" : app.target().equals("DIRECT") ? "直连" : app.target());
             holder.policy().setTextColor(app.target().isEmpty() ? MUTED : MINT);
             holder.policy().setBackground(shape(app.target().isEmpty() ? 0xff2a3946 : 0xff25473e, 9, false));
@@ -940,7 +993,7 @@ public final class MainActivity extends Activity {
                 listDialog.dismiss();
                 execute("应用分流已保存。", () -> {
                     new RoutingStore(this).apply(new RoutingStore.State(screen.state().source(), rules));
-                    return AppRouting.load(this, getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
+                    return routingLoader.load(this, getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false), Module.status());
                 });
             }).show();
     }
@@ -992,6 +1045,7 @@ public final class MainActivity extends Activity {
         boolean installed = status != null && status.installed();
         boolean pending = status != null && !status.pendingVersion.isEmpty();
         boolean enabled = installed && status.enabled;
+        boolean moduleUpdate = installed && bundledModule.valid() && status.updateAvailable(bundledModule.revision());
         if (installed) {
             stateText.setText(switch (status.state) {
                 case "running" -> "TUN 运行中";
@@ -1014,7 +1068,7 @@ public final class MainActivity extends Activity {
         statusBadge.setBackground(shape(running ? 0xff203a35 : 0xff25313c, 10, false));
         String setup = pending ? "模块已安装，重启手机后生效  →"
             : status != null && !installed ? "首次使用：前往设置安装内置模块  →"
-            : installed && !status.version.equals(appVersion()) ? "内置模块 " + appVersion() + " 已就绪，前往设置安装  →" : "";
+            : moduleUpdate ? "模块有功能更新：" + bundledModule.version() + "，前往设置安装  →" : "";
         setupHint.setText(setup);
         setupHint.setVisibility(setup.isEmpty() ? View.GONE : View.VISIBLE);
         profileSummary.setText(installed && status.profile
@@ -1039,13 +1093,15 @@ public final class MainActivity extends Activity {
             : "TUN 启动后可切换模式和节点。");
         refreshButton.setEnabled(!busy);
         logsButton.setEnabled(!busy && installed);
-        moduleSummary.setText("内置版本 " + appVersion() + (pending ? "\n已提交安装，重启手机后生效。"
+        moduleSummary.setText("内置模块 " + (bundledModule.valid() ? bundledModule.version() : "信息不可用")
+            + (pending ? "\n已提交安装，重启手机后生效。"
             : installed ? "\n当前模块 " + (status.version.isEmpty() ? "版本未知" : status.version)
+                + (moduleUpdate ? "\n模块功能有更新，可按需安装。" : "\n现有模块可继续使用，无需重装。")
             : "\n无需另外下载，授权 Root 后即可安装。"));
-        installButton.setText(pending ? "等待重启" : installed && status.version.equals(appVersion())
-            ? "重新安装模块" : "安装内置模块");
-        installButton.setEnabled(!busy && !pending);
-        exportButton.setEnabled(!busy);
+        installButton.setText(pending ? "等待重启" : moduleUpdate ? "更新模块"
+            : installed ? "重新安装模块" : "安装内置模块");
+        installButton.setEnabled(!busy && !pending && bundledModule.valid());
+        exportButton.setEnabled(!busy && bundledModule.valid());
         updatingSwitch = true;
         bootSwitch.setChecked(installed && status.boot);
         bootSwitch.setEnabled(!busy && enabled);

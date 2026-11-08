@@ -26,9 +26,10 @@ final class Module {
         final boolean control;
         final String version;
         final String pendingVersion;
+        final int revision;
 
         Status(String state, boolean profile, boolean boot, boolean enabled, boolean control,
-               String version, String pendingVersion) {
+               String version, String pendingVersion, int revision) {
             this.state = state;
             this.profile = profile;
             this.boot = boot;
@@ -36,9 +37,23 @@ final class Module {
             this.control = control;
             this.version = version;
             this.pendingVersion = pendingVersion;
+            this.revision = revision;
         }
 
         boolean installed() { return !state.equals("missing"); }
+
+        int functionalRevision() {
+            if (revision > 0) return revision;
+            // These published releases differ only in version metadata, not module functionality.
+            if (control && (version.equals("0.0.1") || version.equals("0.0.2"))) return 1;
+            return 0;
+        }
+
+        boolean updateAvailable(int bundledRevision) {
+            if (!installed() || bundledRevision <= 0) return false;
+            int current = functionalRevision();
+            return current > 0 ? current < bundledRevision : !control;
+        }
     }
 
     static Status status() throws Exception {
@@ -60,6 +75,7 @@ final class Module {
         boolean control = false;
         String version = "";
         String pendingVersion = "";
+        int revision = 0;
         for (String line : output.split("\\r?\\n")) {
             if (line.startsWith("state=")) state = line.substring(6);
             if (line.equals("profile=1")) profile = true;
@@ -68,18 +84,22 @@ final class Module {
             if (line.equals("control=1")) control = true;
             if (line.startsWith("version=")) version = line.substring(8);
             if (line.startsWith("pending=")) pendingVersion = line.substring(8);
+            if (line.startsWith("revision=")) {
+                try { revision = Math.max(0, Integer.parseInt(line.substring(9))); }
+                catch (NumberFormatException ignored) { revision = 0; }
+            }
         }
         switch (state) {
             case "running", "starting", "retrying", "orphaned", "stopped", "missing" -> { }
             default -> throw new IOException("无法读取 KernelSU / Magisk 模块的状态。");
         }
-        return new Status(state, profile, boot, enabled, control, version, pendingVersion);
+        return new Status(state, profile, boot, enabled, control, version, pendingVersion, revision);
     }
 
     static String run(Command command, byte[] payload) throws Exception {
         String script = "/data/adb/modules/minclash/control.sh";
         String metadata = command == Command.STATUS
-            ? "grep '^version=' /data/adb/modules/minclash/module.prop 2>/dev/null; "
+            ? "grep -E '^(version|revision)=' /data/adb/modules/minclash/module.prop 2>/dev/null; "
                 + "if [ -f /data/adb/modules_update/minclash/module.prop ]; then "
                 + "sed -n 's/^version=/pending=/p' /data/adb/modules_update/minclash/module.prop; fi; "
                 + "if [ ! -f " + script + " ]; then echo state=missing; exit 0; fi; "

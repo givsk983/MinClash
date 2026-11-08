@@ -10,6 +10,7 @@ import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Set;
 import java.util.HashSet;
+import java.util.Arrays;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -28,23 +29,29 @@ public final class RootApps {
         PackageManager manager = context.getPackageManager();
         Method query = manager.getClass().getMethod("getInstalledApplicationsAsUser", int.class, int.class);
         List<ApplicationInfo> apps = (List<ApplicationInfo>) query.invoke(manager, 0, user);
-        Method launcherQuery = manager.getClass().getMethod("queryIntentActivitiesAsUser", Intent.class, int.class, int.class);
-        List<ResolveInfo> activities = (List<ResolveInfo>) launcherQuery.invoke(manager,
-            new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0, user);
+        boolean iconsOnly = args.length > 1 && args[1].equals("icons");
+        Set<String> requested = new HashSet<>(Arrays.asList(args).subList(Math.min(2, args.length), args.length));
         Set<String> launchers = new HashSet<>();
-        for (ResolveInfo info : activities) if (info.activityInfo != null) launchers.add(info.activityInfo.packageName);
+        if (!iconsOnly) {
+            Method launcherQuery = manager.getClass().getMethod("queryIntentActivitiesAsUser", Intent.class, int.class, int.class);
+            List<ResolveInfo> activities = (List<ResolveInfo>) launcherQuery.invoke(manager,
+                new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0, user);
+            for (ResolveInfo info : activities) if (info.activityInfo != null) launchers.add(info.activityInfo.packageName);
+        }
         JSONArray result = new JSONArray();
         int iconBytes = 0;
         for (ApplicationInfo app : apps) {
-            String label = app.packageName;
-            try { label = manager.getApplicationLabel(app).toString(); }
-            catch (RuntimeException ignored) { /* Keep the package selectable if its resources are unavailable. */ }
+            if (iconsOnly && !requested.contains(app.packageName)) continue;
             JSONObject item = new JSONObject();
             item.put("package", app.packageName);
-            item.put("label", label);
-            item.put("system", (app.flags & (ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0);
-            item.put("launchable", launchers.contains(app.packageName));
-            try {
+            if (!iconsOnly) {
+                String label = app.packageName;
+                try { label = manager.getApplicationLabel(app).toString(); }
+                catch (RuntimeException ignored) { /* Keep packages with unavailable resources selectable. */ }
+                item.put("label", label);
+                item.put("system", (app.flags & (ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0);
+                item.put("launchable", launchers.contains(app.packageName));
+            } else try {
                 String icon = AppIcons.encode(manager.getApplicationIcon(app));
                 if (iconBytes + icon.length() <= 4 * 1024 * 1024) {
                     item.put("icon", icon);

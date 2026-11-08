@@ -53,12 +53,10 @@ def jdk_tool(name):
 
 
 def build_apk(yaml_jar, apache_license, module_archive):
-    manifest = (ROOT / "app/AndroidManifest.xml").read_text(encoding="utf-8")
     properties = dict(line.split("=", 1) for line in
                       (ROOT / "module/module.prop").read_text(encoding="utf-8").splitlines() if "=" in line)
-    if f'android:versionName="{properties["version"]}"' not in manifest or \
-       f'android:versionCode="{properties["versionCode"]}"' not in manifest:
-        raise RuntimeError("App and bundled module versions must match.")
+    if not properties.get("version") or int(properties.get("versionCode", "0")) <= 0 or int(properties.get("revision", "0")) <= 0:
+        raise RuntimeError("Module version, versionCode and functional revision must be configured.")
     sdk_path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
     if not sdk_path and os.name == "nt":
         sdk_path = Path(os.environ["LOCALAPPDATA"]) / "Android" / "Sdk"
@@ -104,6 +102,8 @@ def build_apk(yaml_jar, apache_license, module_archive):
         target.write(apache_license, "assets/licenses/snakeyaml-LICENSE.txt", zipfile.ZIP_DEFLATED)
         target.write(module_archive, "assets/minclash-module.zip", zipfile.ZIP_STORED)
         target.writestr("assets/minclash-module.sha256", sha256(module_archive) + "\n")
+        target.writestr("assets/minclash-module.properties", "".join(
+            key + "=" + properties[key] + "\n" for key in ("version", "versionCode", "revision")))
 
     aligned = BUILD / "aligned.apk"
     execute(sdk_tool("zipalign"), "-f", "4", base, aligned)

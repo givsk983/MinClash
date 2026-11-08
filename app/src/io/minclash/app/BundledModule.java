@@ -8,9 +8,28 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.Properties;
 
 final class BundledModule {
     static final String ASSET = "minclash-module.zip";
+
+    record Info(String version, int versionCode, int revision) {
+        boolean valid() { return !version.isEmpty() && versionCode > 0 && revision > 0; }
+    }
+
+    static Info info(Context context) throws IOException {
+        Properties values = new Properties();
+        try (InputStream input = context.getAssets().open("minclash-module.properties")) {
+            values.load(input);
+        }
+        try {
+            Info info = new Info(values.getProperty("version", ""),
+                Integer.parseInt(values.getProperty("versionCode", "0")),
+                Integer.parseInt(values.getProperty("revision", "0")));
+            if (!info.valid()) throw new IOException("内置模块版本信息无效。");
+            return info;
+        } catch (NumberFormatException error) { throw new IOException("内置模块版本信息无效。", error); }
+    }
 
     static void copy(Context context, OutputStream output) throws IOException {
         try (InputStream input = context.getAssets().open(ASSET)) {

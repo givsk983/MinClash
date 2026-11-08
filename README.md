@@ -1,4 +1,4 @@
-# MinClash 0.0.2
+# MinClash 0.0.3
 
 MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模块和 Mihomo v1.19.33 Android ARM64 内核。发布时只需要分发 `dist/MinClash.apk`。适用于 ARM64、Android 9 及以上，且内核支持 `/dev/tun` 或 `/dev/net/tun` 的 Root 手机。
 
@@ -11,7 +11,8 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
    代理组使用卡片显示组名、当前出口链路及手动／自动状态，支持搜索。节点页高亮当前选择，可搜索节点或代理组。
 5. 在「配置 → 管理应用分流」搜索已安装的应用，选择「跟随订阅规则」「直连」或指定代理组。例如，将 Claude 指向 `US` 组后，即使机场规则将 Claude 分到 `OpenAI`，也会优先走 `US` 组当前选择的节点。应用分流只在规则模式生效；运行中保存会短暂重连。
    列表中应用名、包名和出口标签分别显示。默认「应用」显示用户安装的应用和可打开的系统应用，「已指定」查看个人设置，「全部」包含系统组件；具体生效说明和列表读取方式可在右上角「说明」查看。
-   列表显示应用的真实图标；图标不可读时显示提示和检查入口，明确区分权限拒绝与其他读取失败。右上角「权限」显示查询权限、动态授权支持情况和图标读取状态；设备支持且尚未授予的动态权限可在此申请。
+   列表先显示应用名称和包名，真实图标在后台按需加载并缓存；图标不可读时显示提示和检查入口，明确区分权限拒绝与其他读取失败。右上角「权限」显示查询权限、动态授权支持情况和已尝试读取的图标状态；尚未显示的应用图标不会误报为失败。设备支持且尚未授予的动态权限可在此申请；必要时可选择 Root 补充图标。
+   应用清单在 App 内缓存最多 60 秒，重复打开和保存时减少扫描，个人规则和代理组仍读取最新设置。从系统设置或其他 App 返回、权限申请完成或点击「重新读取」后刷新缓存。
 
 「设置」页管理开机自启、内置模块及诊断。开机自启默认开启，并在有有效配置时生效。「停止 TUN」停止当前会话；若要让下次开机也保持停止，请同时关掉自启开关。导入或更新订阅前请先停止 TUN。App 保存最近一次成功导入的订阅链接，可通过「更新当前订阅」重新下载。遇到错误时，可到「设置 → 内核日志」查看。
 
@@ -19,6 +20,7 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 - App 通过 `su` 调用固定的控制命令，配置经标准输入交给模块。模块用 `mihomo -t` 校验临时文件，再原子替换配置。App 退出后，模块继续独立运行。
 - 内置模块使用 SHA-256 校验后，通过 `ksud module install` 或 `magisk --install-module` 安装。保留 `/data/adb/minclash` 中已有的配置和日志，安装完成后提示用户重启，不自动重启设备。App 识别已安装版本和待重启的模块更新。
+- App 和模块独立更新。界面、应用分流、图标或权限等 App 功能更新不会要求重装模块。仅模块功能修订号增加或现有模块缺少必要能力时提示更新；已发布的模块 0.0.1 与 0.0.2 功能一致，都可继续使用。模块安装确认、版本展示与导出文件名均读取内置模块自己的信息。
 - `service.sh` 在 Android 完成启动后启动守护进程。守护进程监测 `minclash0`、策略路由和内核进程，故障后按 3 秒至 60 秒的间隔退避重试。停止时先发 `SIGTERM`，再检查并清理本次启动占用的规则。模块保留 `20882` 路由表及 `8800–8810` 优先级段，启动前会检查冲突。
 - 导入保留 YAML 的节点、策略组和规则。只有节点或节点提供者的 YAML 会补上默认选择组和匹配规则。模块统一使用 Mihomo `mips` TUN、自动路由和 53 端口 DNS 接管。导入配置中的额外监听、外部控制器和 NTP 设置会被移除。未填写 DNS 上游时使用 Mihomo 内置默认值。支持范围为手机本机流量。请在测试时先关闭其他 VPN 或透明代理模块，Android 的私人 DNS 也可能绕过 53 端口接管。
 - App 通过 Root 访问数据目录里的 Unix 套接字控制 Mihomo。手动切换的模式会在下次启动 TUN 时恢复。节点选择由 Mihomo 的 `profile.store-selected` 设置控制是否记忆。
@@ -30,10 +32,12 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 准备 Python 3.11 或以上、JDK 17 或以上、Android SDK Platform 36、Build Tools 36.0.0 和 NDK 27.0.12077973。通过 `ANDROID_HOME` 指定 SDK 目录，再运行 `python build.py`。如果 NDK 安装在其他位置，可通过 `ANDROID_NDK_HOME` 指定其目录。脚本校验下载文件的 SHA-256，在 `build` 中生成模块 ZIP，再将其和校验值嵌入 `dist/MinClash.apk`。后续升级应保留 `build/debug.keystore`。
 
-App 和模块的展示版本统一为 `0.0.2`，内部 `versionCode=11`，可直接覆盖先前版本并保留数据。后续发布时递增内部版本号。构建会检查 App 与模块版本是否一致。
+App 当前展示版本为 `0.0.3`，开发构建 `versionCode=13`；内置模块保持 `0.0.2`、`versionCode=11`、功能修订号 `revision=1`。App 与模块不再要求版本一致。只有模块功能实际变更时才增加模块版本和修订号；App 更新单独递增 App 版本号。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
 
 上游版本、模块安装规范和 TUN 参数可查阅 [Mihomo v1.19.33](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33)、[Magisk 开发文档](https://topjohnwu.github.io/Magisk/guides.html) 和 [Mihomo TUN 文档](https://wiki.metacubex.one/config/inbound/tun/)。
 
 ## 验证
 
 保留了首次 PID 检测误报修复，以及每 4 秒静默刷新状态的逻辑，自动查询不会反复禁用按钮。PID 回归检查可使用 Root 管理器的 BusyBox 运行 `tests/pid-check.sh /path/to/control.sh`，覆盖有效 PID、PID 重用、旧开机标识及失效记录。
+
+`tests/AndroidInventoryCheck.java` 通过 Android `app_process` 和专用临时目录验证应用清单缓存、规则及代理组更新、缓存失效、异步图标加载和失败后的重新读取，不修改正在使用的配置。
