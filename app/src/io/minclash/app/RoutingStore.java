@@ -1,0 +1,120 @@
+package io.minclash.app;
+
+import android.content.Context;
+import android.util.AtomicFile;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import org.json.JSONObject;
+
+/** Private subscription source and personal policies, independent of the generated core config. */
+final class RoutingStore {
+    record State(byte[] source, Map<String, String> applications) {
+        State {
+            source = source.clone();
+            applications = Collections.unmodifiableMap(new TreeMap<>(applications));
+        }
+    }
+
+    private final AtomicFile file;
+
+    RoutingStore(Context context) {
+        file = new AtomicFile(new File(context.getFilesDir(), "app-routing.json"));
+    }
+
+    State load() throws Exception {
+        State saved = read();
+        return saved == null ? new State(Profile.normalize(Module.readProfile()), Collections.emptyMap()) : saved;
+    }
+
+    void importProfile(byte[] source) throws Exception {
+        State saved = read();
+        apply(new State(source, saved == null ? Collections.emptyMap() : saved.applications()));
+    }
+
+    private State read() throws Exception {
+        InputStream input;
+        try { input = file.openRead(); }
+        catch (FileNotFoundException missing) { return null; }
+        try (input) {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                if (bytes.size() + count > Profile.MAX_BYTES * 8) throw new IOException("应用分流设置过大。");
+                bytes.write(buffer, 0, count);
+            }
+            JSONObject object = new JSONObject(bytes.toString(StandardCharsets.UTF_8.name()));
+            if (object.getInt("version") != 1) throw new IOException("应用分流设置版本不受支持。");
+            JSONObject rules = object.getJSONObject("applications");
+            Map<String, String> applications = new TreeMap<>();
+            for (Iterator<String> keys = rules.keys(); keys.hasNext();) {
+                String name = keys.next();
+                applications.put(name, rules.getString(name));
+            }
+            return new State(Profile.normalize(object.getString("source").getBytes(StandardCharsets.UTF_8)), applications);
+        }
+    }
+
+    private void save(State state) throws Exception {
+        JSONObject object = new JSONObject();
+        object.put("version", 1);
+        object.put("source", new String(state.source(), StandardCharsets.UTF_8));
+        object.put("applications", new JSONObject(state.applications()));
+        byte[] bytes = object.toString().getBytes(StandardCharsets.UTF_8);
+        FileOutputStream output = null;
+        try {
+            output = file.startWrite();
+            output.write(bytes);
+            file.finishWrite(output);
+        } catch (Exception error) {
+            if (output != null) file.failWrite(output);
+            throw error;
+        }
+    }
+
+    void apply(State state) throws Exception {
+        byte[] merged = Profile.withAppRules(state.source(), state.applications());
+        Module.Status before = Module.status();
+        byte[] previous = before.profile ? Module.readProfile() : null;
+        boolean reconnect = !before.state.equals("stopped");
+        List<Controller.Group> selections = before.state.equals("running") && before.control
+            ? Controller.groups().values() : Collections.emptyList();
+        if (reconnect) Module.run(Module.Command.STOP, null);
+        boolean imported = false;
+        try {
+            Module.run(Module.Command.IMPORT, merged);
+            imported = true;
+            save(state);
+        } catch (Exception error) {
+            try {
+                if (imported && previous != null) Module.run(Module.Command.IMPORT, previous);
+                if (reconnect) restart(selections);
+            } catch (Exception recovery) {
+                throw new IOException("保存失败，恢复连接也未完成，请检查内核日志。\n" + error.getMessage()
+                    + "\n" + recovery.getMessage(), error);
+            }
+            throw error;
+        }
+        if (reconnect) {
+            try { restart(selections); }
+            catch (Exception error) {
+                throw new IOException("应用规则已保存，但恢复连接或节点选择失败，请检查代理组及连接状态。\n" + error.getMessage(), error);
+            }
+        }
+    }
+
+    private void restart(List<Controller.Group> selections) throws Exception {
+        Module.run(Module.Command.START, null);
+        Controller.restoreSelections(selections);
+    }
+}

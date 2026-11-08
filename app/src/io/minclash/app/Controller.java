@@ -57,6 +57,24 @@ final class Controller {
         else request("PUT", path, new JSONObject().put("name", proxy).toString());
     }
 
+    static void restoreSelections(List<Group> previous) throws Exception {
+        if (previous.isEmpty()) return;
+        Groups ready = null;
+        Exception last = null;
+        for (int attempt = 0; attempt < 20; attempt++) {
+            try { ready = groups(); break; }
+            catch (Exception error) { last = error; Thread.sleep(300); }
+        }
+        if (ready == null) throw new IOException("内核控制接口未就绪，无法恢复节点选择。", last);
+        for (Group old : previous) {
+            if (old.automatic() || old.current().isEmpty()) continue;
+            for (Group current : ready.values()) {
+                if (current.name().equals(old.name()) && current.options().contains(old.current())
+                    && !current.current().equals(old.current())) select(old.name(), old.current());
+            }
+        }
+    }
+
     private static String request(String method, String path, String body) throws Exception {
         String request = method + " " + path + " HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n"
             + "Content-Type: application/json\r\nContent-Length: " + body.getBytes(StandardCharsets.UTF_8).length

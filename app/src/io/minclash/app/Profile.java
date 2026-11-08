@@ -10,6 +10,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.LinkedHashSet;
 import java.util.Set;
 import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
@@ -143,6 +147,76 @@ final class Profile {
               - MATCH,%s
             """.formatted(group, group);
         fields.addAll(((MappingNode) yaml.compose(new StringReader(defaults))).getValue());
+    }
+
+    static List<String> routingTargets(byte[] content) throws IOException {
+        MappingNode root = routingRoot(content);
+        Set<String> names = new LinkedHashSet<>();
+        names.add("DIRECT");
+        for (NodeTuple tuple : root.getValue()) {
+            if (!keyOf(tuple).equals("proxy-groups") || !(tuple.getValueNode() instanceof SequenceNode groups)) continue;
+            for (Node group : groups.getValue()) {
+                if (!(group instanceof MappingNode mapping)) continue;
+                for (NodeTuple field : mapping.getValue()) {
+                    if (keyOf(field).equals("name") && field.getValueNode() instanceof ScalarNode name) {
+                        names.add(name.getValue());
+                    }
+                }
+            }
+        }
+        return new ArrayList<>(names);
+    }
+
+    // Always merge into the saved subscription source, never into an earlier merged profile.
+    static byte[] withAppRules(byte[] source, Map<String, String> applications) throws IOException {
+        byte[] base = normalize(source);
+        if (applications.isEmpty()) return base;
+        Yaml yaml = new Yaml();
+        MappingNode root = routingRoot(base);
+        Set<String> targets = new HashSet<>(routingTargets(base));
+        List<Node> rules = new ArrayList<>();
+        for (Map.Entry<String, String> entry : new TreeMap<>(applications).entrySet()) {
+            if (!entry.getKey().matches("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)*")) {
+                throw new IOException("应用包名无效：" + entry.getKey());
+            }
+            if (!targets.contains(entry.getValue())) {
+                throw new IOException("应用 " + entry.getKey() + " 指定的代理组「" + entry.getValue()
+                    + "」已不存在。请先在应用分流中重新选择，再更新订阅。");
+            }
+            rules.add(yaml.represent("PROCESS-NAME," + entry.getKey() + "," + entry.getValue()));
+        }
+        for (NodeTuple tuple : root.getValue()) {
+            if (!keyOf(tuple).equals("rules")) continue;
+            if (!(tuple.getValueNode() instanceof SequenceNode imported)) {
+                throw new IOException("配置中的 rules 必须是规则列表。");
+            }
+            rules.addAll(imported.getValue());
+        }
+        root.getValue().removeIf(tuple -> keyOf(tuple).equals("rules") || keyOf(tuple).equals("find-process-mode"));
+        root.getValue().add(new NodeTuple(yaml.represent("find-process-mode"), yaml.represent("always")));
+        root.getValue().add(new NodeTuple(yaml.represent("rules"), new SequenceNode(Tag.SEQ, rules,
+            org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK)));
+        StringWriter output = new StringWriter();
+        yaml.serialize(root, output);
+        byte[] result = output.toString().getBytes(StandardCharsets.UTF_8);
+        if (result.length > MAX_BYTES) throw new IOException("合并应用规则后，配置超过 2 MiB。");
+        return result;
+    }
+
+    private static MappingNode routingRoot(byte[] content) throws IOException {
+        LoaderOptions options = new LoaderOptions();
+        options.setAllowDuplicateKeys(false);
+        options.setMergeOnCompose(true);
+        options.setNestingDepthLimit(40);
+        options.setCodePointLimit(MAX_BYTES);
+        try {
+            Node parsed = new Yaml(options).compose(new StringReader(new String(content, StandardCharsets.UTF_8)));
+            if (!(parsed instanceof MappingNode root)) throw new IOException("无法读取当前配置。");
+            keysOf(root);
+            return root;
+        } catch (YAMLException error) {
+            throw new IOException("无法读取当前配置的分流规则。", error);
+        }
     }
 
     private static Set<String> keysOf(MappingNode node) throws IOException {

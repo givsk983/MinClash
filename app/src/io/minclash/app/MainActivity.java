@@ -16,11 +16,16 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
+import android.text.Editable;
+import android.text.TextWatcher;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
+import android.widget.BaseAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -32,12 +37,20 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Locale;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.function.BiConsumer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
     private static final int PICK_PROFILE = 1;
     private static final int EXPORT_MODULE = 2;
+    private static final int REQUEST_APP_LIST = 3;
+    private static final int APP_LIST_SETTINGS = 4;
+    private static final String ROOT_INVENTORY = "root_app_inventory";
     private static final String SUBSCRIPTION = "subscription";
     private static final int BG = 0xff0d131a;
     private static final int CARD = 0xff17212b;
@@ -64,6 +77,9 @@ public final class MainActivity extends Activity {
     private Button updateButton;
     private Button modeButton;
     private Button groupsButton;
+    private Button routingButton;
+    private int routingFilter;
+    private String routingQuery = "";
     private TextView proxyHint;
     private Button refreshButton;
     private Button logsButton;
@@ -160,6 +176,13 @@ public final class MainActivity extends Activity {
         importButton.setOnClickListener(view -> pickProfile());
         add(settings, importButton, 10);
         add(settings, label("更换配置前，请先停止连接。", 12, MUTED, false), 14);
+        LinearLayout routing = card(profiles, 14);
+        add(routing, label("应用分流", 17, TEXT, true), 0);
+        add(routing, label("给应用指定直连或代理组。你的设置优先于机场规则，更新订阅后继续保留。", 13, MUTED, false), 8);
+        routingButton = button("管理应用分流", false);
+        routingButton.setOnClickListener(view -> openAppRouting());
+        add(routing, routingButton, 16);
+        add(routing, label("在规则模式下生效。运行中保存会短暂重连。", 12, MUTED, false), 12);
         LinearLayout instructions = card(profiles, 14);
         add(instructions, label("开始使用", 15, TEXT, true), 0);
         add(instructions, label("01   在设置页安装内置模块并重启\n02   导入订阅链接或本地配置\n03   回到概览，启动 TUN", 13, MUTED, false), 12);
@@ -394,7 +417,7 @@ public final class MainActivity extends Activity {
 
     private void importSubscription(String address) {
         execute("订阅已通过 Mihomo 校验并保存。", () -> {
-            Module.run(Module.Command.IMPORT, Subscription.fetch(address));
+            new RoutingStore(this).importProfile(Subscription.fetch(address));
             getPreferences(MODE_PRIVATE).edit().putString(SUBSCRIPTION, address).apply();
             return Module.status();
         });
@@ -409,6 +432,10 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == APP_LIST_SETTINGS) {
+            loadAppRouting(false);
+            return;
+        }
         if (request == EXPORT_MODULE && result == RESULT_OK && data != null && data.getData() != null) {
             Uri outputUri = data.getData();
             execute("模块安装包已导出，可在 Root 管理器中安装。", () -> {
@@ -426,7 +453,7 @@ public final class MainActivity extends Activity {
         execute("配置已通过 Mihomo 校验并保存。", () -> {
             try (InputStream input = getContentResolver().openInputStream(uri)) {
                 if (input == null) throw new IOException("无法打开所选文件。");
-                Module.run(Module.Command.IMPORT, Profile.normalize(input));
+                new RoutingStore(this).importProfile(Profile.normalize(input));
             }
             getPreferences(MODE_PRIVATE).edit().remove(SUBSCRIPTION).apply();
             return Module.status();
@@ -451,29 +478,167 @@ public final class MainActivity extends Activity {
     }
 
     private void showGroups(List<Controller.Group> groups) {
-        AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("代理组与节点");
         if (groups.isEmpty()) {
-            dialog.setMessage("当前配置没有可手动选择的代理组。").setPositiveButton("关闭", null).show();
+            new AlertDialog.Builder(this).setTitle("代理组与节点")
+                .setMessage("当前配置没有可手动选择的代理组。").setPositiveButton("关闭", null).show();
             return;
         }
-        String[] labels = new String[groups.size()];
+        List<PolicyItem> items = new ArrayList<>();
         for (int i = 0; i < groups.size(); i++) {
             Controller.Group group = groups.get(i);
-            labels[i] = group.current().isEmpty() ? group.name() : group.name() + "\n" + group.current();
+            items.add(new PolicyItem(group.name(), "当前出口 · " + groupRoute(group, groups),
+                group.current().equals("DIRECT") ? "直连" : group.automatic() ? "自动" : "手动", false, true, i));
         }
-        dialog.setItems(labels, (ignored, index) -> showNodes(groups.get(index)))
-            .setNegativeButton("关闭", null).show();
+        showPolicyList("代理组与节点", groups.size() + " 个代理组 · 点击查看可选节点", "搜索代理组或当前出口", items,
+            (dialog, index) -> { dialog.dismiss(); showNodes(groups.get(index), groups); }, null);
     }
 
-    private void showNodes(Controller.Group group) {
-        String[] labels = group.options().toArray(new String[0]);
-        AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle(group.name())
-            .setSingleChoiceItems(labels, group.options().indexOf(group.current()), (choices, index) -> {
-                choices.dismiss();
-                selectNode(group.name(), labels[index]);
-            }).setNegativeButton("取消", null);
-        if (group.automatic()) dialog.setNeutralButton("恢复自动", (ignored, index) -> selectNode(group.name(), null));
-        dialog.show();
+    private String groupRoute(Controller.Group group, List<Controller.Group> groups) {
+        String current = group.current();
+        StringBuilder route = new StringBuilder();
+        java.util.Set<String> visited = new java.util.HashSet<>();
+        for (int depth = 0; depth < 6 && !current.isEmpty() && visited.add(current); depth++) {
+            if (route.length() > 0) route.append(" → ");
+            route.append(current.equals("DIRECT") ? "直连" : current.equals("REJECT") ? "拒绝连接" : current);
+            String next = "";
+            for (Controller.Group candidate : groups) if (candidate.name().equals(current)) { next = candidate.current(); break; }
+            current = next;
+        }
+        return route.length() == 0 ? "尚未选择" : route.toString();
+    }
+
+    private void showNodes(Controller.Group group, List<Controller.Group> groups) {
+        List<PolicyItem> items = new ArrayList<>();
+        for (int i = 0; i < group.options().size(); i++) {
+            String option = group.options().get(i);
+            String detail = option.equals("DIRECT") ? "直接连接，不经过代理" : "代理节点";
+            for (Controller.Group candidate : groups) if (candidate.name().equals(option)) {
+                detail = "代理组 · " + groupRoute(candidate, groups);
+                break;
+            }
+            boolean selected = option.equals(group.current());
+            items.add(new PolicyItem(option.equals("DIRECT") ? "直连" : option, detail,
+                selected ? "当前" : "", selected, false, i));
+        }
+        showPolicyList(group.name() + " · 选择出口", group.options().size() + " 个选项 · 点击切换", "搜索节点或代理组", items,
+            (dialog, index) -> {
+                dialog.dismiss();
+                String option = group.options().get(index);
+                if (!option.equals(group.current())) selectNode(group.name(), option);
+            }, group.automatic() ? () -> selectNode(group.name(), null) : null);
+    }
+
+    private record PolicyItem(String title, String detail, String badge, boolean selected, boolean navigates, int index) {}
+
+    private void showPolicyList(String title, String subtitle, String hint, List<PolicyItem> items,
+                                BiConsumer<AlertDialog, Integer> onPick, Runnable reset) {
+        LinearLayout header = column();
+        header.setPadding(dp(20), dp(20), dp(20), dp(8));
+        add(header, label(title, 20, TEXT, true), 0);
+        add(header, label(subtitle, 12, MUTED, false), 8);
+        EditText search = new EditText(this);
+        search.setSingleLine(true);
+        search.setTextColor(TEXT);
+        search.setHintTextColor(MUTED);
+        search.setTextSize(14);
+        search.setHint(hint);
+        search.setPadding(dp(14), dp(12), dp(14), dp(12));
+        search.setBackground(shape(BG, 12, true));
+        add(header, search, 14);
+        PolicyAdapter adapter = new PolicyAdapter();
+        adapter.entries.addAll(items);
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence text, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence text, int start, int before, int count) {
+                String query = text.toString().trim().toLowerCase(Locale.ROOT);
+                adapter.entries.clear();
+                for (PolicyItem item : items) {
+                    if ((item.title() + " " + item.detail()).toLowerCase(Locale.ROOT).contains(query)) adapter.entries.add(item);
+                }
+                adapter.notifyDataSetChanged();
+            }
+            @Override public void afterTextChanged(Editable text) {}
+        });
+        AlertDialog.Builder builder = new AlertDialog.Builder(this).setCustomTitle(header)
+            .setAdapter(adapter, null).setNegativeButton("关闭", null);
+        if (reset != null) builder.setNeutralButton("恢复自动", (dialog, which) -> reset.run());
+        AlertDialog dialog = builder.show();
+        dialog.getListView().setDivider(null);
+        dialog.getListView().setPadding(dp(10), dp(4), dp(10), dp(6));
+        dialog.getListView().setClipToPadding(false);
+        dialog.getListView().setOnItemClickListener((parent, view, index, id) -> {
+            PolicyItem item = adapter.getItem(index);
+            if (item != null) onPick.accept(dialog, item.index());
+        });
+        dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            | android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+    }
+
+    private record PolicyRow(LinearLayout card, TextView title, TextView detail, TextView badge, TextView arrow) {}
+
+    private final class PolicyAdapter extends BaseAdapter {
+        final List<PolicyItem> entries = new ArrayList<>();
+        @Override public int getCount() { return Math.max(1, entries.size()); }
+        @Override public PolicyItem getItem(int index) { return index < entries.size() ? entries.get(index) : null; }
+        @Override public long getItemId(int index) { return index; }
+        @Override public boolean isEnabled(int index) { return !entries.isEmpty(); }
+        @Override public View getView(int index, View reusable, ViewGroup parent) {
+            PolicyItem item = getItem(index);
+            if (item == null) {
+                TextView empty = label("没有匹配的项目", 14, MUTED, false);
+                empty.setPadding(dp(20), dp(32), dp(20), dp(32));
+                empty.setGravity(Gravity.CENTER);
+                return empty;
+            }
+            LinearLayout row;
+            PolicyRow holder;
+            if (reusable instanceof LinearLayout layout && reusable.getTag() instanceof PolicyRow existing) {
+                row = layout;
+                holder = existing;
+            } else {
+                row = column();
+                row.setPadding(dp(6), dp(4), dp(6), dp(4));
+                LinearLayout card = new LinearLayout(MainActivity.this);
+                card.setGravity(Gravity.CENTER_VERTICAL);
+                card.setPadding(dp(14), dp(14), dp(14), dp(14));
+                card.setDuplicateParentStateEnabled(true);
+                LinearLayout details = column();
+                card.addView(details, new LinearLayout.LayoutParams(0, -2, 1));
+                TextView name = label("", 15, TEXT, true);
+                name.setMaxLines(2);
+                name.setEllipsize(TextUtils.TruncateAt.END);
+                add(details, name, 0);
+                TextView detail = label("", 11, MUTED, false);
+                detail.setMaxLines(2);
+                detail.setEllipsize(TextUtils.TruncateAt.END);
+                add(details, detail, 6);
+                TextView badge = label("", 11, MINT, true);
+                badge.setSingleLine(true);
+                badge.setPadding(dp(9), dp(6), dp(9), dp(6));
+                LinearLayout.LayoutParams badgeParams = new LinearLayout.LayoutParams(-2, -2);
+                badgeParams.leftMargin = dp(10);
+                card.addView(badge, badgeParams);
+                TextView arrow = label("", 20, MUTED, false);
+                LinearLayout.LayoutParams arrowParams = new LinearLayout.LayoutParams(-2, -2);
+                arrowParams.leftMargin = dp(9);
+                card.addView(arrow, arrowParams);
+                add(row, card, 0);
+                holder = new PolicyRow(card, name, detail, badge, arrow);
+                row.setTag(holder);
+            }
+            holder.title().setText(item.title());
+            holder.detail().setText(item.detail());
+            holder.badge().setText(item.badge());
+            holder.badge().setVisibility(item.badge().isEmpty() ? View.GONE : View.VISIBLE);
+            boolean accent = item.selected() || item.badge().equals("直连") || item.badge().equals("自动");
+            holder.badge().setTextColor(accent ? MINT : MUTED);
+            holder.badge().setBackground(shape(accent ? 0xff25473e : 0xff2a3946, 9, false));
+            holder.card().setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9),
+                shape(item.selected() ? 0xff213b37 : 0xff1f2d39, 14, item.selected()), null));
+            holder.arrow().setText(item.navigates() ? "›" : item.selected() ? "✓" : "○");
+            holder.arrow().setTextColor(item.selected() ? MINT : MUTED);
+            return row;
+        }
     }
 
     private void selectNode(String group, String node) {
@@ -481,6 +646,303 @@ public final class MainActivity extends Activity {
             Controller.select(group, node);
             return Module.status();
         });
+    }
+
+    private void openAppRouting() {
+        routingFilter = 0;
+        routingQuery = "";
+        boolean allowRoot = getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false);
+        if (InstalledAppsAccess.needsRequest(this)) {
+            requestPermissions(new String[] {InstalledAppsAccess.RUNTIME_PERMISSION}, REQUEST_APP_LIST);
+            return;
+        }
+        loadAppRouting(allowRoot);
+    }
+
+    @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(request, permissions, results);
+        if (request == REQUEST_APP_LIST) loadAppRouting(false);
+    }
+
+    private void loadAppRouting(boolean allowRoot) {
+        execute("", () -> AppRouting.load(this, allowRoot));
+    }
+
+    private void showAppPermissions(AppRouting.Screen screen, AlertDialog listDialog) {
+        boolean requestable = InstalledAppsAccess.needsRequest(this);
+        String query = Build.VERSION.SDK_INT < 30 ? "此 Android 版本无需单独申请"
+            : checkSelfPermission("android.permission.QUERY_ALL_PACKAGES") == android.content.pm.PackageManager.PERMISSION_GRANTED
+                ? "已授予（普通权限，无需弹窗）" : "未授予";
+        String runtime = !InstalledAppsAccess.supportsRequest(this) ? "此系统未提供动态申请入口"
+            : requestable ? "尚未授予，可点击下方申请" : "已授予";
+        String icons = screen.missingIcons() == 0 ? "已全部读取" : screen.missingIcons() + " 个图标未能读取";
+        new AlertDialog.Builder(this).setTitle("应用列表与图标权限")
+            .setMessage("查询已安装应用：" + query + "\n\n系统动态权限：" + runtime + "\n\n应用图标：" + icons
+                + (screen.iconPermissionDenied() ? "，存在明确的权限拒绝。" : "。")
+                + "\n\n系统“应用权限”页主要展示可动态申请的权限，“未请求任何权限”不代表查询权限未声明。"
+                + "\n\n图标读取失败也可能是应用被隐藏、已卸载或资源不可用；这里会按实际结果提示。")
+            .setNegativeButton("关闭", null)
+            .setNeutralButton("应用设置", (dialog, which) -> {
+                listDialog.dismiss();
+                try {
+                    startActivityForResult(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + getPackageName())), APP_LIST_SETTINGS);
+                } catch (android.content.ActivityNotFoundException error) { showMessage("无法打开系统应用设置。"); }
+            })
+            .setPositiveButton(requestable ? "申请权限" : "重新读取", (dialog, which) -> {
+                listDialog.dismiss();
+                if (requestable) requestPermissions(new String[] {InstalledAppsAccess.RUNTIME_PERMISSION}, REQUEST_APP_LIST);
+                else loadAppRouting(getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
+            }).show();
+    }
+
+    private void showAppRouting(AppRouting.Screen screen) {
+        if (screen.systemInventoryEmpty() && !screen.rootInventory()) {
+            String reason = !InstalledAppsAccess.supportsRequest(this)
+                ? "此系统没有可弹窗申请的应用列表权限；已声明的查询权限在安装时授予，但普通查询仍未返回其他应用。"
+                : InstalledAppsAccess.needsRequest(this) ? "读取应用列表权限尚未授予，普通查询未返回其他应用。"
+                : "读取应用列表权限已授予，但普通查询仍未返回其他应用。";
+            new AlertDialog.Builder(this).setTitle("未能读取应用列表")
+                .setMessage(reason + "\n\n可前往应用设置检查权限，或使用现有 Root 授权读取。选择 Root 后会记住此选择，每次仍先尝试普通查询。")
+                .setNegativeButton("取消", null)
+                .setNeutralButton("应用设置", (dialog, which) -> {
+                    try {
+                        startActivityForResult(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:" + getPackageName())), APP_LIST_SETTINGS);
+                    } catch (android.content.ActivityNotFoundException error) { showMessage("无法打开系统应用设置。"); }
+                })
+                .setPositiveButton("用 Root 读取", (dialog, which) -> execute("", () -> {
+                    AppRouting.Screen loaded = AppRouting.load(this, true);
+                    getPreferences(MODE_PRIVATE).edit().putBoolean(ROOT_INVENTORY, true).apply();
+                    return loaded;
+                })).show();
+            return;
+        }
+        LinearLayout content = column();
+        AlertDialog[] listDialog = new AlertDialog[1];
+        content.setPadding(dp(20), dp(18), dp(20), dp(8));
+        LinearLayout heading = new LinearLayout(this);
+        heading.setGravity(Gravity.CENTER_VERTICAL);
+        heading.addView(label("应用分流", 20, TEXT, true), new LinearLayout.LayoutParams(0, -2, 1));
+        Button permission = button("权限", false);
+        permission.setTextSize(12);
+        permission.setMinHeight(dp(32));
+        permission.setPadding(dp(10), dp(6), dp(10), dp(6));
+        permission.setOnClickListener(view -> showAppPermissions(screen, listDialog[0]));
+        LinearLayout.LayoutParams permissionParams = new LinearLayout.LayoutParams(-2, -2);
+        permissionParams.rightMargin = dp(6);
+        heading.addView(permission, permissionParams);
+        Button info = button("说明", false);
+        info.setTextSize(12);
+        info.setMinHeight(dp(32));
+        info.setPadding(dp(12), dp(6), dp(12), dp(6));
+        info.setOnClickListener(view -> new AlertDialog.Builder(this).setTitle("应用分流说明")
+            .setMessage("• 个人选择优先于订阅规则，仅在规则模式下生效。\n\n"
+                + "• 选择“跟随订阅规则”可移除个人设置。运行中保存会短暂重连。\n\n"
+                + "• “应用”显示用户安装的应用和可打开的系统应用；系统组件可在“全部”中查找。\n\n"
+                + (screen.rootInventory() ? "读取方式：普通接口优先，已使用你选择的 Root 补充读取应用或图标。" : "读取方式：系统应用查询接口。"))
+            .setPositiveButton("知道了", null).show());
+        heading.addView(info, new LinearLayout.LayoutParams(-2, -2));
+        add(content, heading, 0);
+        TextView count = label("", 12, MUTED, false);
+        add(content, count, 8);
+        if (screen.missingIcons() > 0) {
+            TextView warning = label(screen.iconPermissionDenied() ? "部分图标读取无权限 · 点此检查权限"
+                : "部分图标无法读取 · 点此查看权限与原因", 11, AMBER, false);
+            warning.setPadding(0, dp(6), 0, dp(6));
+            warning.setOnClickListener(view -> showAppPermissions(screen, listDialog[0]));
+            add(content, warning, 4);
+        }
+        EditText search = new EditText(this);
+        search.setHint("搜索应用名称或包名");
+        search.setSingleLine(true);
+        search.setTextColor(TEXT);
+        search.setHintTextColor(MUTED);
+        search.setTextSize(14);
+        search.setInputType(InputType.TYPE_CLASS_TEXT);
+        search.setPadding(dp(14), dp(12), dp(14), dp(12));
+        search.setBackground(shape(BG, 12, true));
+        search.setText(routingQuery);
+        add(content, search, 14);
+        LinearLayout tabs = new LinearLayout(this);
+        Button[] filters = new Button[3];
+        String[] filterNames = {"应用", "已指定", "全部"};
+        for (int i = 0; i < filters.length; i++) {
+            filters[i] = button(filterNames[i], false);
+            filters[i].setTextSize(12);
+            filters[i].setMinHeight(dp(34));
+            filters[i].setPadding(dp(4), dp(8), dp(4), dp(8));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1);
+            if (i > 0) params.leftMargin = dp(6);
+            tabs.addView(filters[i], params);
+        }
+        add(content, tabs, 12);
+        RoutingAdapter adapter = new RoutingAdapter();
+        Runnable filter = () -> {
+            String query = search.getText().toString().trim().toLowerCase(Locale.ROOT);
+            routingQuery = search.getText().toString();
+            adapter.entries.clear();
+            for (AppRouting.Entry app : screen.applications()) {
+                boolean show = switch (routingFilter) {
+                    case 1 -> !app.target().isEmpty();
+                    case 2 -> true;
+                    default -> app.userFacing();
+                };
+                if (!show) continue;
+                if (!(app.label() + " " + app.packageName()).toLowerCase(Locale.ROOT).contains(query)) continue;
+                adapter.entries.add(app);
+            }
+            count.setText(adapter.entries.size() + " 个应用 · 已指定 " + screen.state().applications().size() + " 个");
+            adapter.notifyDataSetChanged();
+            for (int i = 0; i < filters.length; i++) {
+                boolean selected = i == routingFilter;
+                filters[i].setTextColor(selected ? BG : MUTED);
+                filters[i].setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9),
+                    shape(selected ? MINT : 0xff202e3a, 10, false), null));
+            }
+        };
+        for (int i = 0; i < filters.length; i++) {
+            final int index = i;
+            filters[i].setOnClickListener(view -> { routingFilter = index; filter.run(); });
+        }
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence text, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence text, int start, int before, int count) { filter.run(); }
+            @Override public void afterTextChanged(Editable text) {}
+        });
+        AlertDialog dialog = new AlertDialog.Builder(this).setCustomTitle(content)
+            .setAdapter(adapter, null).setNegativeButton("关闭", null).create();
+        listDialog[0] = dialog;
+        filter.run();
+        dialog.show();
+        dialog.getListView().setDivider(null);
+        dialog.getListView().setPadding(dp(10), dp(4), dp(10), dp(6));
+        dialog.getListView().setClipToPadding(false);
+        dialog.getListView().setOnItemClickListener((parent, view, index, id) -> {
+            AppRouting.Entry app = adapter.getItem(index);
+            if (app != null) showAppTarget(screen, app, dialog);
+        });
+        dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            | android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+    }
+
+    private record RoutingRow(ImageView icon, TextView missingIcon, TextView name, TextView packageName, TextView policy) {}
+
+    private final class RoutingAdapter extends BaseAdapter {
+        final List<AppRouting.Entry> entries = new ArrayList<>();
+
+        @Override public int getCount() { return Math.max(1, entries.size()); }
+        @Override public AppRouting.Entry getItem(int index) { return index < entries.size() ? entries.get(index) : null; }
+        @Override public long getItemId(int index) { return index; }
+        @Override public boolean isEnabled(int index) { return !entries.isEmpty(); }
+
+        @Override public View getView(int index, View reusable, ViewGroup parent) {
+            AppRouting.Entry app = getItem(index);
+            if (app == null) {
+                LinearLayout empty = column();
+                empty.setPadding(dp(20), dp(32), dp(20), dp(32));
+                TextView title = label(routingFilter == 1 && routingQuery.trim().isEmpty()
+                    ? "还没有指定应用" : "没有匹配的应用", 15, TEXT, true);
+                title.setGravity(Gravity.CENTER);
+                add(empty, title, 0);
+                TextView hint = label(routingFilter == 1 ? "在“应用”中选择一个 App，为它指定出口。"
+                    : "试试其他名称，或切换到“全部”查找系统组件。", 12, MUTED, false);
+                hint.setGravity(Gravity.CENTER);
+                add(empty, hint, 10);
+                return empty;
+            }
+            LinearLayout row;
+            RoutingRow holder;
+            if (reusable instanceof LinearLayout layout && reusable.getTag() instanceof RoutingRow existing) {
+                row = layout;
+                holder = existing;
+            } else {
+                row = column();
+                row.setPadding(dp(6), dp(4), dp(6), dp(4));
+                LinearLayout card = new LinearLayout(MainActivity.this);
+                card.setGravity(Gravity.CENTER_VERTICAL);
+                card.setPadding(dp(12), dp(13), dp(12), dp(13));
+                card.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9), shape(0xff1f2d39, 14, false), null));
+                card.setDuplicateParentStateEnabled(true);
+                FrameLayout iconBox = new FrameLayout(MainActivity.this);
+                iconBox.setBackground(shape(0xff2b4149, 10, false));
+                iconBox.setClipToOutline(true);
+                ImageView icon = new ImageView(MainActivity.this);
+                icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                iconBox.addView(icon, new FrameLayout.LayoutParams(-1, -1));
+                TextView missingIcon = label("!", 20, AMBER, true);
+                missingIcon.setGravity(Gravity.CENTER);
+                iconBox.addView(missingIcon, new FrameLayout.LayoutParams(-1, -1));
+                card.addView(iconBox, new LinearLayout.LayoutParams(dp(36), dp(36)));
+                LinearLayout details = column();
+                LinearLayout.LayoutParams detailsParams = new LinearLayout.LayoutParams(0, -2, 1);
+                detailsParams.leftMargin = dp(10);
+                card.addView(details, detailsParams);
+                TextView name = label("", 15, TEXT, true);
+                name.setSingleLine(true);
+                name.setEllipsize(TextUtils.TruncateAt.END);
+                add(details, name, 0);
+                TextView packageName = label("", 10, MUTED, false);
+                packageName.setSingleLine(true);
+                packageName.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+                add(details, packageName, 5);
+                TextView policy = label("", 11, MUTED, true);
+                policy.setSingleLine(true);
+                policy.setEllipsize(TextUtils.TruncateAt.END);
+                policy.setMaxWidth(dp(96));
+                policy.setPadding(dp(9), dp(6), dp(9), dp(6));
+                LinearLayout.LayoutParams policyParams = new LinearLayout.LayoutParams(-2, -2);
+                policyParams.leftMargin = dp(8);
+                card.addView(policy, policyParams);
+                TextView arrow = label("›", 22, MUTED, false);
+                LinearLayout.LayoutParams arrowParams = new LinearLayout.LayoutParams(-2, -2);
+                arrowParams.leftMargin = dp(8);
+                card.addView(arrow, arrowParams);
+                add(row, card, 0);
+                holder = new RoutingRow(icon, missingIcon, name, packageName, policy);
+                row.setTag(holder);
+            }
+            String name = app.label().isEmpty() ? app.packageName() : app.label();
+            holder.icon().setImageBitmap(app.icon());
+            holder.icon().setContentDescription(name + "图标");
+            holder.icon().setVisibility(app.icon() == null ? View.GONE : View.VISIBLE);
+            holder.missingIcon().setVisibility(app.icon() == null ? View.VISIBLE : View.GONE);
+            holder.missingIcon().setContentDescription(app.iconIssue().equals("permission") ? "图标读取无权限" : "图标未能读取");
+            holder.name().setText(name);
+            holder.packageName().setText(!app.installed() ? "未在应用列表中找到 · " + app.packageName()
+                : app.iconIssue().equals("permission") ? "图标读取无权限 · " + app.packageName() : app.packageName());
+            holder.policy().setText(app.target().isEmpty() ? "跟随规则" : app.target().equals("DIRECT") ? "直连" : app.target());
+            holder.policy().setTextColor(app.target().isEmpty() ? MUTED : MINT);
+            holder.policy().setBackground(shape(app.target().isEmpty() ? 0xff2a3946 : 0xff25473e, 9, false));
+            return row;
+        }
+    }
+
+    private void showAppTarget(AppRouting.Screen screen, AppRouting.Entry app, AlertDialog listDialog) {
+        List<String> targets = new ArrayList<>();
+        targets.add("");
+        targets.addAll(screen.targets());
+        String[] labels = new String[targets.size()];
+        for (int i = 0; i < labels.length; i++) {
+            String target = targets.get(i);
+            labels[i] = target.isEmpty() ? "跟随订阅规则" : target.equals("DIRECT") ? "直连" : "代理组：" + target;
+        }
+        int[] chosen = {targets.indexOf(app.target())};
+        new AlertDialog.Builder(this).setTitle(app.label() + " · 出口")
+            .setSingleChoiceItems(labels, chosen[0], (dialog, index) -> chosen[0] = index)
+            .setNegativeButton("取消", null).setPositiveButton("保存", (dialog, which) -> {
+                if (chosen[0] < 0) return;
+                String target = targets.get(chosen[0]);
+                if (target.equals(app.target())) return;
+                Map<String, String> rules = new TreeMap<>(screen.state().applications());
+                if (target.isEmpty()) rules.remove(app.packageName());
+                else rules.put(app.packageName(), target);
+                listDialog.dismiss();
+                execute("应用分流已保存。", () -> {
+                    new RoutingStore(this).apply(new RoutingStore.State(screen.state().source(), rules));
+                    return AppRouting.load(this, getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
+                });
+            }).show();
     }
 
     private interface Operation { Object run() throws Exception; }
@@ -504,6 +966,10 @@ public final class MainActivity extends Activity {
                         if (result instanceof String logs) showLogs(logs);
                         if (result instanceof Controller.Mode mode) showModes(mode);
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
+                        if (result instanceof AppRouting.Screen screen) {
+                            status = screen.status();
+                            showAppRouting(screen);
+                        }
                     }
                     render();
                     schedulePoll();
@@ -567,6 +1033,7 @@ public final class MainActivity extends Activity {
         boolean canControl = !busy && enabled && status.control && status.state.equals("running");
         modeButton.setEnabled(canControl);
         groupsButton.setEnabled(canControl);
+        routingButton.setEnabled(!busy && enabled && status.profile);
         proxyHint.setText(installed && !status.control ? "请升级 MinClash Root 模块以使用代理控制。"
             : installed && status.state.equals("running") ? "全局模式使用 GLOBAL 组。"
             : "TUN 启动后可切换模式和节点。");

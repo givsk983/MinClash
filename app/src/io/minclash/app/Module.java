@@ -45,6 +45,13 @@ final class Module {
         return parseStatus(run(Command.STATUS, null));
     }
 
+    static byte[] readProfile() throws Exception {
+        String source = runRoot("exec /system/bin/cat /data/adb/minclash/config.yaml", Command.API, null, 15);
+        byte[] bytes = source.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > Profile.MAX_BYTES) throw new Profile.TooLarge();
+        return bytes;
+    }
+
     static Status parseStatus(String output) throws IOException {
         String state = "";
         boolean profile = false;
