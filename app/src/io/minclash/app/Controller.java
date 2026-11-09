@@ -5,8 +5,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -33,7 +35,9 @@ final class Controller {
         return Mode.valueOf(config.getString("mode").toUpperCase(Locale.ROOT));
     }
 
-    static Groups groups() throws Exception {
+    static Groups groups() throws Exception { return groups(true); }
+
+    private static Groups groups(boolean selectableOnly) throws Exception {
         JSONArray proxies = new JSONObject(request("GET", "/group", "")).getJSONArray("proxies");
         List<Group> groups = new ArrayList<>();
         for (int i = 0; i < proxies.length(); i++) {
@@ -41,14 +45,55 @@ final class Controller {
             String name = proxy.getString("name");
             String type = proxy.getString("type");
             boolean automatic = type.equals("URLTest") || type.equals("Fallback");
-            if ((!automatic && !type.equals("Selector")) || proxy.optBoolean("hidden")) continue;
-            JSONArray all = proxy.getJSONArray("all");
+            if (selectableOnly && ((!automatic && !type.equals("Selector")) || proxy.optBoolean("hidden"))) continue;
+            JSONArray all = proxy.optJSONArray("all");
+            if (all == null) continue;
             List<String> options = new ArrayList<>();
             for (int j = 0; j < all.length(); j++) options.add(all.getString(j));
-            if (!options.isEmpty()) groups.add(new Group(name, proxy.optString("now"), options, automatic));
+            if (!selectableOnly || !options.isEmpty()) groups.add(new Group(name, proxy.optString("now"), options, automatic));
         }
         groups.sort(Comparator.comparing(Group::name, String.CASE_INSENSITIVE_ORDER));
         return new Groups(groups);
+    }
+
+    static String primaryNode(Mode mode) throws Exception {
+        List<Group> groups = groups(false).values();
+        Group primary = groups.stream().filter(group -> mode == Mode.GLOBAL
+            ? ProxyGroupSection.isGlobal(group.name()) : ProxyGroupSection.isProxies(group.name())).findFirst().orElse(null);
+        if (primary == null && mode != Mode.GLOBAL) {
+            primary = groups.stream().filter(group -> ProxyGroupSection.of(group.name()) == ProxyGroupSection.MAIN
+                && !ProxyGroupSection.isGlobal(group.name())).min(Comparator.comparing(Group::automatic)).orElse(null);
+        }
+        if (primary == null) return "未找到主代理";
+        List<String> route = route(primary, groups);
+        return route.isEmpty() ? "尚未选择" : outletLabel(route.get(route.size() - 1));
+    }
+
+    static List<String> route(Group group, List<Group> groups) {
+        List<String> route = new ArrayList<>();
+        Set<String> visited = new HashSet<>();
+        visited.add(group.name());
+        String current = group.current();
+        while (!current.isEmpty() && visited.add(current)) {
+            route.add(current);
+            String next = "";
+            for (Group candidate : groups) {
+                if (candidate.name().equals(current)) {
+                    next = candidate.current();
+                    break;
+                }
+            }
+            current = next;
+        }
+        return route;
+    }
+
+    static String outletLabel(String name) {
+        return switch (name) {
+            case "DIRECT" -> "直连";
+            case "REJECT" -> "拒绝连接";
+            default -> name;
+        };
     }
 
     static void select(String group, String proxy) throws Exception {

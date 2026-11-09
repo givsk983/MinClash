@@ -1,4 +1,4 @@
-# MinClash 0.0.3
+# MinClash 0.0.4
 
 MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模块和 Mihomo v1.19.33 Android ARM64 内核。发布时只需要分发 `dist/MinClash.apk`。适用于 ARM64、Android 9 及以上，且内核支持 `/dev/tun` 或 `/dev/net/tun` 的 Root 手机。
 
@@ -7,6 +7,7 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 1. 安装 `dist/MinClash.apk`，在 KernelSU / Magisk 中为 MinClash 授予 Root 权限。
 2. 在 App「设置 → 内置模块」点击「安装内置模块」，安装成功后重启手机。无需另外下载模块 ZIP。如果管理器不支持直接安装，可点击「导出模块安装包」，再到管理器中从本地安装。
 3. 在「配置」页导入 Clash / Mihomo YAML 订阅链接或本地文件，再回到「概览」点击「启动 TUN」。也可以先导入 `direct-smoke.yaml` 验证直连转发。
+   「概览 → 网络检测」可并行测试 Google、百度和 Cloudflare，显示连通状态及 HTTPS 响应延迟。检测使用 MinClash 当前的网络路径，切换网络、模式或节点后可重新检测。
 4. 运行后可在「代理控制」切换规则、全局、直连模式，并在「代理组与节点」选择节点。全局模式使用 `GLOBAL` 组，规则模式使用配置中各条规则指定的组。
    代理组使用卡片显示组名、当前出口链路及手动／自动状态，支持搜索。节点页高亮当前选择，可搜索节点或代理组。
 5. 在「配置 → 管理应用分流」搜索已安装的应用，选择「跟随订阅规则」「直连」或指定代理组。例如，将 Claude 指向 `US` 组后，即使机场规则将 Claude 分到 `OpenAI`，也会优先走 `US` 组当前选择的节点。应用分流只在规则模式生效；运行中保存会短暂重连。
@@ -32,7 +33,7 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 准备 Python 3.11 或以上、JDK 17 或以上、Android SDK Platform 36、Build Tools 36.0.0 和 NDK 27.0.12077973。通过 `ANDROID_HOME` 指定 SDK 目录，再运行 `python build.py`。如果 NDK 安装在其他位置，可通过 `ANDROID_NDK_HOME` 指定其目录。脚本校验下载文件的 SHA-256，在 `build` 中生成模块 ZIP，再将其和校验值嵌入 `dist/MinClash.apk`。后续升级应保留 `build/debug.keystore`。
 
-App 当前展示版本为 `0.0.3`，开发构建 `versionCode=13`；内置模块保持 `0.0.2`、`versionCode=11`、功能修订号 `revision=1`。App 与模块不再要求版本一致。只有模块功能实际变更时才增加模块版本和修订号；App 更新单独递增 App 版本号。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
+App 当前展示版本为 `0.0.4`，开发构建 `versionCode=14`；内置模块为 `0.0.2`、`versionCode=11`、功能修订号 `revision=1`。App 与模块分别维护版本。模块功能实际变更时才增加模块版本和修订号；App 更新单独递增 App 版本号。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
 
 上游版本、模块安装规范和 TUN 参数可查阅 [Mihomo v1.19.33](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33)、[Magisk 开发文档](https://topjohnwu.github.io/Magisk/guides.html) 和 [Mihomo TUN 文档](https://wiki.metacubex.one/config/inbound/tun/)。
 

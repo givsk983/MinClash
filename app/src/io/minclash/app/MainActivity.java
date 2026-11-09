@@ -17,8 +17,11 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
 import android.text.Editable;
+import android.text.SpannableString;
 import android.text.TextWatcher;
 import android.text.TextUtils;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.RelativeSizeSpan;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -38,6 +41,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
@@ -61,6 +65,7 @@ public final class MainActivity extends Activity {
     private static final int AMBER = 0xfff5ca88;
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService networkWorker = Executors.newFixedThreadPool(NetworkCheck.values().length);
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable poll = this::pollStatus;
     private Module.Status status;
@@ -78,6 +83,8 @@ public final class MainActivity extends Activity {
     private Button updateButton;
     private Button modeButton;
     private Button groupsButton;
+    private record ProxySummary(Controller.Mode mode, String node) {}
+    private ProxySummary proxySummary;
     private Button routingButton;
     private int routingFilter;
     private String routingQuery = "";
@@ -93,6 +100,9 @@ public final class MainActivity extends Activity {
     private TextView profileSummary;
     private TextView statusBadge;
     private TextView setupHint;
+    private View networkCheckArea;
+    private final TextView[] networkResults = new TextView[NetworkCheck.values().length];
+    private int networkChecksPending;
     private final View[] pages = new View[4];
     private final Button[] navigation = new Button[4];
     private int selectedPage;
@@ -148,11 +158,17 @@ public final class MainActivity extends Activity {
         setupHint.setBackground(shape(0xff302b22, 14, false));
         setupHint.setOnClickListener(view -> selectPage(2));
         add(overview, setupHint, 12);
+        addNetworkCheckCard(overview);
         section(overview, "代理控制");
         modeButton = button("代理模式", false);
         modeButton.setOnClickListener(view -> execute("", Controller::mode));
         groupsButton = button("代理组与节点", false);
         groupsButton.setOnClickListener(view -> execute("", Controller::groups));
+        for (Button control : List.of(modeButton, groupsButton)) {
+            control.setLines(2);
+            control.setLineSpacing(dp(5), 1f);
+            control.setEllipsize(TextUtils.TruncateAt.END);
+        }
         buttonRow(overview, modeButton, groupsButton, 10);
         proxyHint = label("", 13, MUTED, false);
         add(overview, proxyHint, 10);
@@ -320,8 +336,78 @@ public final class MainActivity extends Activity {
     @Override protected void onDestroy() {
         main.removeCallbacks(poll);
         routingIcons.close();
+        networkWorker.shutdownNow();
         worker.shutdown();
         super.onDestroy();
+    }
+
+    private void addNetworkCheckCard(LinearLayout overview) {
+        FrameLayout checks = new FrameLayout(this);
+        checks.setMinimumHeight(dp(48));
+        checks.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9), shape(CARD, 14, true), null));
+        checks.setFocusable(true);
+        checks.setOnClickListener(view -> checkNetwork());
+        networkCheckArea = checks;
+
+        TextView hint = label("点击刷新", 8, 0xff71808b, false);
+        FrameLayout.LayoutParams hintParams = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.RIGHT);
+        hintParams.rightMargin = dp(7);
+        hintParams.bottomMargin = dp(3);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        for (NetworkCheck target : NetworkCheck.values()) {
+            LinearLayout site = column();
+            TextView name = label(target.label, 11, TEXT, true);
+            name.setGravity(Gravity.CENTER);
+            add(site, name, 0);
+            TextView result = label("—", 12, MUTED, true);
+            result.setGravity(Gravity.CENTER);
+            add(site, result, 4);
+            row.addView(site, new LinearLayout.LayoutParams(0, -2, 1));
+            networkResults[target.ordinal()] = result;
+        }
+        FrameLayout.LayoutParams rowParams = new FrameLayout.LayoutParams(-1, -2, Gravity.CENTER_VERTICAL);
+        int sideMargin = (int) Math.ceil(hint.getPaint().measureText(hint.getText().toString())) + dp(12);
+        rowParams.leftMargin = sideMargin;
+        rowParams.rightMargin = sideMargin;
+        rowParams.topMargin = dp(8);
+        rowParams.bottomMargin = dp(8);
+        checks.addView(row, rowParams);
+        checks.addView(hint, hintParams);
+        add(overview, checks, 14);
+    }
+
+    private void checkNetwork() {
+        if (busy || networkChecksPending != 0) return;
+        networkChecksPending = networkResults.length;
+        networkCheckArea.setEnabled(false);
+        for (NetworkCheck target : NetworkCheck.values()) {
+            showNetworkResult(target, "…", MUTED);
+            networkWorker.execute(() -> {
+                NetworkCheck.Result result = target.run();
+                main.post(() -> finishNetworkCheck(target, result));
+            });
+        }
+    }
+
+    private void finishNetworkCheck(NetworkCheck target, NetworkCheck.Result result) {
+        if (isDestroyed()) return;
+        switch (result.state()) {
+            case REACHABLE -> showNetworkResult(target, result.medianMs() + "\u00a0ms", MINT);
+            case TIMEOUT -> showNetworkResult(target, "超时", AMBER);
+            case UNREACHABLE -> showNetworkResult(target, "失败", AMBER);
+            case HTTP_ERROR -> showNetworkResult(target, "HTTP\u00a0" + result.responseCode(), AMBER);
+        }
+        if (--networkChecksPending == 0) {
+            networkCheckArea.setEnabled(!busy);
+        }
+    }
+
+    private void showNetworkResult(NetworkCheck target, String value, int color) {
+        TextView result = networkResults[target.ordinal()];
+        result.setText(value);
+        result.setTextColor(color);
     }
 
     private void refresh() { execute("", Module::status); }
@@ -337,10 +423,12 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             try {
                 Module.Status updated = Module.status();
+                ProxySummary summary = readProxySummary(updated);
                 main.post(() -> {
                     if (isDestroyed()) return;
                     polling = false;
                     status = updated;
+                    proxySummary = summary;
                     render();
                     schedulePoll();
                 });
@@ -359,6 +447,19 @@ public final class MainActivity extends Activity {
     private void schedulePoll() {
         main.removeCallbacks(poll);
         if (visible && !busy && isActive()) main.postDelayed(poll, 4000);
+    }
+
+    private static boolean hasProxyControl(Module.Status status) {
+        return status != null && status.installed() && status.enabled && status.control && status.state.equals("running");
+    }
+
+    private static ProxySummary readProxySummary(Module.Status status) {
+        if (!hasProxyControl(status)) return null;
+        Controller.Mode mode;
+        try { mode = Controller.mode(); }
+        catch (Exception error) { return null; }
+        try { return new ProxySummary(mode, Controller.primaryNode(mode)); }
+        catch (Exception error) { return new ProxySummary(mode, "暂不可用"); }
     }
 
     private String savedSubscription() {
@@ -493,28 +594,24 @@ public final class MainActivity extends Activity {
                 .setMessage("当前配置没有可手动选择的代理组。").setPositiveButton("关闭", null).show();
             return;
         }
+        List<Controller.Group> ordered = new ArrayList<>(groups);
+        ordered.sort(Comparator.comparing((Controller.Group group) -> ProxyGroupSection.of(group.name()))
+            .thenComparing(group -> !ProxyGroupSection.isProxies(group.name())));
         List<PolicyItem> items = new ArrayList<>();
-        for (int i = 0; i < groups.size(); i++) {
-            Controller.Group group = groups.get(i);
+        for (int i = 0; i < ordered.size(); i++) {
+            Controller.Group group = ordered.get(i);
             items.add(new PolicyItem(group.name(), "当前出口 · " + groupRoute(group, groups),
-                group.current().equals("DIRECT") ? "直连" : group.automatic() ? "自动" : "手动", false, true, i));
+                group.current().equals("DIRECT") ? "直连" : group.automatic() ? "自动" : "手动", false, true, i,
+                ProxyGroupSection.of(group.name()).label));
         }
         showPolicyList("代理组与节点", groups.size() + " 个代理组 · 点击查看可选节点", "搜索代理组或当前出口", items,
-            (dialog, index) -> { dialog.dismiss(); showNodes(groups.get(index), groups); }, null);
+            (dialog, index) -> { dialog.dismiss(); showNodes(ordered.get(index), groups); }, null);
     }
 
     private String groupRoute(Controller.Group group, List<Controller.Group> groups) {
-        String current = group.current();
-        StringBuilder route = new StringBuilder();
-        java.util.Set<String> visited = new java.util.HashSet<>();
-        for (int depth = 0; depth < 6 && !current.isEmpty() && visited.add(current); depth++) {
-            if (route.length() > 0) route.append(" → ");
-            route.append(current.equals("DIRECT") ? "直连" : current.equals("REJECT") ? "拒绝连接" : current);
-            String next = "";
-            for (Controller.Group candidate : groups) if (candidate.name().equals(current)) { next = candidate.current(); break; }
-            current = next;
-        }
-        return route.length() == 0 ? "尚未选择" : route.toString();
+        List<String> route = Controller.route(group, groups);
+        if (route.isEmpty()) return "尚未选择";
+        return TextUtils.join(" → ", route.stream().map(Controller::outletLabel).toArray());
     }
 
     private void showNodes(Controller.Group group, List<Controller.Group> groups) {
@@ -528,7 +625,7 @@ public final class MainActivity extends Activity {
             }
             boolean selected = option.equals(group.current());
             items.add(new PolicyItem(option.equals("DIRECT") ? "直连" : option, detail,
-                selected ? "当前" : "", selected, false, i));
+                selected ? "当前" : "", selected, false, i, ""));
         }
         showPolicyList(group.name() + " · 选择出口", group.options().size() + " 个选项 · 点击切换", "搜索节点或代理组", items,
             (dialog, index) -> {
@@ -538,7 +635,8 @@ public final class MainActivity extends Activity {
             }, group.automatic() ? () -> selectNode(group.name(), null) : null);
     }
 
-    private record PolicyItem(String title, String detail, String badge, boolean selected, boolean navigates, int index) {}
+    private record PolicyItem(String title, String detail, String badge, boolean selected, boolean navigates,
+                              int index, String section) {}
 
     private void showPolicyList(String title, String subtitle, String hint, List<PolicyItem> items,
                                 BiConsumer<AlertDialog, Integer> onPick, Runnable reset) {
@@ -556,16 +654,12 @@ public final class MainActivity extends Activity {
         search.setBackground(shape(BG, 12, true));
         add(header, search, 14);
         PolicyAdapter adapter = new PolicyAdapter();
-        adapter.entries.addAll(items);
+        adapter.filter(items, "");
         search.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence text, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence text, int start, int before, int count) {
                 String query = text.toString().trim().toLowerCase(Locale.ROOT);
-                adapter.entries.clear();
-                for (PolicyItem item : items) {
-                    if ((item.title() + " " + item.detail()).toLowerCase(Locale.ROOT).contains(query)) adapter.entries.add(item);
-                }
-                adapter.notifyDataSetChanged();
+                adapter.filter(items, query);
             }
             @Override public void afterTextChanged(Editable text) {}
         });
@@ -578,7 +672,7 @@ public final class MainActivity extends Activity {
         dialog.getListView().setClipToPadding(false);
         dialog.getListView().setOnItemClickListener((parent, view, index, id) -> {
             PolicyItem item = adapter.getItem(index);
-            if (item != null) onPick.accept(dialog, item.index());
+            if (item != null && item.index() >= 0) onPick.accept(dialog, item.index());
         });
         dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
             | android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
@@ -587,11 +681,30 @@ public final class MainActivity extends Activity {
     private record PolicyRow(LinearLayout card, TextView title, TextView detail, TextView badge, TextView arrow) {}
 
     private final class PolicyAdapter extends BaseAdapter {
-        final List<PolicyItem> entries = new ArrayList<>();
+        private final List<PolicyItem> entries = new ArrayList<>();
+
+        void filter(List<PolicyItem> items, String query) {
+            entries.clear();
+            String section = "";
+            for (PolicyItem item : items) {
+                if (!(item.title() + " " + item.detail()).toLowerCase(Locale.ROOT).contains(query)) continue;
+                if (!item.section().isEmpty() && !section.equals(item.section())) {
+                    section = item.section();
+                    entries.add(new PolicyItem(section, "", "", false, false, -1, ""));
+                }
+                entries.add(item);
+            }
+            notifyDataSetChanged();
+        }
+
         @Override public int getCount() { return Math.max(1, entries.size()); }
         @Override public PolicyItem getItem(int index) { return index < entries.size() ? entries.get(index) : null; }
         @Override public long getItemId(int index) { return index; }
-        @Override public boolean isEnabled(int index) { return !entries.isEmpty(); }
+        @Override public boolean areAllItemsEnabled() { return false; }
+        @Override public boolean isEnabled(int index) {
+            PolicyItem item = getItem(index);
+            return item != null && item.index() >= 0;
+        }
         @Override public View getView(int index, View reusable, ViewGroup parent) {
             PolicyItem item = getItem(index);
             if (item == null) {
@@ -599,6 +712,12 @@ public final class MainActivity extends Activity {
                 empty.setPadding(dp(20), dp(32), dp(20), dp(32));
                 empty.setGravity(Gravity.CENTER);
                 return empty;
+            }
+            if (item.index() < 0) {
+                TextView heading = label(item.title(), 12, MUTED, true);
+                heading.setPadding(dp(10), dp(10), dp(10), dp(4));
+                heading.setAccessibilityHeading(true);
+                return heading;
             }
             LinearLayout row;
             PolicyRow holder;
@@ -1008,12 +1127,16 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             try {
                 Object result = operation.run();
+                Module.Status updatedStatus = result instanceof Module.Status updated ? updated
+                    : result instanceof AppRouting.Screen screen ? screen.status() : null;
+                ProxySummary summary = readProxySummary(updatedStatus);
                 main.post(() -> {
                     if (isDestroyed()) return;
                     busy = false;
                     if (!success.isEmpty()) showMessage(success);
                     if (result instanceof Module.Status updated) {
                         status = updated;
+                        proxySummary = summary;
                         getPreferences(MODE_PRIVATE).edit().putBoolean("connected", true).apply();
                     } else if (visible) {
                         if (result instanceof String logs) showLogs(logs);
@@ -1021,6 +1144,7 @@ public final class MainActivity extends Activity {
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
                         if (result instanceof AppRouting.Screen screen) {
                             status = screen.status();
+                            proxySummary = summary;
                             showAppRouting(screen);
                         }
                     }
@@ -1084,14 +1208,19 @@ public final class MainActivity extends Activity {
         boolean subscribed = !savedSubscription().isEmpty() && installed && status.profile;
         updateButton.setVisibility(subscribed ? View.VISIBLE : View.GONE);
         updateButton.setEnabled(canImport && subscribed);
-        boolean canControl = !busy && enabled && status.control && status.state.equals("running");
+        boolean hasControl = hasProxyControl(status);
+        boolean canControl = !busy && hasControl;
         modeButton.setEnabled(canControl);
         groupsButton.setEnabled(canControl);
+        String unavailable = hasControl ? "暂不可用" : "—";
+        setProxyButtonText(modeButton, "代理模式", proxySummary == null ? unavailable : proxySummary.mode().label + "模式");
+        setProxyButtonText(groupsButton, "代理组与节点", proxySummary == null ? unavailable : proxySummary.node());
         routingButton.setEnabled(!busy && enabled && status.profile);
         proxyHint.setText(installed && !status.control ? "请升级 MinClash Root 模块以使用代理控制。"
             : installed && status.state.equals("running") ? "全局模式使用 GLOBAL 组。"
             : "TUN 启动后可切换模式和节点。");
         refreshButton.setEnabled(!busy);
+        networkCheckArea.setEnabled(!busy && networkChecksPending == 0);
         logsButton.setEnabled(!busy && installed);
         moduleSummary.setText("内置模块 " + (bundledModule.valid() ? bundledModule.version() : "信息不可用")
             + (pending ? "\n已提交安装，重启手机后生效。"
@@ -1107,6 +1236,16 @@ public final class MainActivity extends Activity {
         bootSwitch.setEnabled(!busy && enabled);
         updatingSwitch = false;
         messageText.setVisibility(messageText.length() == 0 ? View.GONE : View.VISIBLE);
+    }
+
+    private void setProxyButtonText(Button button, String title, String summary) {
+        SpannableString text = new SpannableString(title + "\n" + summary);
+        text.setSpan(new RelativeSizeSpan(0.85f), title.length() + 1, text.length(), SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE);
+        if (button.isEnabled()) {
+            int muted = (button.getCurrentTextColor() & 0x00ffffff) | 0xaa000000;
+            text.setSpan(new ForegroundColorSpan(muted), title.length() + 1, text.length(), SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        button.setText(text);
     }
 
     private void showMessage(String text) {
