@@ -1,8 +1,10 @@
 package io.minclash.app;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Insets;
@@ -15,6 +17,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.InputType;
 import android.text.Editable;
 import android.text.SpannableString;
@@ -54,8 +57,9 @@ public final class MainActivity extends Activity {
     private static final int EXPORT_MODULE = 2;
     private static final int REQUEST_APP_LIST = 3;
     private static final int APP_LIST_SETTINGS = 4;
+    private static final int REQUEST_NOTIFICATIONS = 5;
+    private static final String NOTIFICATION_CONTROL = "notification_control";
     private static final String ROOT_INVENTORY = "root_app_inventory";
-    private static final String SUBSCRIPTION = "subscription";
     private static final int BG = 0xff0d131a;
     private static final int CARD = 0xff17212b;
     private static final int BORDER = 0xff293641;
@@ -64,7 +68,8 @@ public final class MainActivity extends Activity {
     private static final int MINT = 0xff79e7c9;
     private static final int AMBER = 0xfff5ca88;
 
-    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    // Serialize config writes across Activity recreation as well as within one screen.
+    private static final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final ExecutorService networkWorker = Executors.newFixedThreadPool(NetworkCheck.values().length);
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable poll = this::pollStatus;
@@ -81,6 +86,9 @@ public final class MainActivity extends Activity {
     private Button importButton;
     private Button subscriptionButton;
     private Button updateButton;
+    private TextView subscriptionSummary;
+    private SubscriptionCatalog subscriptionCatalog;
+    private SubscriptionCatalog.Snapshot subscriptions;
     private Button modeButton;
     private Button groupsButton;
     private record ProxySummary(Controller.Mode mode, String node) {}
@@ -94,6 +102,9 @@ public final class MainActivity extends Activity {
     private Button refreshButton;
     private Button logsButton;
     private Switch bootSwitch;
+    private Button notificationButton;
+    private boolean pickNodePending;
+    private AlertDialog proxyPickerDialog;
     private Button installButton;
     private Button exportButton;
     private TextView moduleSummary;
@@ -110,6 +121,7 @@ public final class MainActivity extends Activity {
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         routingIcons = new AppIconLoader(this);
+        subscriptionCatalog = new SubscriptionCatalog(getPreferences(MODE_PRIVATE), new RoutingStore(this));
         LinearLayout root = column();
         root.setBackgroundColor(BG);
         root.setOnApplyWindowInsetsListener((view, insets) -> {
@@ -184,18 +196,21 @@ public final class MainActivity extends Activity {
         LinearLayout profiles = page(content, 1);
         header(profiles, "配置", "管理订阅与本地文件");
         LinearLayout settings = card(profiles, 22);
-        add(settings, label("导入配置", 17, TEXT, true), 0);
-        add(settings, label("使用 Clash / Mihomo 格式的订阅或 YAML 文件。", 13, MUTED, false), 8);
-        subscriptionButton = button("导入订阅链接", true);
-        subscriptionButton.setOnClickListener(view -> promptSubscription());
+        add(settings, label("订阅与配置", 17, TEXT, true), 0);
+        subscriptionSummary = label("正在读取订阅…", 13, MUTED, false);
+        add(settings, subscriptionSummary, 8);
+        subscriptionButton = button("管理订阅", true);
+        subscriptionButton.setOnClickListener(view -> showSubscriptions());
         add(settings, subscriptionButton, 20);
         updateButton = button("更新当前订阅", false);
-        updateButton.setOnClickListener(view -> importSubscription(savedSubscription()));
+        updateButton.setOnClickListener(view -> {
+            if (subscriptions != null) activateSubscription(subscriptions.active());
+        });
         add(settings, updateButton, 10);
         importButton = button("导入 Mihomo YAML", false);
         importButton.setOnClickListener(view -> pickProfile());
         add(settings, importButton, 10);
-        add(settings, label("更换配置前，请先停止连接。", 12, MUTED, false), 14);
+        add(settings, label("运行中切换或更新订阅会短暂重连。导入本地文件前请先停止 TUN。", 12, MUTED, false), 14);
         LinearLayout routing = card(profiles, 14);
         add(routing, label("应用分流", 17, TEXT, true), 0);
         add(routing, label("给应用指定直连或代理组。你的设置优先于机场规则，更新订阅后继续保留。", 13, MUTED, false), 8);
@@ -229,6 +244,10 @@ public final class MainActivity extends Activity {
             });
         });
         add(service, bootSwitch, 0);
+        notificationButton = button("开启通知栏控制", false);
+        notificationButton.setOnClickListener(view -> toggleNotificationControl());
+        add(service, notificationButton, 14);
+        add(service, label("TUN 运行时显示状态、模式和节点，可从通知栏切换节点。", 12, MUTED, false), 6);
         add(service, label("手机启动后自动连接，需先导入有效配置。", 12, MUTED, false), 6);
 
         LinearLayout moduleCard = card(preferences, 14);
@@ -309,12 +328,16 @@ public final class MainActivity extends Activity {
         root.addView(bar);
         try { bundledModule = BundledModule.info(this); }
         catch (IOException error) { showMessage("无法读取内置模块信息，现有模块仍可继续运行。"); }
-        selectPage(savedInstanceState == null ? 0 : savedInstanceState.getInt("page", 0));
+        pickNodePending = savedInstanceState != null && savedInstanceState.getBoolean("pickNodePending");
+        readNotificationAction(getIntent());
+        selectPage(pickNodePending || savedInstanceState == null ? 0 : savedInstanceState.getInt("page", 0));
         render();
+        worker.execute(this::refreshSubscriptionCatalog);
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
         state.putInt("page", selectedPage);
+        state.putBoolean("pickNodePending", pickNodePending);
         super.onSaveInstanceState(state);
     }
 
@@ -324,7 +347,80 @@ public final class MainActivity extends Activity {
         routingLoader.invalidate();
         routingIcons.invalidate();
         visible = true;
-        if (getPreferences(MODE_PRIVATE).getBoolean("connected", false)) main.post(poll);
+        if (pickNodePending || getPreferences(MODE_PRIVATE).getBoolean("connected", false)) main.post(poll);
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        readNotificationAction(intent);
+        if (pickNodePending) {
+            selectPage(0);
+            if (status == null) main.post(poll);
+            else openPendingNodePicker();
+        }
+    }
+
+    private void readNotificationAction(Intent intent) {
+        if (ProxyNotificationService.ACTION_PICK_NODE.equals(intent.getAction())) {
+            pickNodePending = proxyPickerDialog == null || !proxyPickerDialog.isShowing();
+            intent.setAction(null);
+        }
+    }
+
+    private void openPendingNodePicker() {
+        if (!pickNodePending || !visible || busy || status == null) return;
+        pickNodePending = false;
+        if (proxyPickerDialog != null && proxyPickerDialog.isShowing()) return;
+        if (!hasProxyControl(status)) {
+            showMessage("TUN 运行且代理控制可用时才能切换节点。");
+            return;
+        }
+        execute("", () -> new NodePicker(Controller.mode(), Controller.groups()));
+    }
+
+    private record NodePicker(Controller.Mode mode, Controller.Groups groups) {}
+
+    private void showCurrentNodePicker(NodePicker picker) {
+        List<Controller.Group> groups = picker.groups().values();
+        Controller.Group primary = Controller.primaryGroup(picker.mode(), groups);
+        if (primary == null) {
+            showGroups(groups);
+            return;
+        }
+        Controller.Group selected = primary;
+        for (String name : Controller.route(primary, groups)) {
+            for (Controller.Group group : groups) {
+                if (group.name().equals(name)) { selected = group; break; }
+            }
+        }
+        showNodes(selected, groups, () -> showGroups(groups));
+    }
+
+    private boolean notificationEnabled() {
+        return getPreferences(MODE_PRIVATE).getBoolean(NOTIFICATION_CONTROL, false);
+    }
+
+    private void toggleNotificationControl() {
+        if (notificationEnabled()) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean(NOTIFICATION_CONTROL, false).apply();
+            ProxyNotificationService.sync(this, false);
+            render();
+        } else if (Build.VERSION.SDK_INT >= 33
+            && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATIONS);
+        } else {
+            enableNotificationControl();
+        }
+    }
+
+    private void enableNotificationControl() {
+        if (!ProxyNotificationService.canShow(this)) {
+            startActivity(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()));
+            return;
+        }
+        getPreferences(MODE_PRIVATE).edit().putBoolean(NOTIFICATION_CONTROL, true).apply();
+        render();
     }
 
     @Override protected void onStop() {
@@ -337,7 +433,6 @@ public final class MainActivity extends Activity {
         main.removeCallbacks(poll);
         routingIcons.close();
         networkWorker.shutdownNow();
-        worker.shutdown();
         super.onDestroy();
     }
 
@@ -462,8 +557,21 @@ public final class MainActivity extends Activity {
         catch (Exception error) { return new ProxySummary(mode, "暂不可用"); }
     }
 
-    private String savedSubscription() {
-        return getPreferences(MODE_PRIVATE).getString(SUBSCRIPTION, "");
+    private void refreshSubscriptionCatalog() {
+        try {
+            SubscriptionCatalog.Snapshot loaded = subscriptionCatalog.load();
+            main.post(() -> {
+                if (isDestroyed()) return;
+                subscriptions = loaded;
+                render();
+            });
+        } catch (Exception error) {
+            main.post(() -> {
+                if (isDestroyed()) return;
+                if (subscriptions == null) subscriptionSummary.setText("无法读取订阅列表");
+                showMessage("无法读取订阅列表。");
+            });
+        }
     }
 
     private String appVersion() {
@@ -498,40 +606,144 @@ public final class MainActivity extends Activity {
         startActivityForResult(picker, EXPORT_MODULE);
     }
 
-    private void promptSubscription() {
+    private void showSubscriptions() {
+        if (subscriptions == null || busy) return;
+        List<SubscriptionCatalog.Entry> entries = subscriptions.entries();
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("管理订阅")
+            .setNegativeButton("关闭", null).setPositiveButton("添加订阅", (view, which) -> promptSubscription());
+        if (entries.isEmpty()) {
+            dialog.setMessage("还没有保存的订阅。可添加 Clash / Mihomo 订阅链接。");
+        } else {
+            String[] names = entries.stream().map(entry -> entry.name() +
+                (entry.address().equals(subscriptions.activeAddress()) ? "  ·  当前使用" : "")).toArray(String[]::new);
+            dialog.setItems(names, (view, index) -> showSubscriptionActions(entries.get(index)));
+        }
+        dialog.show();
+    }
+
+    private void showSubscriptionActions(SubscriptionCatalog.Entry entry) {
+        boolean active = entry.address().equals(subscriptions.activeAddress());
+        String use = active ? "更新订阅" : "切换到此订阅";
+        List<String> actions = new ArrayList<>();
+        if (canApplySubscription()) actions.add(use);
+        actions.add("重命名");
+        if (!active) actions.add("删除");
+        new AlertDialog.Builder(this).setTitle(entry.name())
+            .setItems(actions.toArray(new String[0]), (dialog, index) -> {
+                switch (actions.get(index)) {
+                    case "重命名" -> renameSubscription(entry);
+                    case "删除" -> new AlertDialog.Builder(this).setTitle("删除订阅")
+                        .setMessage("从列表移除「" + entry.name() + "」？")
+                        .setNegativeButton("取消", null).setPositiveButton("删除", (view, which) -> {
+                            List<SubscriptionCatalog.Entry> entries = new ArrayList<>(subscriptions.entries());
+                            entries.remove(entry);
+                            saveSubscriptions(entries, "已删除订阅。");
+                        }).show();
+                    default -> activateSubscription(entry);
+                }
+            }).setNegativeButton("返回", (dialog, which) -> showSubscriptions()).show();
+    }
+
+    private EditText subscriptionInput(String hint, int inputType) {
         EditText input = new EditText(this);
-        input.setHint("https://");
+        input.setHint(hint);
         input.setSingleLine(true);
         input.setTextColor(TEXT);
         input.setHintTextColor(MUTED);
         input.setTextSize(14);
         input.setPadding(dp(14), dp(14), dp(14), dp(14));
         input.setBackground(shape(BG, 12, true));
-        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        input.setInputType(inputType);
         input.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
+        return input;
+    }
+
+    private void promptSubscription() {
+        EditText nameInput = subscriptionInput("订阅名称（选填）", InputType.TYPE_CLASS_TEXT);
+        EditText input = subscriptionInput("https://", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        LinearLayout content = column();
+        content.setPadding(dp(20), dp(4), dp(20), 0);
+        add(content, nameInput, 0);
+        add(content, input, 10);
+        boolean canActivate = canApplySubscription();
+        AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle("添加订阅")
+            .setMessage("粘贴机场提供的 Clash / Mihomo 订阅链接。")
+            .setView(content).setNegativeButton("取消", null).setPositiveButton(canActivate ? "保存并启用" : "保存", null);
+        if (canActivate) builder.setNeutralButton("仅保存", null);
+        AlertDialog dialog = builder.show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> addSubscription(dialog, nameInput, input, canActivate));
+        if (canActivate) dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+            .setOnClickListener(view -> addSubscription(dialog, nameInput, input, false));
+    }
+
+    private void addSubscription(AlertDialog dialog, EditText nameInput, EditText input, boolean activate) {
+        if (busy) return;
+        String address = input.getText().toString().trim();
+        String host;
+        try { host = Subscription.host(address); }
+        catch (IOException invalid) {
+            input.setError(invalid.getMessage());
+            return;
+        }
+        if (subscriptions.entries().stream().anyMatch(entry -> entry.address().equals(address))) {
+            input.setError("此订阅已在列表中。");
+            return;
+        }
+        String name = nameInput.getText().toString().trim();
+        SubscriptionCatalog.Entry entry = new SubscriptionCatalog.Entry(name.isEmpty() ? host : name, address);
+        List<SubscriptionCatalog.Entry> entries = new ArrayList<>(subscriptions.entries());
+        entries.add(entry);
+        dialog.dismiss();
+        if (activate && canApplySubscription()) {
+            execute("订阅已保存并启用。", () -> {
+                subscriptionCatalog.save(entries);
+                return applySubscription(entry.address());
+            });
+        } else {
+            saveSubscriptions(entries, "订阅已保存。");
+        }
+    }
+
+    private void renameSubscription(SubscriptionCatalog.Entry entry) {
+        EditText input = subscriptionInput("订阅名称", InputType.TYPE_CLASS_TEXT);
+        input.setText(entry.name());
+        input.selectAll();
         LinearLayout content = column();
         content.setPadding(dp(20), dp(4), dp(20), 0);
         add(content, input, 0);
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("导入订阅链接")
-            .setMessage("粘贴机场提供的 Clash / Mihomo 订阅链接。")
-            .setView(content).setNegativeButton("取消", null).setPositiveButton("下载并导入", null).show();
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("重命名订阅")
+            .setView(content).setNegativeButton("取消", null).setPositiveButton("保存", null).show();
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
-            String address = input.getText().toString().trim();
-            if (address.isEmpty()) {
-                input.setError("请输入订阅链接。");
-                return;
-            }
+            String name = input.getText().toString().trim();
+            if (name.isEmpty()) { input.setError("请输入订阅名称。"); return; }
+            List<SubscriptionCatalog.Entry> entries = new ArrayList<>(subscriptions.entries());
+            entries.set(entries.indexOf(entry), new SubscriptionCatalog.Entry(name, entry.address()));
             dialog.dismiss();
-            importSubscription(address);
+            saveSubscriptions(entries, "订阅已重命名。");
         });
     }
 
-    private void importSubscription(String address) {
-        execute("订阅已通过 Mihomo 校验并保存。", () -> {
-            new RoutingStore(this).importProfile(Subscription.fetch(address));
-            getPreferences(MODE_PRIVATE).edit().putString(SUBSCRIPTION, address).apply();
-            return Module.status();
+    private void saveSubscriptions(List<SubscriptionCatalog.Entry> entries, String success) {
+        execute(success, () -> {
+            subscriptionCatalog.save(entries);
+            refreshSubscriptionCatalog();
+            return null;
         });
+    }
+
+    private void activateSubscription(SubscriptionCatalog.Entry entry) {
+        if (entry == null || !canApplySubscription()) return;
+        boolean active = entry.address().equals(subscriptions.activeAddress());
+        execute(active ? "订阅已更新。" : "已切换到「" + entry.name() + "」。", () -> applySubscription(entry.address()));
+    }
+
+    private Module.Status applySubscription(String address) throws Exception {
+        try {
+            new RoutingStore(this).importProfile(Subscription.fetch(address), address);
+        } finally {
+            refreshSubscriptionCatalog();
+        }
+        return Module.status();
     }
 
     private void pickProfile() {
@@ -564,9 +776,10 @@ public final class MainActivity extends Activity {
         execute("配置已通过 Mihomo 校验并保存。", () -> {
             try (InputStream input = getContentResolver().openInputStream(uri)) {
                 if (input == null) throw new IOException("无法打开所选文件。");
-                new RoutingStore(this).importProfile(Profile.normalize(input));
+                new RoutingStore(this).importProfile(Profile.normalize(input), "");
+            } finally {
+                refreshSubscriptionCatalog();
             }
-            getPreferences(MODE_PRIVATE).edit().remove(SUBSCRIPTION).apply();
             return Module.status();
         });
     }
@@ -590,8 +803,8 @@ public final class MainActivity extends Activity {
 
     private void showGroups(List<Controller.Group> groups) {
         if (groups.isEmpty()) {
-            new AlertDialog.Builder(this).setTitle("代理组与节点")
-                .setMessage("当前配置没有可手动选择的代理组。").setPositiveButton("关闭", null).show();
+            rememberProxyPicker(new AlertDialog.Builder(this).setTitle("代理组与节点")
+                .setMessage("当前配置没有可手动选择的代理组。").setPositiveButton("关闭", null).show());
             return;
         }
         List<Controller.Group> ordered = new ArrayList<>(groups);
@@ -605,7 +818,7 @@ public final class MainActivity extends Activity {
                 ProxyGroupSection.of(group.name()).label));
         }
         showPolicyList("代理组与节点", groups.size() + " 个代理组 · 点击查看可选节点", "搜索代理组或当前出口", items,
-            (dialog, index) -> { dialog.dismiss(); showNodes(ordered.get(index), groups); }, null);
+            (dialog, index) -> { dialog.dismiss(); showNodes(ordered.get(index), groups, null); }, null, null);
     }
 
     private String groupRoute(Controller.Group group, List<Controller.Group> groups) {
@@ -614,7 +827,7 @@ public final class MainActivity extends Activity {
         return TextUtils.join(" → ", route.stream().map(Controller::outletLabel).toArray());
     }
 
-    private void showNodes(Controller.Group group, List<Controller.Group> groups) {
+    private void showNodes(Controller.Group group, List<Controller.Group> groups, Runnable browseGroups) {
         List<PolicyItem> items = new ArrayList<>();
         for (int i = 0; i < group.options().size(); i++) {
             String option = group.options().get(i);
@@ -632,14 +845,14 @@ public final class MainActivity extends Activity {
                 dialog.dismiss();
                 String option = group.options().get(index);
                 if (!option.equals(group.current())) selectNode(group.name(), option);
-            }, group.automatic() ? () -> selectNode(group.name(), null) : null);
+            }, group.automatic() ? () -> selectNode(group.name(), null) : null, browseGroups);
     }
 
     private record PolicyItem(String title, String detail, String badge, boolean selected, boolean navigates,
                               int index, String section) {}
 
     private void showPolicyList(String title, String subtitle, String hint, List<PolicyItem> items,
-                                BiConsumer<AlertDialog, Integer> onPick, Runnable reset) {
+                                BiConsumer<AlertDialog, Integer> onPick, Runnable reset, Runnable browseGroups) {
         LinearLayout header = column();
         header.setPadding(dp(20), dp(20), dp(20), dp(8));
         add(header, label(title, 20, TEXT, true), 0);
@@ -666,7 +879,9 @@ public final class MainActivity extends Activity {
         AlertDialog.Builder builder = new AlertDialog.Builder(this).setCustomTitle(header)
             .setAdapter(adapter, null).setNegativeButton("关闭", null);
         if (reset != null) builder.setNeutralButton("恢复自动", (dialog, which) -> reset.run());
+        if (browseGroups != null) builder.setPositiveButton("所有代理组", (dialog, which) -> browseGroups.run());
         AlertDialog dialog = builder.show();
+        rememberProxyPicker(dialog);
         dialog.getListView().setDivider(null);
         dialog.getListView().setPadding(dp(10), dp(4), dp(10), dp(6));
         dialog.getListView().setClipToPadding(false);
@@ -676,6 +891,13 @@ public final class MainActivity extends Activity {
         });
         dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
             | android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+    }
+
+    private void rememberProxyPicker(AlertDialog dialog) {
+        proxyPickerDialog = dialog;
+        dialog.setOnDismissListener(dismissed -> {
+            if (proxyPickerDialog == dialog) proxyPickerDialog = null;
+        });
     }
 
     private record PolicyRow(LinearLayout card, TextView title, TextView detail, TextView badge, TextView arrow) {}
@@ -790,6 +1012,11 @@ public final class MainActivity extends Activity {
 
     @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(request, permissions, results);
+        if (request == REQUEST_NOTIFICATIONS) {
+            if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) enableNotificationControl();
+            else showMessage("开启通知栏控制需要在系统设置中允许 MinClash 通知。");
+            return;
+        }
         if (request == REQUEST_APP_LIST) refreshAppRouting(getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
     }
 
@@ -1111,7 +1338,7 @@ public final class MainActivity extends Activity {
                 else rules.put(app.packageName(), target);
                 listDialog.dismiss();
                 execute("应用分流已保存。", () -> {
-                    new RoutingStore(this).apply(new RoutingStore.State(screen.state().source(), rules));
+                    new RoutingStore(this).apply(new RoutingStore.State(screen.state().source(), rules, screen.state().subscription()));
                     return routingLoader.load(this, getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false), Module.status());
                 });
             }).show();
@@ -1142,6 +1369,7 @@ public final class MainActivity extends Activity {
                         if (result instanceof String logs) showLogs(logs);
                         if (result instanceof Controller.Mode mode) showModes(mode);
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
+                        if (result instanceof NodePicker picker) showCurrentNodePicker(picker);
                         if (result instanceof AppRouting.Screen screen) {
                             status = screen.status();
                             proxySummary = summary;
@@ -1164,6 +1392,11 @@ public final class MainActivity extends Activity {
     }
 
     private boolean isActive() { return status != null && status.installed() && !status.state.equals("stopped"); }
+
+    private boolean canApplySubscription() {
+        return !busy && status != null && status.installed() && status.enabled
+            && (status.state.equals("stopped") || status.state.equals("running"));
+    }
 
     private void render() {
         boolean installed = status != null && status.installed();
@@ -1195,8 +1428,11 @@ public final class MainActivity extends Activity {
             : moduleUpdate ? "模块有功能更新：" + bundledModule.version() + "，前往设置安装  →" : "";
         setupHint.setText(setup);
         setupHint.setVisibility(setup.isEmpty() ? View.GONE : View.VISIBLE);
-        profileSummary.setText(installed && status.profile
-            ? (savedSubscription().isEmpty() ? "本地配置已就绪" : "订阅配置已就绪") : "尚未导入配置");
+        SubscriptionCatalog.Entry active = subscriptions == null ? null : subscriptions.active();
+        String current = active != null ? "当前订阅 · " + active.name()
+            : installed && status.profile ? "本地配置已就绪" : "尚未启用订阅";
+        profileSummary.setText(installed && status.profile ? current : "尚未导入配置");
+        if (subscriptions != null) subscriptionSummary.setText(current);
         if (busy) refreshButton.setText("处理中…");
         else refreshButton.setText(installed ? "刷新状态" : "检测环境");
         toggle.setText(status == null ? "检测环境" : !installed ? "前往安装模块" : isActive() ? "停止 TUN" : "启动 TUN");
@@ -1204,10 +1440,10 @@ public final class MainActivity extends Activity {
             || installed && (isActive() || enabled && status.profile)));
         boolean canImport = !busy && enabled && !isActive();
         importButton.setEnabled(canImport);
-        subscriptionButton.setEnabled(canImport);
-        boolean subscribed = !savedSubscription().isEmpty() && installed && status.profile;
+        subscriptionButton.setEnabled(!busy && subscriptions != null);
+        boolean subscribed = active != null && installed && status.profile;
         updateButton.setVisibility(subscribed ? View.VISIBLE : View.GONE);
-        updateButton.setEnabled(canImport && subscribed);
+        updateButton.setEnabled(canApplySubscription() && subscribed);
         boolean hasControl = hasProxyControl(status);
         boolean canControl = !busy && hasControl;
         modeButton.setEnabled(canControl);
@@ -1235,7 +1471,11 @@ public final class MainActivity extends Activity {
         bootSwitch.setChecked(installed && status.boot);
         bootSwitch.setEnabled(!busy && enabled);
         updatingSwitch = false;
+        boolean notification = notificationEnabled();
+        notificationButton.setText(notification ? "关闭通知栏控制" : "开启通知栏控制");
+        if (visible && !busy && status != null) ProxyNotificationService.sync(this, notification && enabled && isActive());
         messageText.setVisibility(messageText.length() == 0 ? View.GONE : View.VISIBLE);
+        openPendingNodePicker();
     }
 
     private void setProxyButtonText(Button button, String title, String summary) {

@@ -18,7 +18,9 @@ import org.json.JSONObject;
 
 /** Private subscription source and personal policies, independent of the generated core config. */
 final class RoutingStore {
-    record State(byte[] source, Map<String, String> applications) {
+    record State(byte[] source, Map<String, String> applications, String subscription) {
+        State(byte[] source, Map<String, String> applications) { this(source, applications, null); }
+
         State {
             source = source.clone();
             applications = Collections.unmodifiableMap(new TreeMap<>(applications));
@@ -36,12 +38,30 @@ final class RoutingStore {
         return saved == null ? new State(Profile.normalize(Module.readProfile()), Collections.emptyMap()) : saved;
     }
 
-    void importProfile(byte[] source) throws Exception {
+    void importProfile(byte[] source, String subscription) throws Exception {
         State saved = read();
-        apply(new State(source, saved == null ? Collections.emptyMap() : saved.applications()));
+        apply(new State(source, saved == null ? Collections.emptyMap() : saved.applications(), subscription));
+    }
+
+    String savedSubscription(String legacyAddress) throws Exception {
+        JSONObject object = readObject();
+        return object == null ? legacyAddress : object.optString("subscription", legacyAddress);
     }
 
     private State read() throws Exception {
+        JSONObject object = readObject();
+        if (object == null) return null;
+        JSONObject rules = object.getJSONObject("applications");
+        Map<String, String> applications = new TreeMap<>();
+        for (Iterator<String> keys = rules.keys(); keys.hasNext();) {
+            String name = keys.next();
+            applications.put(name, rules.getString(name));
+        }
+        return new State(Profile.normalize(object.getString("source").getBytes(StandardCharsets.UTF_8)), applications,
+            object.optString("subscription", null));
+    }
+
+    private JSONObject readObject() throws Exception {
         InputStream input;
         try { input = file.openRead(); }
         catch (FileNotFoundException missing) { return null; }
@@ -55,13 +75,7 @@ final class RoutingStore {
             }
             JSONObject object = new JSONObject(bytes.toString(StandardCharsets.UTF_8.name()));
             if (object.getInt("version") != 1) throw new IOException("应用分流设置版本不受支持。");
-            JSONObject rules = object.getJSONObject("applications");
-            Map<String, String> applications = new TreeMap<>();
-            for (Iterator<String> keys = rules.keys(); keys.hasNext();) {
-                String name = keys.next();
-                applications.put(name, rules.getString(name));
-            }
-            return new State(Profile.normalize(object.getString("source").getBytes(StandardCharsets.UTF_8)), applications);
+            return object;
         }
     }
 
@@ -70,6 +84,7 @@ final class RoutingStore {
         object.put("version", 1);
         object.put("source", new String(state.source(), StandardCharsets.UTF_8));
         object.put("applications", new JSONObject(state.applications()));
+        object.put("subscription", state.subscription());
         byte[] bytes = object.toString().getBytes(StandardCharsets.UTF_8);
         FileOutputStream output = null;
         try {
@@ -108,7 +123,7 @@ final class RoutingStore {
         if (reconnect) {
             try { restart(selections); }
             catch (Exception error) {
-                throw new IOException("应用规则已保存，但恢复连接或节点选择失败，请检查代理组及连接状态。\n" + error.getMessage(), error);
+                throw new IOException("配置已保存，但恢复连接或节点选择失败，请检查代理组及连接状态。\n" + error.getMessage(), error);
             }
         }
     }

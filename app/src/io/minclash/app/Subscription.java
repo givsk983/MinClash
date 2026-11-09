@@ -8,6 +8,8 @@ import java.net.SocketTimeoutException;
 import java.net.URL;
 
 final class Subscription {
+    static String host(String address) throws IOException { return parse(null, address).getHost(); }
+
     static byte[] fetch(String address) throws IOException {
         URL url = parse(null, address);
         for (int redirects = 0; redirects <= 5; redirects++) {

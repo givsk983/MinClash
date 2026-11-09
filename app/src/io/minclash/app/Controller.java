@@ -58,15 +58,20 @@ final class Controller {
 
     static String primaryNode(Mode mode) throws Exception {
         List<Group> groups = groups(false).values();
+        Group primary = primaryGroup(mode, groups);
+        if (primary == null) return "未找到主代理";
+        List<String> route = route(primary, groups);
+        return route.isEmpty() ? "尚未选择" : outletLabel(route.get(route.size() - 1));
+    }
+
+    static Group primaryGroup(Mode mode, List<Group> groups) {
         Group primary = groups.stream().filter(group -> mode == Mode.GLOBAL
             ? ProxyGroupSection.isGlobal(group.name()) : ProxyGroupSection.isProxies(group.name())).findFirst().orElse(null);
         if (primary == null && mode != Mode.GLOBAL) {
             primary = groups.stream().filter(group -> ProxyGroupSection.of(group.name()) == ProxyGroupSection.MAIN
                 && !ProxyGroupSection.isGlobal(group.name())).min(Comparator.comparing(Group::automatic)).orElse(null);
         }
-        if (primary == null) return "未找到主代理";
-        List<String> route = route(primary, groups);
-        return route.isEmpty() ? "尚未选择" : outletLabel(route.get(route.size() - 1));
+        return primary;
     }
 
     static List<String> route(Group group, List<Group> groups) {
