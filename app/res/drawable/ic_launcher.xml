@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="48dp" android:height="48dp" android:viewportWidth="48" android:viewportHeight="48">
-    <path android:fillColor="#132C32" android:pathData="M0,0h48v48h-48z" />
-    <path android:fillColor="#79E7C9" android:pathData="M9,34V14h5l10,11 10,-11h5v20h-5V21l-10,11 -10,-11v13z" />
-</vector>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#181C22" />
+        </shape>
+    </item>
+    <item android:drawable="@drawable/ic_launcher_mark" />
+</layer-list>

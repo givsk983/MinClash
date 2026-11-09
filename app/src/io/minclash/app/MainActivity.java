@@ -3,7 +3,10 @@ package io.minclash.app;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
@@ -101,8 +104,11 @@ public final class MainActivity extends Activity {
     private TextView proxyHint;
     private Button refreshButton;
     private Button logsButton;
+    private Button diagnosticsButton;
     private Switch bootSwitch;
     private Button notificationButton;
+    private Button launcherIconButton;
+    private ImageView aboutLogo;
     private boolean pickNodePending;
     private AlertDialog proxyPickerDialog;
     private Button installButton;
@@ -118,10 +124,15 @@ public final class MainActivity extends Activity {
     private final Button[] navigation = new Button[4];
     private int selectedPage;
 
+    private SharedPreferences appPreferences() {
+        // Keep the original Activity preference file across all launcher aliases.
+        return getSharedPreferences("MainActivity", MODE_PRIVATE);
+    }
+
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         routingIcons = new AppIconLoader(this);
-        subscriptionCatalog = new SubscriptionCatalog(getPreferences(MODE_PRIVATE), new RoutingStore(this));
+        subscriptionCatalog = new SubscriptionCatalog(appPreferences(), new RoutingStore(this));
         LinearLayout root = column();
         root.setBackgroundColor(BG);
         root.setOnApplyWindowInsetsListener((view, insets) -> {
@@ -250,6 +261,12 @@ public final class MainActivity extends Activity {
         add(service, label("TUN 运行时显示状态、模式和节点，可从通知栏切换节点。", 12, MUTED, false), 6);
         add(service, label("手机启动后自动连接，需先导入有效配置。", 12, MUTED, false), 6);
 
+        LinearLayout appearance = card(preferences, 14);
+        add(appearance, label("外观", 17, TEXT, true), 0);
+        launcherIconButton = button("", false);
+        launcherIconButton.setOnClickListener(view -> showLauncherIcons());
+        add(appearance, launcherIconButton, 10);
+
         LinearLayout moduleCard = card(preferences, 14);
         add(moduleCard, label("内置模块", 17, TEXT, true), 0);
         moduleSummary = label("", 13, MUTED, false);
@@ -276,12 +293,12 @@ public final class MainActivity extends Activity {
         header(information, "关于", "软件信息与项目动态");
         LinearLayout identity = card(information, 22);
         identity.setGravity(Gravity.CENTER_HORIZONTAL);
-        ImageView logo = new ImageView(this);
-        logo.setImageResource(getResources().getIdentifier("ic_launcher", "drawable", getPackageName()));
-        logo.setBackground(shape(0xff132c32, 16, false));
-        logo.setClipToOutline(true);
-        logo.setContentDescription("MinClash 图标");
-        identity.addView(logo, new LinearLayout.LayoutParams(dp(60), dp(60)));
+        aboutLogo = new ImageView(this);
+        aboutLogo.setBackground(shape(CARD, 16, false));
+        aboutLogo.setClipToOutline(true);
+        aboutLogo.setContentDescription("MinClash 图标");
+        identity.addView(aboutLogo, new LinearLayout.LayoutParams(dp(60), dp(60)));
+        updateLauncherIcon();
         TextView applicationName = label("MinClash", 24, TEXT, true);
         applicationName.setGravity(Gravity.CENTER);
         add(identity, applicationName, 16);
@@ -291,6 +308,14 @@ public final class MainActivity extends Activity {
         TextView description = label("轻量的 Android Root TUN 工具\n管理订阅、代理模式与节点连接", 13, MUTED, false);
         description.setGravity(Gravity.CENTER);
         add(identity, description, 14);
+
+        LinearLayout diagnostics = card(information, 14);
+        add(diagnostics, label("诊断与反馈", 17, TEXT, true), 0);
+        add(diagnostics, label("检查模块、TUN、网络和节点 DNS。可预览报告，再复制或分享给维护者。",
+            13, MUTED, false), 8);
+        diagnosticsButton = button("生成诊断报告", false);
+        diagnosticsButton.setOnClickListener(view -> runDiagnostics(null));
+        add(diagnostics, diagnosticsButton, 14);
 
         LinearLayout links = card(information, 14);
         add(links, label("项目与社区", 17, TEXT, true), 0);
@@ -347,7 +372,7 @@ public final class MainActivity extends Activity {
         routingLoader.invalidate();
         routingIcons.invalidate();
         visible = true;
-        if (pickNodePending || getPreferences(MODE_PRIVATE).getBoolean("connected", false)) main.post(poll);
+        if (pickNodePending || appPreferences().getBoolean("connected", false)) main.post(poll);
     }
 
     @Override protected void onNewIntent(Intent intent) {
@@ -397,12 +422,12 @@ public final class MainActivity extends Activity {
     }
 
     private boolean notificationEnabled() {
-        return getPreferences(MODE_PRIVATE).getBoolean(NOTIFICATION_CONTROL, false);
+        return appPreferences().getBoolean(NOTIFICATION_CONTROL, false);
     }
 
     private void toggleNotificationControl() {
         if (notificationEnabled()) {
-            getPreferences(MODE_PRIVATE).edit().putBoolean(NOTIFICATION_CONTROL, false).apply();
+            appPreferences().edit().putBoolean(NOTIFICATION_CONTROL, false).apply();
             ProxyNotificationService.sync(this, false);
             render();
         } else if (Build.VERSION.SDK_INT >= 33
@@ -419,7 +444,7 @@ public final class MainActivity extends Activity {
                 .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()));
             return;
         }
-        getPreferences(MODE_PRIVATE).edit().putBoolean(NOTIFICATION_CONTROL, true).apply();
+        appPreferences().edit().putBoolean(NOTIFICATION_CONTROL, true).apply();
         render();
     }
 
@@ -488,12 +513,7 @@ public final class MainActivity extends Activity {
 
     private void finishNetworkCheck(NetworkCheck target, NetworkCheck.Result result) {
         if (isDestroyed()) return;
-        switch (result.state()) {
-            case REACHABLE -> showNetworkResult(target, result.medianMs() + "\u00a0ms", MINT);
-            case TIMEOUT -> showNetworkResult(target, "超时", AMBER);
-            case UNREACHABLE -> showNetworkResult(target, "失败", AMBER);
-            case HTTP_ERROR -> showNetworkResult(target, "HTTP\u00a0" + result.responseCode(), AMBER);
-        }
+        showNetworkResult(target, result.display(), result.state() == NetworkCheck.State.REACHABLE ? MINT : AMBER);
         if (--networkChecksPending == 0) {
             networkCheckArea.setEnabled(!busy);
         }
@@ -667,7 +687,7 @@ public final class MainActivity extends Activity {
         add(content, input, 10);
         boolean canActivate = canApplySubscription();
         AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle("添加订阅")
-            .setMessage("粘贴机场提供的 Clash / Mihomo 订阅链接。")
+            .setMessage("粘贴机场提供的 Clash / Mihomo 订阅链接。\n" + Subscription.PROXY_HINT)
             .setView(content).setNegativeButton("取消", null).setPositiveButton(canActivate ? "保存并启用" : "保存", null);
         if (canActivate) builder.setNeutralButton("仅保存", null);
         AlertDialog dialog = builder.show();
@@ -756,7 +776,7 @@ public final class MainActivity extends Activity {
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (request == APP_LIST_SETTINGS) {
-            refreshAppRouting(getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
+            refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false));
             return;
         }
         if (request == EXPORT_MODULE && result == RESULT_OK && data != null && data.getData() != null) {
@@ -782,6 +802,30 @@ public final class MainActivity extends Activity {
             }
             return Module.status();
         });
+    }
+
+    private void updateLauncherIcon() {
+        LauncherIcon icon = LauncherIcon.current(this);
+        launcherIconButton.setText("桌面图标 · " + icon.label);
+        aboutLogo.setImageResource(getResources().getIdentifier(icon.drawable, "drawable", getPackageName()));
+    }
+
+    private void showLauncherIcons() {
+        LauncherIcon[] icons = LauncherIcon.values();
+        String[] labels = new String[icons.length];
+        for (int i = 0; i < icons.length; i++) labels[i] = icons[i].label;
+        new AlertDialog.Builder(this).setTitle("桌面图标")
+            .setSingleChoiceItems(labels, LauncherIcon.current(this).ordinal(), (dialog, index) -> {
+                dialog.dismiss();
+                try {
+                    icons[index].select(this);
+                    showMessage("已选择" + icons[index].label + "图标，回到桌面查看。");
+                } catch (IllegalArgumentException | SecurityException error) {
+                    android.util.Log.w("MinClash", "Unable to change launcher icon", error);
+                    showMessage("切换桌面图标失败，请重试。");
+                }
+                updateLauncherIcon();
+            }).setNegativeButton("取消", null).show();
     }
 
     private void showModes(Controller.Mode current) {
@@ -1002,7 +1046,7 @@ public final class MainActivity extends Activity {
     private void openAppRouting() {
         routingFilter = 0;
         routingQuery = "";
-        boolean allowRoot = getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false);
+        boolean allowRoot = appPreferences().getBoolean(ROOT_INVENTORY, false);
         if (InstalledAppsAccess.needsRequest(this)) {
             requestPermissions(new String[] {InstalledAppsAccess.RUNTIME_PERMISSION}, REQUEST_APP_LIST);
             return;
@@ -1017,7 +1061,7 @@ public final class MainActivity extends Activity {
             else showMessage("开启通知栏控制需要在系统设置中允许 MinClash 通知。");
             return;
         }
-        if (request == REQUEST_APP_LIST) refreshAppRouting(getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
+        if (request == REQUEST_APP_LIST) refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false));
     }
 
     private void loadAppRouting(boolean allowRoot) {
@@ -1037,7 +1081,7 @@ public final class MainActivity extends Activity {
         Module.Status current = status;
         execute("", () -> {
             AppRouting.Screen loaded = routingLoader.load(this, true, current);
-            getPreferences(MODE_PRIVATE).edit().putBoolean(ROOT_INVENTORY, true).apply();
+            appPreferences().edit().putBoolean(ROOT_INVENTORY, true).apply();
             return loaded;
         });
     }
@@ -1083,7 +1127,7 @@ public final class MainActivity extends Activity {
                 listDialog.dismiss();
                 if (requestable) requestPermissions(new String[] {InstalledAppsAccess.RUNTIME_PERMISSION}, REQUEST_APP_LIST);
                 else if (rootOption) enableRootRouting();
-                else refreshAppRouting(getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false));
+                else refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false));
             }).show();
     }
 
@@ -1339,9 +1383,15 @@ public final class MainActivity extends Activity {
                 listDialog.dismiss();
                 execute("应用分流已保存。", () -> {
                     new RoutingStore(this).apply(new RoutingStore.State(screen.state().source(), rules, screen.state().subscription()));
-                    return routingLoader.load(this, getPreferences(MODE_PRIVATE).getBoolean(ROOT_INVENTORY, false), Module.status());
+                    return routingLoader.load(this, appPreferences().getBoolean(ROOT_INVENTORY, false), Module.status());
                 });
             }).show();
+    }
+
+    private void runDiagnostics(Subscription.NetworkFailure subscriptionFailure) {
+        if (busy) return;
+        showMessage("正在检查模块、网络与节点 DNS…");
+        execute("", () -> DiagnosticReport.collect(appVersion(), Build.VERSION.SDK_INT, subscriptionFailure, networkWorker));
     }
 
     private interface Operation { Object run() throws Exception; }
@@ -1361,12 +1411,14 @@ public final class MainActivity extends Activity {
                     if (isDestroyed()) return;
                     busy = false;
                     if (!success.isEmpty()) showMessage(success);
+                    if (result instanceof DiagnosticReport) showMessage("");
                     if (result instanceof Module.Status updated) {
                         status = updated;
                         proxySummary = summary;
-                        getPreferences(MODE_PRIVATE).edit().putBoolean("connected", true).apply();
+                        appPreferences().edit().putBoolean("connected", true).apply();
                     } else if (visible) {
                         if (result instanceof String logs) showLogs(logs);
+                        if (result instanceof DiagnosticReport report) showDiagnosticReport(report.text());
                         if (result instanceof Controller.Mode mode) showModes(mode);
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
                         if (result instanceof NodePicker picker) showCurrentNodePicker(picker);
@@ -1386,6 +1438,7 @@ public final class MainActivity extends Activity {
                     showMessage(error.getMessage() == null ? "操作失败，请重新检测环境。" : error.getMessage());
                     render();
                     schedulePoll();
+                    if (visible && error instanceof Subscription.NetworkFailure failure) showSubscriptionNetworkFailure(failure);
                 });
             }
         });
@@ -1458,6 +1511,7 @@ public final class MainActivity extends Activity {
         refreshButton.setEnabled(!busy);
         networkCheckArea.setEnabled(!busy && networkChecksPending == 0);
         logsButton.setEnabled(!busy && installed);
+        diagnosticsButton.setEnabled(!busy);
         moduleSummary.setText("内置模块 " + (bundledModule.valid() ? bundledModule.version() : "信息不可用")
             + (pending ? "\n已提交安装，重启手机后生效。"
             : installed ? "\n当前模块 " + (status.version.isEmpty() ? "版本未知" : status.version)
@@ -1494,14 +1548,36 @@ public final class MainActivity extends Activity {
     }
 
     private void showLogs(String logs) {
-        TextView content = label(logs.isEmpty() ? "暂无内核日志。" : logs, 12, TEXT, false);
+        textDialog("内核日志", logs.isEmpty() ? "暂无内核日志。" : logs).setPositiveButton("关闭", null).show();
+    }
+
+    private void showSubscriptionNetworkFailure(Subscription.NetworkFailure failure) {
+        new AlertDialog.Builder(this).setTitle("订阅下载失败").setMessage(failure.getMessage())
+            .setNegativeButton("关闭", null).setPositiveButton("诊断与反馈", (dialog, which) -> {
+                selectPage(3);
+                runDiagnostics(failure);
+            }).show();
+    }
+
+    private void showDiagnosticReport(String report) {
+        textDialog("诊断报告", report).setNegativeButton("关闭", null)
+            .setNeutralButton("复制", (dialog, which) -> {
+                getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("MinClash 诊断报告", report));
+                showMessage("已复制诊断报告，可附上故障现象和复现步骤再发送。");
+            }).setPositiveButton("分享…", (dialog, which) -> {
+                Intent share = new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, report);
+                startActivity(Intent.createChooser(share, "分享诊断报告"));
+            }).show();
+    }
+
+    private AlertDialog.Builder textDialog(String title, String text) {
+        TextView content = label(text, 12, TEXT, false);
         content.setTypeface(Typeface.MONOSPACE);
         content.setPadding(dp(16), dp(12), dp(16), dp(12));
         content.setTextIsSelectable(true);
         ScrollView scroll = new ScrollView(this);
         scroll.addView(content);
-        new AlertDialog.Builder(this).setTitle("内核日志").setView(scroll)
-            .setPositiveButton("关闭", null).show();
+        return new AlertDialog.Builder(this).setTitle(title).setView(scroll);
     }
 
     private LinearLayout column() {

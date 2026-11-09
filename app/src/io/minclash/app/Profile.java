@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.regex.Pattern;
 import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.error.MarkedYAMLException;
@@ -28,6 +29,8 @@ import org.yaml.snakeyaml.nodes.Tag;
 
 final class Profile {
     static final int MAX_BYTES = 2 * 1024 * 1024;
+    private static final Pattern LOOPBACK_DNS = Pattern.compile(
+        "(?i)^(?:[a-z][a-z0-9+.-]*://)?(?:localhost\\.?|127(?:\\.[0-9]{1,3}){3}|\\[::1\\])(?=[:/?#]|$)|^::1$");
     private static final Set<String> MANAGED_FIELDS = new HashSet<>(Arrays.asList("port", "socks-port", "mixed-port",
         "redir-port", "tproxy-port", "listeners", "tunnels", "tuic-server", "iptables", "ebpf",
         "ss-config", "vmess-config", "tcptun-config", "udptun-config",
@@ -95,8 +98,7 @@ final class Profile {
             });
             fields.addAll(((MappingNode) yaml.compose(new StringReader(MANAGED))).getValue());
 
-            Node dns = null;
-            for (NodeTuple tuple : fields) if (keyOf(tuple).equals("dns")) dns = tuple.getValueNode();
+            Node dns = field(root, "dns");
             if (dns != null && !Tag.NULL.equals(dns.getTag()) && !(dns instanceof MappingNode)) {
                 throw new IOException("配置中的 dns 必须是映射。");
             }
@@ -122,6 +124,13 @@ final class Profile {
         } catch (YAMLException error) {
             throw new IOException("无法读取 YAML 配置。", error);
         }
+    }
+
+    static boolean usesLoopbackProxyDns(byte[] content) throws IOException {
+        if (!(field(routingRoot(content), "dns") instanceof MappingNode dns)) return false;
+        if (!(field(dns, "proxy-server-nameserver") instanceof SequenceNode resolvers)) return false;
+        return resolvers.getValue().stream().anyMatch(node -> node instanceof ScalarNode resolver
+            && LOOPBACK_DNS.matcher(resolver.getValue().trim()).find());
     }
 
     private static void addDefaultGroup(Yaml yaml, List<NodeTuple> fields) {
@@ -232,6 +241,13 @@ final class Profile {
 
     private static String keyOf(NodeTuple tuple) {
         return ((ScalarNode) tuple.getKeyNode()).getValue();
+    }
+
+    private static Node field(MappingNode mapping, String name) {
+        for (NodeTuple tuple : mapping.getValue()) {
+            if (tuple.getKeyNode() instanceof ScalarNode key && key.getValue().equals(name)) return tuple.getValueNode();
+        }
+        return null;
     }
 
     private Profile() {}

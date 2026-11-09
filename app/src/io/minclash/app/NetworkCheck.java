@@ -14,7 +14,16 @@ enum NetworkCheck {
 
     enum State { REACHABLE, TIMEOUT, UNREACHABLE, HTTP_ERROR }
     private record Sample(State state, long latencyMs, int responseCode) {}
-    record Result(State state, long medianMs, int responseCode) {}
+    record Result(State state, long medianMs, int responseCode) {
+        String display() {
+            return switch (state) {
+                case REACHABLE -> medianMs + "\u00a0ms";
+                case TIMEOUT -> "超时";
+                case UNREACHABLE -> "失败";
+                case HTTP_ERROR -> "HTTP\u00a0" + responseCode;
+            };
+        }
+    }
 
     private static final int SAMPLE_COUNT = 3;
     private static final int SOCKET_TIMEOUT_MS = 5000;
