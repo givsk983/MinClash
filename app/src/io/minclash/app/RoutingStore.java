@@ -9,15 +9,21 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.json.JSONObject;
 
 /** Private subscription source and personal policies, independent of the generated core config. */
 final class RoutingStore {
+    // Serialize configuration changes across Activities and scheduled subscription updates.
+    static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
+
     record State(byte[] source, Map<String, String> applications, String subscription) {
         State(byte[] source, Map<String, String> applications) { this(source, applications, null); }
 
@@ -41,6 +47,14 @@ final class RoutingStore {
     void importProfile(byte[] source, String subscription) throws Exception {
         State saved = read();
         apply(new State(source, saved == null ? Collections.emptyMap() : saved.applications(), subscription));
+    }
+
+    boolean repairDns() throws Exception {
+        byte[] installed = Module.readProfile();
+        byte[] repaired = Profile.repairDns(installed);
+        if (installed == repaired) return false;
+        apply(repaired, null);
+        return true;
     }
 
     String savedSubscription(String legacyAddress) throws Exception {
@@ -98,18 +112,26 @@ final class RoutingStore {
     }
 
     void apply(State state) throws Exception {
-        byte[] merged = Profile.withAppRules(state.source(), state.applications());
+        apply(Profile.withAppRules(state.source(), state.applications()), state);
+    }
+
+    private void apply(byte[] merged, State state) throws Exception {
         Module.Status before = Module.status();
         byte[] previous = before.profile ? Module.readProfile() : null;
-        boolean reconnect = !before.state.equals("stopped");
+        if (before.enabled && Arrays.equals(merged, previous)) {
+            if (state != null) save(state);
+            return;
+        }
+        boolean reconnect = before.installed() && !before.state.equals("stopped");
         List<Controller.Group> selections = before.state.equals("running") && before.control
             ? Controller.groups().values() : Collections.emptyList();
+        if (reconnect && before.validate) Module.run(Module.Command.VALIDATE, merged);
         if (reconnect) Module.run(Module.Command.STOP, null);
         boolean imported = false;
         try {
             Module.run(Module.Command.IMPORT, merged);
             imported = true;
-            save(state);
+            if (state != null) save(state);
         } catch (Exception error) {
             try {
                 if (imported && previous != null) Module.run(Module.Command.IMPORT, previous);

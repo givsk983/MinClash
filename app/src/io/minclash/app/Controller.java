@@ -64,6 +64,27 @@ final class Controller {
         return route.isEmpty() ? "尚未选择" : outletLabel(route.get(route.size() - 1));
     }
 
+    static String testPrimaryOutlet(Mode mode) throws Exception {
+        if (mode == Mode.DIRECT) return "当前模式为直连";
+        List<Group> groups = groups(false).values();
+        Group primary = primaryGroup(mode, groups);
+        if (primary == null) return "无法确定主代理组";
+        List<String> route = route(primary, groups);
+        if (route.isEmpty()) return "主代理组尚无选中出口";
+        String outlet = route.get(route.size() - 1);
+        if (outlet.equals("DIRECT") || outlet.equals("REJECT") || outlet.equals("REJECT-DROP")) {
+            return "主代理组选中" + outletLabel(outlet);
+        }
+        String path = "/proxies/" + Uri.encode(outlet) + "/delay?timeout=5000&expected=204&url="
+            + Uri.encode("https://www.google.com/generate_204");
+        try {
+            int delay = new JSONObject(request("GET", path, "")).getInt("delay");
+            return "节点 HTTPS 探测通过 · " + delay + " ms";
+        } catch (IOException error) {
+            return "节点 HTTPS 探测失败";
+        }
+    }
+
     static Group primaryGroup(Mode mode, List<Group> groups) {
         Group primary = groups.stream().filter(group -> mode == Mode.GLOBAL
             ? ProxyGroupSection.isGlobal(group.name()) : ProxyGroupSection.isProxies(group.name())).findFirst().orElse(null);
@@ -96,7 +117,7 @@ final class Controller {
     static String outletLabel(String name) {
         return switch (name) {
             case "DIRECT" -> "直连";
-            case "REJECT" -> "拒绝连接";
+            case "REJECT", "REJECT-DROP" -> "拒绝连接";
             default -> name;
         };
     }

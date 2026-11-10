@@ -30,7 +30,11 @@ import org.yaml.snakeyaml.nodes.Tag;
 final class Profile {
     static final int MAX_BYTES = 2 * 1024 * 1024;
     private static final Pattern LOOPBACK_DNS = Pattern.compile(
-        "(?i)^(?:[a-z][a-z0-9+.-]*://)?(?:localhost\\.?|127(?:\\.[0-9]{1,3}){3}|\\[::1\\])(?=[:/?#]|$)|^::1$");
+        "(?i)^(?:[a-z][a-z0-9+.-]*://)?(?:localhost\\.?|127(?:\\.[0-9]{1,3}){3}|\\[(?:::1|0:0:0:0:0:0:0:1)\\])(?=[:/?#]|$)|^::1$");
+    private static final List<String> DNS_UPSTREAMS = Arrays.asList("default-nameserver", "nameserver", "fallback",
+        "proxy-server-nameserver", "direct-nameserver");
+    private static final List<String> DIRECT_DNS = Arrays.asList(
+        "https://223.5.5.5/dns-query#DIRECT", "https://1.1.1.1/dns-query#DIRECT");
     private static final Set<String> MANAGED_FIELDS = new HashSet<>(Arrays.asList("port", "socks-port", "mixed-port",
         "redir-port", "tproxy-port", "listeners", "tunnels", "tuic-server", "iptables", "ebpf",
         "ss-config", "vmess-config", "tcptun-config", "udptun-config",
@@ -129,8 +133,45 @@ final class Profile {
     static boolean usesLoopbackProxyDns(byte[] content) throws IOException {
         if (!(field(routingRoot(content), "dns") instanceof MappingNode dns)) return false;
         if (!(field(dns, "proxy-server-nameserver") instanceof SequenceNode resolvers)) return false;
-        return resolvers.getValue().stream().anyMatch(node -> node instanceof ScalarNode resolver
-            && LOOPBACK_DNS.matcher(resolver.getValue().trim()).find());
+        return resolvers.getValue().stream().anyMatch(Profile::isLoopbackDns);
+    }
+
+    static byte[] repairDns(byte[] content) throws IOException {
+        MappingNode root = routingRoot(content);
+        if (!(field(root, "dns") instanceof MappingNode dns)) return content;
+        Yaml yaml = new Yaml();
+        boolean changed = replaceLoopbackDns(dns, DNS_UPSTREAMS, yaml);
+        if (field(dns, "proxy-server-nameserver-policy") instanceof MappingNode policy) {
+            changed |= replaceLoopbackDns(policy, null, yaml);
+        }
+        if (!changed) return content;
+        StringWriter output = new StringWriter();
+        yaml.serialize(root, output);
+        byte[] repaired = output.toString().getBytes(StandardCharsets.UTF_8);
+        if (repaired.length > MAX_BYTES) throw new TooLarge();
+        return repaired;
+    }
+
+    private static boolean replaceLoopbackDns(MappingNode mapping, List<String> fields, Yaml yaml) {
+        boolean changed = false;
+        List<NodeTuple> entries = mapping.getValue();
+        for (int index = 0; index < entries.size(); index++) {
+            NodeTuple tuple = entries.get(index);
+            if (fields != null && !fields.contains(keyOf(tuple))) continue;
+            Node value = tuple.getValueNode();
+            boolean loopbackOnly = value instanceof SequenceNode list
+                ? !list.getValue().isEmpty() && list.getValue().stream().allMatch(Profile::isLoopbackDns)
+                : fields == null && isLoopbackDns(value);
+            if (!loopbackOnly) continue;
+            entries.set(index, new NodeTuple(tuple.getKeyNode(), yaml.represent(DIRECT_DNS)));
+            changed = true;
+        }
+        return changed;
+    }
+
+    private static boolean isLoopbackDns(Node node) {
+        return node instanceof ScalarNode resolver && Tag.STR.equals(resolver.getTag())
+            && LOOPBACK_DNS.matcher(resolver.getValue().trim()).find();
     }
 
     private static void addDefaultGroup(Yaml yaml, List<NodeTuple> fields) {
@@ -178,7 +219,7 @@ final class Profile {
 
     // Always merge into the saved subscription source, never into an earlier merged profile.
     static byte[] withAppRules(byte[] source, Map<String, String> applications) throws IOException {
-        byte[] base = normalize(source);
+        byte[] base = repairDns(normalize(source));
         if (applications.isEmpty()) return base;
         Yaml yaml = new Yaml();
         MappingNode root = routingRoot(base);

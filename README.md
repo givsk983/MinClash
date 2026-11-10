@@ -1,4 +1,4 @@
-# MinClash 0.0.6
+# MinClash 0.0.7
 
 MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模块和 Mihomo v1.19.33 Android ARM64 内核。发布时只需要分发 `dist/MinClash.apk`。适用于 ARM64、Android 9 及以上，且内核支持 `/dev/tun` 或 `/dev/net/tun` 的 Root 手机。
 
@@ -21,7 +21,11 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 「设置」页管理开机自启、内置模块及诊断。开机自启默认开启，并在有有效配置时生效。「停止 TUN」停止当前会话；若要让下次开机也保持停止，请同时关掉自启开关。遇到错误时，可到「设置 → 内核日志」查看。
 
-「关于 → 诊断与反馈」会检查模块状态、TUN、三站 HTTPS 连通性及节点 DNS，并在分享前显示报告。报告只包含版本、状态和检测结果，省略订阅链接、节点名称和原始日志。出现本机节点 DNS 和解析失败线索时，会提示检查手机上的 DNS 服务。
+「关于 → 检查更新」会查询 GitHub Release，可在 App 内下载新版 APK，再由 Android 确认安装。覆盖安装需要使用相同 APK 签名。
+
+「配置 → 自动更新当前订阅」默认关闭。开启后由 Android 在有网络时安排每日刷新，只更新当前订阅，保留应用分流。内容一致时继续使用当前连接。
+
+「关于 → 诊断与反馈」可分别测试三站 HTTPS 的实际网络路径、主代理节点出口和 DNS，并在分享前预览报告。配置中某组 DNS 上游全部指向本机时，重新导入、更新订阅或点击「修复本机 DNS 配置」可将该组替换为直连的公共加密 DNS（阿里云和 Cloudflare）。混合使用本机与外部上游的组会保留。
 
 在「设置」开启通知栏控制并允许通知后，TUN 运行期间可从通知栏查看模式和节点，或打开当前代理组的节点选择。正常退出 App 后通知仍会刷新。手机重启后若模块自动连接，打开 App 即可恢复通知栏控制。
 
@@ -43,7 +47,7 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 准备 Python 3.11 或以上、JDK 17 或以上、Android SDK Platform 36、Build Tools 36.0.0 和 NDK 27.0.12077973。通过 `ANDROID_HOME` 指定 SDK 目录，再运行 `python build.py`。如果 NDK 安装在其他位置，可通过 `ANDROID_NDK_HOME` 指定其目录。脚本校验下载文件的 SHA-256，在 `build` 中生成模块 ZIP，再将其和校验值嵌入 `dist/MinClash.apk`。后续升级应保留 `build/debug.keystore`。
 
-App 当前展示版本为 `0.0.6`，开发构建 `versionCode=16`；内置模块为 `0.0.2`、`versionCode=11`、功能修订号 `revision=1`。App 与模块分别维护版本。模块功能实际变更时才增加模块版本和修订号；App 更新单独递增 App 版本号。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
+App 当前展示版本为 `0.0.7`，构建 `versionCode=17`。内置模块为 `0.0.3`、`versionCode=12`、功能修订号 `revision=2`，增加了运行中预检、延长校验时限和分类错误。旧模块可继续运行，安装新版模块后重启可启用新版校验。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
 
 上游版本、模块安装规范和 TUN 参数可查阅 [Mihomo v1.19.33](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33)、[Magisk 开发文档](https://topjohnwu.github.io/Magisk/guides.html) 和 [Mihomo TUN 文档](https://wiki.metacubex.one/config/inbound/tun/)。
 

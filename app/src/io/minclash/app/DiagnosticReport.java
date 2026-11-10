@@ -32,6 +32,12 @@ record DiagnosticReport(String text) {
 
         if (subscriptionFailure != null) report.append("订阅下载  ").append(subscriptionFailure.reason).append('\n');
         appendNetworkChecks(report, networkWorker);
+        if (status != null && status.state.equals("running") && status.control) {
+            String outlet;
+            try { outlet = Controller.testPrimaryOutlet(Controller.mode()); }
+            catch (Exception error) { outlet = "无法测试"; }
+            report.append("主代理出口  ").append(outlet).append('\n');
+        }
         if (status != null && status.installed() && status.profile) appendProxyDns(report);
         return new DiagnosticReport(report.toString().trim());
     }

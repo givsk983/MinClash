@@ -10,7 +10,7 @@ import java.util.concurrent.TimeUnit;
 
 final class Module {
     enum Command {
-        STATUS("status"), START("start"), STOP("stop"), IMPORT("import"),
+        STATUS("status"), START("start"), STOP("stop"), IMPORT("import"), VALIDATE("validate"),
         BOOT_ON("boot-on"), BOOT_OFF("boot-off"), LOGS("logs"), API("api"),
         MODE_RULE("mode-rule"), MODE_GLOBAL("mode-global"), MODE_DIRECT("mode-direct");
 
@@ -24,17 +24,19 @@ final class Module {
         final boolean boot;
         final boolean enabled;
         final boolean control;
+        final boolean validate;
         final String version;
         final String pendingVersion;
         final int revision;
 
-        Status(String state, boolean profile, boolean boot, boolean enabled, boolean control,
+        Status(String state, boolean profile, boolean boot, boolean enabled, boolean control, boolean validate,
                String version, String pendingVersion, int revision) {
             this.state = state;
             this.profile = profile;
             this.boot = boot;
             this.enabled = enabled;
             this.control = control;
+            this.validate = validate;
             this.version = version;
             this.pendingVersion = pendingVersion;
             this.revision = revision;
@@ -73,6 +75,7 @@ final class Module {
         boolean boot = false;
         boolean enabled = false;
         boolean control = false;
+        boolean validate = false;
         String version = "";
         String pendingVersion = "";
         int revision = 0;
@@ -82,6 +85,7 @@ final class Module {
             if (line.equals("boot=1")) boot = true;
             if (line.equals("enabled=1")) enabled = true;
             if (line.equals("control=1")) control = true;
+            if (line.equals("validate=1")) validate = true;
             if (line.startsWith("version=")) version = line.substring(8);
             if (line.startsWith("pending=")) pendingVersion = line.substring(8);
             if (line.startsWith("revision=")) {
@@ -93,7 +97,7 @@ final class Module {
             case "running", "starting", "retrying", "orphaned", "stopped", "missing" -> { }
             default -> throw new IOException("无法读取 KernelSU / Magisk 模块的状态。");
         }
-        return new Status(state, profile, boot, enabled, control, version, pendingVersion, revision);
+        return new Status(state, profile, boot, enabled, control, validate, version, pendingVersion, revision);
     }
 
     static String run(Command command, byte[] payload) throws Exception {
@@ -106,7 +110,11 @@ final class Module {
             : "if [ ! -f " + script + " ]; then echo MINCLASH_NO_MODULE; exit 72; fi; ";
         String action = metadata
             + "exec /system/bin/sh " + script + " " + command.argument;
-        return runRoot(action, command, payload, 65);
+        return runRoot(action, command, payload, command == Command.IMPORT || command == Command.VALIDATE ? 135 : 65);
+    }
+
+    static final class ProfileFailure extends IOException {
+        ProfileFailure(String message) { super(message); }
     }
 
     static String runRoot(String action, Command command, byte[] payload, int timeoutSeconds) throws Exception {
@@ -134,6 +142,20 @@ final class Module {
             if (result.contains("MINCLASH_NO_ROOT") || result.isEmpty()) {
                 throw new IOException("请在 KernelSU / Magisk 为 MinClash 授予超级用户权限。");
             }
+            if (command == Command.IMPORT || command == Command.VALIDATE) {
+                switch (result.substring(result.lastIndexOf('\n') + 1)) {
+                    case "MINCLASH_PROFILE_GEODATA" ->
+                        throw new ProfileFailure("配置依赖的地理规则数据下载失败。请在可访问数据源的网络下重试。");
+                    case "MINCLASH_PROFILE_TIMEOUT" ->
+                        throw new ProfileFailure("配置校验超时。请查看日志，确认配置依赖的数据源是否可达。");
+                    case "MINCLASH_PROFILE_REJECTED" ->
+                        throw new ProfileFailure("Mihomo 无法使用这份配置。请查看本次校验的内核日志。");
+                    case "MINCLASH_PROFILE_NO_TIMEOUT" ->
+                        throw new ProfileFailure("当前系统和 Root 管理器均缺少 timeout 命令，无法安全校验配置。");
+                    case "Mihomo rejected the profile or validation timed out. Check logs." ->
+                        throw new ProfileFailure("配置校验失败或超时。请查看日志；可在设置中更新模块以使用新版校验。");
+                }
+            }
             throw new IOException(result.length() > 1600 ? result.substring(result.length() - 1600) : result);
         } finally {
             if (process.isAlive()) process.destroyForcibly();
@@ -145,7 +167,7 @@ final class Module {
         IOException writeFailure = null;
         try (OutputStream stdin = process.getOutputStream()) {
             if (payload != null) {
-                if (command == Command.IMPORT) {
+                if (command == Command.IMPORT || command == Command.VALIDATE) {
                     stdin.write((payload.length + "\n").getBytes(StandardCharsets.US_ASCII));
                 }
                 stdin.write(payload);

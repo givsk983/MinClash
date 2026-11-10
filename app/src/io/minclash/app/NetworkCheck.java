@@ -3,6 +3,7 @@ package io.minclash.app;
 import java.io.IOException;
 import java.net.SocketTimeoutException;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.HttpsURLConnection;
@@ -12,13 +13,14 @@ enum NetworkCheck {
     BAIDU("百度", "https://www.baidu.com/", "HEAD", 200),
     CLOUDFLARE("Cloudflare", "https://www.cloudflare.com/cdn-cgi/trace", "GET", 200);
 
-    enum State { REACHABLE, TIMEOUT, UNREACHABLE, HTTP_ERROR }
+    enum State { REACHABLE, TIMEOUT, DNS_ERROR, UNREACHABLE, HTTP_ERROR }
     private record Sample(State state, long latencyMs, int responseCode) {}
     record Result(State state, long medianMs, int responseCode) {
         String display() {
             return switch (state) {
                 case REACHABLE -> medianMs + "\u00a0ms";
                 case TIMEOUT -> "超时";
+                case DNS_ERROR -> "DNS 失败";
                 case UNREACHABLE -> "失败";
                 case HTTP_ERROR -> "HTTP\u00a0" + responseCode;
             };
@@ -75,6 +77,8 @@ enum NetworkCheck {
             return new Sample(code > 0 ? State.HTTP_ERROR : State.UNREACHABLE, 0, code);
         } catch (SocketTimeoutException error) {
             return new Sample(State.TIMEOUT, 0, 0);
+        } catch (UnknownHostException error) {
+            return new Sample(State.DNS_ERROR, 0, 0);
         } catch (IOException error) {
             return new Sample(State.UNREACHABLE, 0, 0);
         } finally {

@@ -7,6 +7,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
@@ -32,6 +33,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
+import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.BaseAdapter;
@@ -61,6 +63,7 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_APP_LIST = 3;
     private static final int APP_LIST_SETTINGS = 4;
     private static final int REQUEST_NOTIFICATIONS = 5;
+    private static final int UPDATE_INSTALL_PERMISSION = 6;
     private static final String NOTIFICATION_CONTROL = "notification_control";
     private static final String ROOT_INVENTORY = "root_app_inventory";
     private static final int BG = 0xff0d131a;
@@ -71,8 +74,7 @@ public final class MainActivity extends Activity {
     private static final int MINT = 0xff79e7c9;
     private static final int AMBER = 0xfff5ca88;
 
-    // Serialize config writes across Activity recreation as well as within one screen.
-    private static final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private static final ExecutorService worker = RoutingStore.WORKER;
     private final ExecutorService networkWorker = Executors.newFixedThreadPool(NetworkCheck.values().length);
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable poll = this::pollStatus;
@@ -89,6 +91,13 @@ public final class MainActivity extends Activity {
     private Button importButton;
     private Button subscriptionButton;
     private Button updateButton;
+    private Button checkAppUpdateButton;
+    private Button repairDnsButton;
+    private Switch autoUpdateSwitch;
+    private TextView autoUpdateSummary;
+    private AppUpdate.Release pendingUpdate;
+    private UpdateCheck pendingUpdateCheck;
+    private record UpdateCheck(AppUpdate.Release release) {}
     private TextView subscriptionSummary;
     private SubscriptionCatalog subscriptionCatalog;
     private SubscriptionCatalog.Snapshot subscriptions;
@@ -120,6 +129,10 @@ public final class MainActivity extends Activity {
     private View networkCheckArea;
     private final TextView[] networkResults = new TextView[NetworkCheck.values().length];
     private int networkChecksPending;
+    private int networkCheckGeneration;
+    private boolean googleReachable;
+    private boolean cloudflareReachable;
+    private TextView networkWarning;
     private final View[] pages = new View[4];
     private final Button[] navigation = new Button[4];
     private int selectedPage;
@@ -166,8 +179,9 @@ public final class MainActivity extends Activity {
         toggle.setOnClickListener(view -> {
             if (status == null) { refresh(); return; }
             if (!status.installed()) { selectPage(2); return; }
-            execute("", () -> {
-                Module.run(isActive() ? Module.Command.STOP : Module.Command.START, null);
+            boolean stop = isActive();
+            execute("", true, () -> {
+                Module.run(stop ? Module.Command.STOP : Module.Command.START, null);
                 return Module.status();
             });
         });
@@ -187,7 +201,7 @@ public final class MainActivity extends Activity {
         modeButton.setOnClickListener(view -> execute("", Controller::mode));
         groupsButton = button("代理组与节点", false);
         groupsButton.setOnClickListener(view -> execute("", Controller::groups));
-        for (Button control : List.of(modeButton, groupsButton)) {
+        for (Button control : new Button[]{modeButton, groupsButton}) {
             control.setLines(2);
             control.setLineSpacing(dp(5), 1f);
             control.setEllipsize(TextUtils.TruncateAt.END);
@@ -221,6 +235,23 @@ public final class MainActivity extends Activity {
         importButton = button("导入 Mihomo YAML", false);
         importButton.setOnClickListener(view -> pickProfile());
         add(settings, importButton, 10);
+        autoUpdateSwitch = new Switch(this);
+        autoUpdateSwitch.setText("自动更新当前订阅");
+        autoUpdateSwitch.setTextColor(TEXT);
+        autoUpdateSwitch.setChecked(appPreferences().getBoolean(SubscriptionUpdateJob.ENABLED, false));
+        autoUpdateSwitch.setOnCheckedChangeListener((button, enabled) -> {
+            if (enabled == appPreferences().getBoolean(SubscriptionUpdateJob.ENABLED, false)) return;
+            appPreferences().edit().putBoolean(SubscriptionUpdateJob.ENABLED, enabled).apply();
+            if (!SubscriptionUpdateJob.schedule(this, enabled)) {
+                appPreferences().edit().putBoolean(SubscriptionUpdateJob.ENABLED, false).apply();
+                autoUpdateSwitch.setChecked(false);
+                showMessage("Android 无法安排订阅自动更新，请重试。");
+            }
+            autoUpdateSummary.setText(SubscriptionUpdateJob.summary(this, appPreferences()));
+        });
+        add(settings, autoUpdateSwitch, 12);
+        autoUpdateSummary = label(SubscriptionUpdateJob.summary(this, appPreferences()), 12, MUTED, false);
+        add(settings, autoUpdateSummary, 6);
         add(settings, label("运行中切换或更新订阅会短暂重连。导入本地文件前请先停止 TUN。", 12, MUTED, false), 14);
         LinearLayout routing = card(profiles, 14);
         add(routing, label("应用分流", 17, TEXT, true), 0);
@@ -308,6 +339,13 @@ public final class MainActivity extends Activity {
         TextView description = label("轻量的 Android Root TUN 工具\n管理订阅、代理模式与节点连接", 13, MUTED, false);
         description.setGravity(Gravity.CENTER);
         add(identity, description, 14);
+        checkAppUpdateButton = button("检查更新", false);
+        checkAppUpdateButton.setOnClickListener(view -> {
+            if (UpdateInstallReceiver.installing) return;
+            showMessage("正在检查 App 更新…");
+            execute("", () -> new UpdateCheck(AppUpdate.check(appVersion())));
+        });
+        add(identity, checkAppUpdateButton, 14);
 
         LinearLayout diagnostics = card(information, 14);
         add(diagnostics, label("诊断与反馈", 17, TEXT, true), 0);
@@ -316,6 +354,16 @@ public final class MainActivity extends Activity {
         diagnosticsButton = button("生成诊断报告", false);
         diagnosticsButton.setOnClickListener(view -> runDiagnostics(null));
         add(diagnostics, diagnosticsButton, 14);
+        repairDnsButton = button("修复本机 DNS 配置", false);
+        repairDnsButton.setOnClickListener(view -> new AlertDialog.Builder(this)
+            .setTitle("修复本机 DNS 配置")
+            .setMessage("如果配置的 DNS 上游全部指向本机，将改用直连的公共加密 DNS。订阅、节点和分流规则会保留，运行中的 TUN 会短暂重连。")
+            .setNegativeButton("取消", null).setPositiveButton("修复", (dialog, which) ->
+                execute("DNS 配置已修复。", true, () -> {
+                    if (!new RoutingStore(this).repairDns()) throw new IOException("当前配置没有需要修复的纯本机 DNS 上游。");
+                    return Module.status();
+                })).show());
+        add(diagnostics, repairDnsButton, 10);
 
         LinearLayout links = card(information, 14);
         add(links, label("项目与社区", 17, TEXT, true), 0);
@@ -354,6 +402,12 @@ public final class MainActivity extends Activity {
         try { bundledModule = BundledModule.info(this); }
         catch (IOException error) { showMessage("无法读取内置模块信息，现有模块仍可继续运行。"); }
         pickNodePending = savedInstanceState != null && savedInstanceState.getBoolean("pickNodePending");
+        if (savedInstanceState != null) pendingUpdate = (AppUpdate.Release) savedInstanceState.getSerializable("pendingUpdate");
+        if (autoUpdateSwitch.isChecked() && !SubscriptionUpdateJob.schedule(this, true)) {
+            appPreferences().edit().putBoolean(SubscriptionUpdateJob.ENABLED, false).apply();
+            autoUpdateSwitch.setChecked(false);
+            showMessage("Android 无法安排订阅自动更新，请重新开启。");
+        }
         readNotificationAction(getIntent());
         selectPage(pickNodePending || savedInstanceState == null ? 0 : savedInstanceState.getInt("page", 0));
         render();
@@ -363,6 +417,7 @@ public final class MainActivity extends Activity {
     @Override protected void onSaveInstanceState(Bundle state) {
         state.putInt("page", selectedPage);
         state.putBoolean("pickNodePending", pickNodePending);
+        state.putSerializable("pendingUpdate", pendingUpdate);
         super.onSaveInstanceState(state);
     }
 
@@ -454,6 +509,21 @@ public final class MainActivity extends Activity {
         super.onStop();
     }
 
+    @Override protected void onResume() {
+        super.onResume();
+        UpdateInstallReceiver.listen(this::onUpdateInstallResult);
+        render();
+        if (pendingUpdateCheck != null) {
+            showAppUpdate(pendingUpdateCheck.release());
+            pendingUpdateCheck = null;
+        }
+    }
+
+    @Override protected void onPause() {
+        UpdateInstallReceiver.listen(null);
+        super.onPause();
+    }
+
     @Override protected void onDestroy() {
         main.removeCallbacks(poll);
         routingIcons.close();
@@ -496,27 +566,50 @@ public final class MainActivity extends Activity {
         checks.addView(row, rowParams);
         checks.addView(hint, hintParams);
         add(overview, checks, 14);
+        networkWarning = label("", 12, AMBER, false);
+        networkWarning.setVisibility(View.GONE);
+        networkWarning.setOnClickListener(view -> selectPage(3));
+        add(overview, networkWarning, 6);
     }
 
     private void checkNetwork() {
         if (busy || networkChecksPending != 0) return;
+        int generation = ++networkCheckGeneration;
         networkChecksPending = networkResults.length;
+        googleReachable = false;
+        cloudflareReachable = false;
+        networkWarning.setVisibility(View.GONE);
         networkCheckArea.setEnabled(false);
         for (NetworkCheck target : NetworkCheck.values()) {
             showNetworkResult(target, "…", MUTED);
             networkWorker.execute(() -> {
                 NetworkCheck.Result result = target.run();
-                main.post(() -> finishNetworkCheck(target, result));
+                main.post(() -> finishNetworkCheck(generation, target, result));
             });
         }
     }
 
-    private void finishNetworkCheck(NetworkCheck target, NetworkCheck.Result result) {
-        if (isDestroyed()) return;
-        showNetworkResult(target, result.display(), result.state() == NetworkCheck.State.REACHABLE ? MINT : AMBER);
+    private void finishNetworkCheck(int generation, NetworkCheck target, NetworkCheck.Result result) {
+        if (isDestroyed() || generation != networkCheckGeneration) return;
+        boolean reachable = result.state() == NetworkCheck.State.REACHABLE;
+        if (target == NetworkCheck.GOOGLE) googleReachable = reachable;
+        if (target == NetworkCheck.CLOUDFLARE) cloudflareReachable = reachable;
+        showNetworkResult(target, result.display(), reachable ? MINT : AMBER);
         if (--networkChecksPending == 0) {
             networkCheckArea.setEnabled(!busy);
+            if (hasProxyControl(status) && !googleReachable && !cloudflareReachable) {
+                networkWarning.setText("Google 和 Cloudflare 均未连通 · 查看诊断与 DNS 修复  →");
+                networkWarning.setVisibility(View.VISIBLE);
+            }
         }
+    }
+
+    private void resetNetworkChecks() {
+        networkCheckGeneration++;
+        networkChecksPending = 0;
+        networkWarning.setVisibility(View.GONE);
+        for (NetworkCheck target : NetworkCheck.values()) showNetworkResult(target, "—", MUTED);
+        networkCheckArea.setEnabled(!busy);
     }
 
     private void showNetworkResult(NetworkCheck target, String value, int color) {
@@ -542,6 +635,7 @@ public final class MainActivity extends Activity {
                 main.post(() -> {
                     if (isDestroyed()) return;
                     polling = false;
+                    if (!busy) checkNetworkAfterStatus(updated, summary, false);
                     status = updated;
                     proxySummary = summary;
                     render();
@@ -597,6 +691,68 @@ public final class MainActivity extends Activity {
     private String appVersion() {
         try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; }
         catch (android.content.pm.PackageManager.NameNotFoundException error) { throw new IllegalStateException(error); }
+    }
+
+    private void showAppUpdate(AppUpdate.Release release) {
+        showMessage("");
+        if (release == null) {
+            showMessage("当前已是最新版本 " + appVersion() + "。");
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle("发现新版 MinClash " + release.version())
+            .setMessage(release.notes().isEmpty() ? "下载完成后，由 Android 确认安装。" : release.notes())
+            .setNegativeButton("稍后", null).setPositiveButton("下载并安装", (dialog, which) -> startAppUpdate(release)).show();
+    }
+
+    private void startAppUpdate(AppUpdate.Release release) {
+        if (busy || UpdateInstallReceiver.installing) return;
+        if (!getPackageManager().canRequestPackageInstalls()) {
+            pendingUpdate = release;
+            try {
+                startActivityForResult(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:" + getPackageName())), UPDATE_INSTALL_PERMISSION);
+                showMessage("请允许 MinClash 安装应用，返回后继续下载。");
+            } catch (android.content.ActivityNotFoundException error) {
+                pendingUpdate = null;
+                showMessage("系统没有提供允许安装应用的设置入口。");
+            }
+            return;
+        }
+        showMessage("正在下载新版 MinClash…");
+        UpdateInstallReceiver.installing = true;
+        execute("", () -> {
+            try { AppUpdate.downloadAndInstall(getApplicationContext(), release); }
+            catch (Exception error) {
+                main.post(() -> UpdateInstallReceiver.installing = false);
+                throw error;
+            }
+            return null;
+        });
+    }
+
+    private void onUpdateInstallResult(Intent result) {
+        int status = result.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+        if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            Intent confirmation = result.getParcelableExtra(Intent.EXTRA_INTENT);
+            if (confirmation != null) {
+                try {
+                    showMessage("请在系统安装界面确认更新。");
+                    startActivity(confirmation);
+                    return;
+                } catch (android.content.ActivityNotFoundException ignored) { }
+            }
+            UpdateInstallReceiver.installing = false;
+            showMessage("无法打开 Android 安装界面。");
+        } else {
+            showMessage(switch (status) {
+                case PackageInstaller.STATUS_SUCCESS -> "App 更新已安装。";
+                case PackageInstaller.STATUS_FAILURE_ABORTED -> "安装已取消。";
+                case PackageInstaller.STATUS_FAILURE_CONFLICT -> "无法覆盖安装，请确认新旧 APK 使用同一签名。";
+                case PackageInstaller.STATUS_FAILURE_STORAGE -> "安装失败，设备可用存储空间不足。";
+                default -> "Android 安装更新失败，请检查安装权限后重试。";
+            });
+        }
+        render();
     }
 
     private void openLink(String url) {
@@ -715,7 +871,7 @@ public final class MainActivity extends Activity {
         entries.add(entry);
         dialog.dismiss();
         if (activate && canApplySubscription()) {
-            execute("订阅已保存并启用。", () -> {
+            execute("订阅已保存并启用。", true, () -> {
                 subscriptionCatalog.save(entries);
                 return applySubscription(entry.address());
             });
@@ -754,7 +910,8 @@ public final class MainActivity extends Activity {
     private void activateSubscription(SubscriptionCatalog.Entry entry) {
         if (entry == null || !canApplySubscription()) return;
         boolean active = entry.address().equals(subscriptions.activeAddress());
-        execute(active ? "订阅已更新。" : "已切换到「" + entry.name() + "」。", () -> applySubscription(entry.address()));
+        execute(active ? "订阅已更新。" : "已切换到「" + entry.name() + "」。", true,
+            () -> applySubscription(entry.address()));
     }
 
     private Module.Status applySubscription(String address) throws Exception {
@@ -775,6 +932,13 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == UPDATE_INSTALL_PERMISSION) {
+            AppUpdate.Release release = pendingUpdate;
+            pendingUpdate = null;
+            if (release != null && getPackageManager().canRequestPackageInstalls()) startAppUpdate(release);
+            else showMessage("未获得安装权限，可在「关于」重新检查更新。");
+            return;
+        }
         if (request == APP_LIST_SETTINGS) {
             refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false));
             return;
@@ -837,7 +1001,7 @@ public final class MainActivity extends Activity {
                 dialog.dismiss();
                 if (modes[index] != current) {
                     Controller.Mode mode = modes[index];
-                    execute("已切换到" + mode.label + "模式。", () -> {
+                    execute("已切换到" + mode.label + "模式。", true, () -> {
                         Module.run(mode.command, null);
                         return Module.status();
                     });
@@ -933,8 +1097,7 @@ public final class MainActivity extends Activity {
             PolicyItem item = adapter.getItem(index);
             if (item != null && item.index() >= 0) onPick.accept(dialog, item.index());
         });
-        dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
-            | android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+        enableSearchKeyboard(dialog);
     }
 
     private void rememberProxyPicker(AlertDialog dialog) {
@@ -1037,7 +1200,7 @@ public final class MainActivity extends Activity {
     }
 
     private void selectNode(String group, String node) {
-        execute(node == null ? "已恢复自动选点。" : "已切换到 " + node + "。", () -> {
+        execute(node == null ? "已恢复自动选点。" : "已切换到 " + node + "。", true, () -> {
             Controller.select(group, node);
             return Module.status();
         });
@@ -1255,8 +1418,14 @@ public final class MainActivity extends Activity {
             AppRouting.Entry app = adapter.getItem(index);
             if (app != null) showAppTarget(screen, app, dialog);
         });
-        dialog.getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
-            | android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+        enableSearchKeyboard(dialog);
+    }
+
+    private void enableSearchKeyboard(AlertDialog dialog) {
+        // AlertDialog's text-editor detection does not inspect its custom title.
+        dialog.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
+        dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            | WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN);
     }
 
     private record RoutingRow(ImageView icon, TextView missingIcon, TextView name, TextView packageName, TextView policy) {}
@@ -1381,7 +1550,7 @@ public final class MainActivity extends Activity {
                 if (target.isEmpty()) rules.remove(app.packageName());
                 else rules.put(app.packageName(), target);
                 listDialog.dismiss();
-                execute("应用分流已保存。", () -> {
+                execute("应用分流已保存。", true, () -> {
                     new RoutingStore(this).apply(new RoutingStore.State(screen.state().source(), rules, screen.state().subscription()));
                     return routingLoader.load(this, appPreferences().getBoolean(ROOT_INVENTORY, false), Module.status());
                 });
@@ -1397,6 +1566,10 @@ public final class MainActivity extends Activity {
     private interface Operation { Object run() throws Exception; }
 
     private void execute(String success, Operation operation) {
+        execute(success, false, operation);
+    }
+
+    private void execute(String success, boolean checkConnection, Operation operation) {
         if (busy) return;
         busy = true;
         main.removeCallbacks(poll);
@@ -1412,7 +1585,12 @@ public final class MainActivity extends Activity {
                     busy = false;
                     if (!success.isEmpty()) showMessage(success);
                     if (result instanceof DiagnosticReport) showMessage("");
+                    if (result instanceof UpdateCheck update) {
+                        if (visible) showAppUpdate(update.release());
+                        else pendingUpdateCheck = update;
+                    }
                     if (result instanceof Module.Status updated) {
+                        checkNetworkAfterStatus(updated, summary, checkConnection);
                         status = updated;
                         proxySummary = summary;
                         appPreferences().edit().putBoolean("connected", true).apply();
@@ -1423,6 +1601,7 @@ public final class MainActivity extends Activity {
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
                         if (result instanceof NodePicker picker) showCurrentNodePicker(picker);
                         if (result instanceof AppRouting.Screen screen) {
+                            checkNetworkAfterStatus(screen.status(), summary, checkConnection);
                             status = screen.status();
                             proxySummary = summary;
                             showAppRouting(screen);
@@ -1439,9 +1618,22 @@ public final class MainActivity extends Activity {
                     render();
                     schedulePoll();
                     if (visible && error instanceof Subscription.NetworkFailure failure) showSubscriptionNetworkFailure(failure);
+                    if (visible && error instanceof Module.ProfileFailure failure) {
+                        new AlertDialog.Builder(this).setTitle("配置校验失败").setMessage(failure.getMessage())
+                            .setNegativeButton("关闭", null).setPositiveButton("内核日志", (dialog, which) ->
+                                execute("", () -> Module.run(Module.Command.LOGS, null))).show();
+                    }
                 });
             }
         });
+    }
+
+    private void checkNetworkAfterStatus(Module.Status updated, ProxySummary summary, boolean requested) {
+        boolean running = hasProxyControl(updated);
+        if (!requested && running == hasProxyControl(status)
+            && (!running || summary == null || summary.equals(proxySummary))) return;
+        resetNetworkChecks();
+        if (visible && running) checkNetwork();
     }
 
     private boolean isActive() { return status != null && status.installed() && !status.state.equals("stopped"); }
@@ -1473,7 +1665,7 @@ public final class MainActivity extends Activity {
                 : status == null ? "先检测环境，再导入你的配置。" : "前往设置，安装 App 内置的模块。" );
         }
         boolean running = installed && status.state.equals("running");
-        statusBadge.setText(running ? "● 在线" : busy ? "处理中" : pending ? "待重启" : "未连接");
+        statusBadge.setText(running ? "● TUN 就绪" : busy ? "处理中" : pending ? "待重启" : "未连接");
         statusBadge.setTextColor(running ? MINT : MUTED);
         statusBadge.setBackground(shape(running ? 0xff203a35 : 0xff25313c, 10, false));
         String setup = pending ? "模块已安装，重启手机后生效  →"
@@ -1512,6 +1704,10 @@ public final class MainActivity extends Activity {
         networkCheckArea.setEnabled(!busy && networkChecksPending == 0);
         logsButton.setEnabled(!busy && installed);
         diagnosticsButton.setEnabled(!busy);
+        checkAppUpdateButton.setEnabled(!busy && !UpdateInstallReceiver.installing);
+        repairDnsButton.setEnabled(!busy && enabled && status.profile
+            && (status.state.equals("stopped") || status.state.equals("running")));
+        autoUpdateSummary.setText(SubscriptionUpdateJob.summary(this, appPreferences()));
         moduleSummary.setText("内置模块 " + (bundledModule.valid() ? bundledModule.version() : "信息不可用")
             + (pending ? "\n已提交安装，重启手机后生效。"
             : installed ? "\n当前模块 " + (status.version.isEmpty() ? "版本未知" : status.version)

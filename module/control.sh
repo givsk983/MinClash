@@ -259,23 +259,44 @@ stop() {
     write_state stopped
 }
 
-import_profile() {
+check_profile() {
     enabled || fail 'Enable the MinClash module in Magisk first.'
-    if read_pid daemon >/dev/null || read_pid core >/dev/null; then
+    if [ "$1" = import ] && { read_pid daemon >/dev/null || read_pid core >/dev/null; }; then
         fail 'Stop TUN before replacing the profile.'
     fi
-    local candidate expected
+    local operation="$1" candidate expected validation result
     read -r expected || fail 'No profile length was received.'
     case "$expected" in ''|*[!0-9]*) fail 'Invalid profile length.' ;; esac
     [ "$expected" -gt 0 ] && [ "$expected" -le "$LIMIT" ] || fail 'Profile must be 1 byte to 2 MiB.'
     candidate=$(mktemp "$DATA/import.XXXXXX") || fail 'Cannot create temporary profile.'
-    trap 'rm -f "$candidate"' EXIT
+    validation="$candidate.log"
+    trap 'rm -f "$candidate" "$validation"' EXIT
     head -c "$((LIMIT + 1))" > "$candidate" || fail 'Could not read profile.'
     [ "$(stat -c %s "$candidate")" -eq "$expected" ] || fail 'Profile transfer was incomplete or oversized.'
-    "$BB" timeout -k 3 35 "$CORE" -t -d "$DATA" -f "$candidate" >> "$LOG" 2>&1 ||
-        fail 'Mihomo rejected the profile or validation timed out. Check logs.'
-    mv -f "$candidate" "$PROFILE" || fail 'Could not save profile.'
-    trap - EXIT
+    [ -x "$CORE" ] || fail 'The Root module is missing its Mihomo binary.'
+    if [ -x /system/bin/timeout ]; then
+        set -- /system/bin/timeout
+    elif has_applet timeout; then
+        set -- "$BB" timeout
+    else
+        fail 'MINCLASH_PROFILE_NO_TIMEOUT'
+    fi
+    "$@" -s KILL 120 "$CORE" -t -d "$DATA" -f "$candidate" > "$validation" 2>&1
+    result=$?
+    trim_log
+    tail -c 12000 "$validation" >> "$LOG"
+    case "$result" in
+        0) ;;
+        124|137) fail 'MINCLASH_PROFILE_TIMEOUT' ;;
+        *)
+            if grep -Eiq "can't download (geo(site|ip)\.dat|mmdb|asn)" "$validation"; then
+                fail 'MINCLASH_PROFILE_GEODATA'
+            fi
+            fail 'MINCLASH_PROFILE_REJECTED' ;;
+    esac
+    if [ "$operation" = import ]; then
+        mv -f "$candidate" "$PROFILE" || fail 'Could not save profile.'
+    fi
 }
 
 case "${1:-}" in
@@ -293,6 +314,7 @@ case "${1:-}" in
         if [ -e "$DATA/boot-off" ]; then echo boot=0; else echo boot=1; fi
         if enabled; then echo enabled=1; else echo enabled=0; fi
         if [ -x "$SOCKET_REQUEST" ]; then echo control=1; fi
+        echo validate=1
         exit ;;
     logs)
         for file in "$DATA/previous.log" "$LOG"; do
@@ -307,10 +329,10 @@ case "${1:-}" in
     boot) if [ ! -e "$DATA/boot-off" ] && [ -s "$PROFILE" ]; then start; fi ;;
     start) start ;;
     stop) stop ;;
-    import) import_profile ;;
+    import|validate) check_profile "$1" ;;
     api) api ;;
     mode-rule|mode-global|mode-direct) set_mode "${1#mode-}" ;;
     boot-on) rm -f "$DATA/boot-off" ;;
     boot-off) : > "$DATA/boot-off" ;;
-    *) fail 'Usage: control.sh status|start|stop|logs|boot-on|boot-off|import|api|mode-rule|mode-global|mode-direct' ;;
+    *) fail 'Usage: control.sh status|start|stop|logs|boot-on|boot-off|import|validate|api|mode-rule|mode-global|mode-direct' ;;
 esac

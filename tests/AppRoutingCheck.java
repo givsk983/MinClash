@@ -52,9 +52,33 @@ public final class AppRoutingCheck {
         // Keep Unicode group names intact when serializing the generated rules.
         byte[] unicode = Profile.withAppRules(bytes(SOURCE.replace("name: US,", "name: 美国,")), Map.of("com.example.app", "美国"));
         require(((List<?>) parse(unicode).get("rules")).get(0).equals("PROCESS-NAME,com.example.app,美国"), "Unicode group names");
+        byte[] loopback = Profile.normalize(bytes(SOURCE + """
+            dns:
+              default-nameserver: [127.0.0.1]
+              nameserver: [udp://127.0.0.2:7874]
+              proxy-server-nameserver: ['https://[::1]:443/dns-query', '127.0.0.1:53']
+              proxy-server-nameserver-policy:
+                '+.node.example': 'tcp://localhost:5353'
+              nameserver-policy:
+                '+.home.arpa': 'udp://127.0.0.1:53'
+            """));
+        byte[] repaired = Profile.withAppRules(loopback, personal);
+        Map<?, ?> dns = (Map<?, ?>) parse(repaired).get("dns");
+        List<String> direct = List.of("https://223.5.5.5/dns-query#DIRECT", "https://1.1.1.1/dns-query#DIRECT");
+        require(direct.equals(dns.get("nameserver")) && direct.equals(dns.get("default-nameserver"))
+            && direct.equals(dns.get("proxy-server-nameserver")), "replace loopback-only DNS with direct HTTPS");
+        require(direct.equals(((Map<?, ?>) dns.get("proxy-server-nameserver-policy")).get("+.node.example")), "repair node DNS policy");
+        require("udp://127.0.0.1:53".equals(((Map<?, ?>) dns.get("nameserver-policy")).get("+.home.arpa")),
+            "preserve application domain policies");
+        require(Profile.usesLoopbackProxyDns(loopback) && !Profile.usesLoopbackProxyDns(repaired)
+            && Profile.repairDns(repaired) == repaired, "source stays independent and applied repair is idempotent");
+        byte[] mixed = Profile.normalize(bytes(SOURCE + "dns: {nameserver: ['127.0.0.1', 'https://dns.example/dns-query']}\n"));
+        require(Profile.repairDns(mixed) == mixed, "preserve mixed DNS");
+        require(parse(repaired).get("rules").equals(rules), "DNS repair retains routing rules");
         Files.createDirectories(Path.of(args[0]));
         Files.write(Path.of(args[0], "app-routing.yaml"), effective);
         Files.write(Path.of(args[0], "app-routing-nodes-only.yaml"), nodesOnly);
+        Files.write(Path.of(args[0], "dns-repaired.yaml"), repaired);
         System.out.println("PASS: personal priority, direct routing, subscription update, removal, missing groups, invalid packages, nodes-only and Unicode.");
     }
 

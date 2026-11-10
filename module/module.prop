@@ -1,7 +1,7 @@
 id=minclash
 name=MinClash Root TUN
-version=0.0.2
-versionCode=11
-revision=1
+version=0.0.3
+versionCode=12
+revision=2
 author=MinClash
 description=Mihomo v1.19.33 ARM64, with boot startup and a root TUN supervisor managed by the MinClash app.

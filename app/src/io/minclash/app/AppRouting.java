@@ -87,7 +87,7 @@ final class AppRouting {
             boolean empty = entries.isEmpty();
             boolean root = allowRoot && empty;
             if (root) {
-                JSONArray apps = rootQuery(context, List.of());
+                JSONArray apps = rootQuery(context, java.util.Collections.emptyList());
                 for (int i = 0; i < apps.length(); i++) {
                     JSONObject app = apps.getJSONObject(i);
                     String name = app.getString("package");
