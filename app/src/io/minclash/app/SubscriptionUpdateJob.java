@@ -75,6 +75,8 @@ public final class SubscriptionUpdateJob extends JobService {
             if (active != params || !preferences.getBoolean(ENABLED, false)) return;
             routing.importProfile(source, current.address());
             record(preferences, "更新成功");
+        } catch (RoutingStore.SelectionRestoreFailure warning) {
+            if (active == params) record(preferences, "已更新，请检查节点选择");
         } catch (Exception error) {
             if (active == params) record(preferences, "更新失败，请在配置页手动重试");
         } finally {

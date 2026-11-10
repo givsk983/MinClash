@@ -1,6 +1,7 @@
 package io.minclash.app;
 
 import android.content.Context;
+import android.os.SystemClock;
 import android.util.AtomicFile;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -26,6 +27,12 @@ final class RoutingStore {
     private static volatile int generation;
 
     static int generation() { return generation; }
+
+    static final class SelectionRestoreFailure extends IOException {
+        SelectionRestoreFailure(Exception cause) {
+            super("配置已保存，TUN 已恢复，但部分节点选择未能恢复。请检查代理组。", cause);
+        }
+    }
 
     record State(byte[] source, Map<String, String> applications, String subscription) {
         State(byte[] source, Map<String, String> applications) { this(source, applications, null); }
@@ -135,27 +142,53 @@ final class RoutingStore {
         try {
             Module.run(Module.Command.IMPORT, merged);
             imported = true;
+            if (reconnect) restart(before.control);
             if (state != null) save(state);
         } catch (Exception error) {
             try {
+                if (imported && reconnect) Module.run(Module.Command.STOP, null);
                 if (imported && previous != null) Module.run(Module.Command.IMPORT, previous);
-                if (reconnect) restart(selections);
+                if (reconnect && previous != null) {
+                    restart(before.control);
+                    Controller.restoreSelections(selections);
+                }
             } catch (Exception recovery) {
-                throw new IOException("保存失败，恢复连接也未完成，请检查内核日志。\n" + error.getMessage()
+                throw new IOException("应用配置失败，恢复也未完成，请检查内核日志。\n" + error.getMessage()
                     + "\n" + recovery.getMessage(), error);
+            }
+            if (imported && reconnect && previous != null) {
+                throw new IOException("应用新配置失败，已恢复原配置和连接。\n" + error.getMessage(), error);
             }
             throw error;
         }
         if (reconnect) {
-            try { restart(selections); }
+            try { Controller.restoreSelections(selections); }
             catch (Exception error) {
-                throw new IOException("配置已保存，但恢复连接或节点选择失败，请检查代理组及连接状态。\n" + error.getMessage(), error);
+                throw new SelectionRestoreFailure(error);
             }
         }
     }
 
-    private void restart(List<Controller.Group> selections) throws Exception {
+    private void restart(boolean control) throws Exception {
         Module.run(Module.Command.START, null);
-        Controller.restoreSelections(selections);
+        long deadline = SystemClock.elapsedRealtime() + 45_000;
+        Exception last = null;
+        do {
+            Module.Status current = Module.status();
+            if (current.state.equals("running")) {
+                if (!control) return;
+                try {
+                    Controller.mode();
+                    return;
+                } catch (Exception error) {
+                    last = error;
+                }
+            } else if (current.state.equals("retrying") || current.state.equals("stopped")
+                || current.state.equals("orphaned") || !current.enabled) {
+                break;
+            }
+            Thread.sleep(300);
+        } while (SystemClock.elapsedRealtime() < deadline);
+        throw new IOException("TUN 或内核控制接口未就绪。", last);
     }
 }

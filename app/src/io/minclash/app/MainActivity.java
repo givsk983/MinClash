@@ -143,7 +143,7 @@ public final class MainActivity extends Activity {
     private View networkCheckArea;
     private final TextView[] networkResults = new TextView[NetworkCheck.values().length];
     private int networkChecksPending;
-    private int networkCheckGeneration;
+    private volatile int networkCheckGeneration;
     private boolean googleReachable;
     private boolean cloudflareReachable;
     private boolean nodeLatencyAvailable;
@@ -517,6 +517,7 @@ public final class MainActivity extends Activity {
         visible = false;
         main.removeCallbacks(poll);
         main.removeCallbacks(pollLatency);
+        resetNetworkChecks();
         super.onStop();
     }
 
@@ -616,7 +617,8 @@ public final class MainActivity extends Activity {
                 showNetworkResult(target, "…", MUTED);
             }
         }
-        worker.execute(() -> {
+        networkWorker.execute(() -> {
+            if (generation != networkCheckGeneration) return;
             String node = null;
             try { node = Controller.primaryProxy(); }
             catch (Exception ignored) { }
@@ -638,7 +640,8 @@ public final class MainActivity extends Activity {
     }
 
     private void measureNetworkTarget(int generation, String outlet, NetworkCheck target, boolean confirm) {
-        worker.execute(() -> {
+        networkWorker.execute(() -> {
+            if (generation != networkCheckGeneration) return;
             int delay;
             try { delay = Controller.testDelay(outlet, target); }
             catch (Exception ignored) { delay = 0; }
@@ -1197,7 +1200,7 @@ public final class MainActivity extends Activity {
             delays.put(index, "…");
             notifyDataSetChanged();
             String outlet = testName.apply(index);
-            worker.execute(() -> {
+            networkWorker.execute(() -> {
                 int delay;
                 try { delay = Controller.testDelay(outlet, NetworkCheck.GOOGLE); }
                 catch (Exception error) { delay = 0; }
@@ -1837,6 +1840,7 @@ public final class MainActivity extends Activity {
         if (busy) return;
         busy = true;
         main.removeCallbacks(poll);
+        if (checkConnection) resetNetworkChecks();
         render();
         worker.execute(() -> {
             try {
@@ -1878,6 +1882,7 @@ public final class MainActivity extends Activity {
                     if (isDestroyed()) return;
                     busy = false;
                     showMessage(error.getMessage() == null ? "操作失败，请重新检测环境。" : error.getMessage());
+                    if (checkConnection) scheduleLatency(0);
                     render();
                     schedulePoll();
                     if (visible && error instanceof Subscription.NetworkFailure failure) showSubscriptionNetworkFailure(failure);
@@ -2079,7 +2084,7 @@ public final class MainActivity extends Activity {
     }
 
     private void selectPage(int index) {
-        if (selectedPage != 0 && index == 0) confirmNextLatency = true;
+        if (selectedPage == 0 && index != 0) resetNetworkChecks();
         selectedPage = Math.max(0, Math.min(pages.length - 1, index));
         for (int i = 0; i < pages.length; i++) {
             pages[i].setVisibility(i == selectedPage ? View.VISIBLE : View.GONE);

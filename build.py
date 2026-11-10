@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 import gzip
 import hashlib
@@ -17,6 +18,7 @@ MIHOMO = "v1.19.33"
 SNAKEYAML = "2.5"
 ANDROID_CORE = f"mihomo-android-arm64-v8-{MIHOMO}.gz"
 YAML_JAR = f"snakeyaml-{SNAKEYAML}.jar"
+RELEASE_CERT_SHA256 = "8c7b06c0539fc7cab859a13f82836465de2359d2a4dd45ccac5804c35e5f5ef1"
 
 
 def sha256(path):
@@ -52,7 +54,7 @@ def jdk_tool(name):
     raise RuntimeError("Set JAVA_HOME to a JDK 17 or newer.")
 
 
-def build_apk(yaml_jar, apache_license, module_archive):
+def build_apk(yaml_jar, apache_license, module_archive, keystore, release):
     properties = dict(line.split("=", 1) for line in
                       (ROOT / "module/module.prop").read_text(encoding="utf-8").splitlines() if "=" in line)
     if not properties.get("version") or int(properties.get("versionCode", "0")) <= 0 or int(properties.get("revision", "0")) <= 0:
@@ -108,17 +110,21 @@ def build_apk(yaml_jar, apache_license, module_archive):
 
     aligned = BUILD / "aligned.apk"
     execute(sdk_tool("zipalign"), "-f", "4", base, aligned)
-    keystore = BUILD / "debug.keystore"
     if not keystore.exists():
         execute(jdk_tool("keytool"), "-genkeypair", "-noprompt", "-keystore", keystore,
                 "-storepass", "android", "-keypass", "android", "-alias", "minclashdebug", "-keyalg", "RSA",
                 "-keysize", "2048", "-validity", "10000", "-dname", "CN=MinClash Local Debug")
     signer = tools / "lib/apksigner.jar"
-    apk = DIST / "MinClash.apk"
+    apk = BUILD / "signed.apk"
     execute(java, "-jar", signer, "sign", "--ks", keystore, "--ks-pass", "pass:android",
             "--ks-key-alias", "minclashdebug", "--v2-signing-enabled", "true",
             "--v4-signing-enabled", "false", "--out", apk, aligned)
-    execute(java, "-jar", signer, "verify", "--verbose", apk)
+    verified = subprocess.check_output(
+        [str(java), "-jar", str(signer), "verify", "--verbose", "--print-certs", str(apk)], text=True)
+    print(verified, end="")
+    if release and f"Signer #1 certificate SHA-256 digest: {RELEASE_CERT_SHA256}" not in verified.splitlines():
+        raise RuntimeError("The signing certificate differs from the published MinClash APK.")
+    apk.replace(DIST / "MinClash.apk")
 
 
 def build_socket_request():
@@ -175,6 +181,12 @@ def build_module(archive, license_path):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--release", action="store_true", help="Require the published APK signing certificate.")
+    options = parser.parse_args()
+    keystore = Path(os.environ.get("MINCLASH_KEYSTORE", BUILD / "debug.keystore")).resolve()
+    if options.release and not keystore.is_file():
+        raise RuntimeError("Restore the MinClash signing keystore or set MINCLASH_KEYSTORE before building a release.")
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
     DIST.mkdir(exist_ok=True)
     archive = download(ANDROID_CORE, f"https://github.com/MetaCubeX/mihomo/releases/download/{MIHOMO}/{ANDROID_CORE}",
@@ -186,8 +198,9 @@ def main():
     apache_license = download("apache-2.0-LICENSE", "https://www.apache.org/licenses/LICENSE-2.0.txt",
                               "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30")
     module_archive = build_module(archive, mihomo_license)
-    build_apk(yaml_jar, apache_license, module_archive)
-    print(f"Release APK (module included): {DIST / 'MinClash.apk'}")
+    build_apk(yaml_jar, apache_license, module_archive, keystore, options.release)
+    apk = DIST / "MinClash.apk"
+    print(f"APK (module included): {apk}\nSHA-256: {sha256(apk)}")
 
 
 if __name__ == "__main__":

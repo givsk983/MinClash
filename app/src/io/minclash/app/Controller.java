@@ -32,7 +32,11 @@ final class Controller {
     record Snapshot(Mode mode, String node, List<Group> groups) {}
 
     static Mode mode() throws Exception {
-        JSONObject config = new JSONObject(request("GET", "/configs", ""));
+        return mode(false);
+    }
+
+    private static Mode mode(boolean probe) throws Exception {
+        JSONObject config = new JSONObject(probe ? probe("/configs") : request("GET", "/configs", ""));
         return Mode.valueOf(config.getString("mode").toUpperCase(Locale.ROOT));
     }
 
@@ -45,7 +49,11 @@ final class Controller {
     }
 
     private static List<Group> readGroups() throws Exception {
-        JSONArray proxies = new JSONObject(request("GET", "/group", "")).getJSONArray("proxies");
+        return readGroups(false);
+    }
+
+    private static List<Group> readGroups(boolean probe) throws Exception {
+        JSONArray proxies = new JSONObject(probe ? probe("/group") : request("GET", "/group", "")).getJSONArray("proxies");
         List<Group> groups = new ArrayList<>();
         for (int i = 0; i < proxies.length(); i++) {
             JSONObject proxy = proxies.getJSONObject(i);
@@ -110,14 +118,14 @@ final class Controller {
     static int testDelay(String outlet, NetworkCheck target) throws Exception {
         String path = "/proxies/" + Uri.encode(outlet) + "/delay?timeout=3500&expected="
             + target.expectedStatus + "&url=" + Uri.encode(target.endpoint.toString());
-        try { return new JSONObject(request("GET", path, "")).getInt("delay"); }
+        try { return new JSONObject(probe(path)).getInt("delay"); }
         catch (IOException error) { return 0; }
     }
 
     static String primaryProxy() throws Exception {
-        Mode mode = mode();
+        Mode mode = mode(true);
         if (mode == Mode.DIRECT) return null;
-        List<Group> groups = readGroups();
+        List<Group> groups = readGroups(true);
         Group primary = primaryGroup(mode, groups);
         if (primary == null) return null;
         List<String> chain = route(primary, groups);
@@ -174,13 +182,7 @@ final class Controller {
 
     static void restoreSelections(List<Group> previous) throws Exception {
         if (previous.isEmpty()) return;
-        Groups ready = null;
-        Exception last = null;
-        for (int attempt = 0; attempt < 20; attempt++) {
-            try { ready = groups(); break; }
-            catch (Exception error) { last = error; Thread.sleep(300); }
-        }
-        if (ready == null) throw new IOException("内核控制接口未就绪，无法恢复节点选择。", last);
+        Groups ready = groups();
         for (Group old : previous) {
             if (old.automatic() || old.current().isEmpty()) continue;
             for (Group current : ready.values()) {
@@ -191,10 +193,21 @@ final class Controller {
     }
 
     private static String request(String method, String path, String body) throws Exception {
+        return request(method, path, body, false);
+    }
+
+    private static String probe(String path) throws Exception {
+        return request("GET", path, "", true);
+    }
+
+    private static String request(String method, String path, String body, boolean probe) throws Exception {
         String request = method + " " + path + " HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n"
             + "Content-Type: application/json\r\nContent-Length: " + body.getBytes(StandardCharsets.UTF_8).length
             + "\r\n\r\n" + body;
-        String reply = Module.run(Module.Command.API, request.getBytes(StandardCharsets.UTF_8));
+        byte[] payload = request.getBytes(StandardCharsets.UTF_8);
+        // Read-only probes can outlive a core restart and must not hold the module's action lock.
+        String reply = probe ? Module.runRoot("exec /data/adb/modules/minclash/bin/socket-request /data/adb/minclash/control.sock",
+            Module.Command.API, payload, 10) : Module.run(Module.Command.API, payload);
         int headerEnd = reply.indexOf("\r\n\r\n");
         int lineEnd = reply.indexOf("\r\n");
         if (headerEnd < 0 || lineEnd < 0) throw new IOException("无法读取 Mihomo 控制响应。");

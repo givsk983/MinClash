@@ -1,4 +1,4 @@
-# MinClash 0.1.0
+# MinClash 0.1.1
 
 MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模块和 Mihomo v1.19.33 Android ARM64 内核。发布时只需要分发 `dist/MinClash.apk`。适用于 ARM64、Android 9 及以上，且内核支持 `/dev/tun` 或 `/dev/net/tun` 的 Root 手机。
 
@@ -15,7 +15,7 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
    列表先显示应用名称和包名，真实图标在后台按需加载并缓存；图标不可读时显示提示和检查入口，明确区分权限拒绝与其他读取失败。右上角「权限」显示查询权限、动态授权支持情况和已尝试读取的图标状态；尚未显示的应用图标不会误报为失败。设备支持且尚未授予的动态权限可在此申请；必要时可选择 Root 补充图标。
    进入配置页会后台预读应用分流。60 秒内可直接打开缓存列表，保存时读取最新配置并合并本次修改。权限变化、订阅更新或重新读取会更新缓存。
 
-「管理订阅」可保存多个订阅，重命名或删除未使用的订阅，并标记当前订阅。切换或更新会重新下载配置并校验，TUN 运行时会短暂重连。导入本地 YAML 前请先停止 TUN。
+「管理订阅」可保存多个订阅，重命名或删除未使用的订阅，并标记当前订阅。切换或更新会重新下载配置并校验，TUN 运行时会短暂重连。若新配置无法启动 TUN 或恢复控制接口，App 会尝试恢复原配置和连接。导入本地 YAML 前请先停止 TUN。
 
 如果订阅链接只能通过代理访问，请先连接可用代理再下载，也可以用其他方式下载 YAML 后从本地导入。遇到域名解析失败、连接错误或超时时，下载提示可直接打开诊断。
 
@@ -45,9 +45,9 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 ## 构建
 
-准备 Python 3.11 或以上、JDK 17 或以上、Android SDK Platform 36、Build Tools 36.0.0 和 NDK 27.0.12077973。通过 `ANDROID_HOME` 指定 SDK 目录，再运行 `python build.py`。如果 NDK 安装在其他位置，可通过 `ANDROID_NDK_HOME` 指定其目录。脚本校验下载文件的 SHA-256，在 `build` 中生成模块 ZIP，再将其和校验值嵌入 `dist/MinClash.apk`。后续升级应保留 `build/debug.keystore`。
+准备 Python 3.11 或以上、JDK 17 或以上、Android SDK Platform 36、Build Tools 36.0.0 和 NDK 27.0.12077973。通过 `ANDROID_HOME` 指定 SDK 目录，再运行 `python build.py`。如果 NDK 安装在其他位置，可通过 `ANDROID_NDK_HOME` 指定其目录。脚本校验下载文件的 SHA-256，在 `build` 中生成模块 ZIP，再将其和校验值嵌入 `dist/MinClash.apk`。发布时运行 `python build.py --release`，脚本会校验签名指纹并输出 APK 的 SHA-256。请私下备份现有的 `build/debug.keystore`，也可用 `MINCLASH_KEYSTORE` 指向备份位置。
 
-App 当前展示版本为 `0.1.0`，构建 `versionCode=20`。内置模块为 `0.0.4`、`versionCode=13`、功能修订号 `revision=3`，安装后重启可启用开机上游检测与一次自动恢复。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
+App 当前展示版本为 `0.1.1`，构建 `versionCode=21`。内置模块为 `0.0.4`、`versionCode=13`、功能修订号 `revision=3`，安装后重启可启用开机上游检测与一次自动恢复。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
 
 上游版本、模块安装规范和 TUN 参数可查阅 [Mihomo v1.19.33](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33)、[Magisk 开发文档](https://topjohnwu.github.io/Magisk/guides.html) 和 [Mihomo TUN 文档](https://wiki.metacubex.one/config/inbound/tun/)。
 
