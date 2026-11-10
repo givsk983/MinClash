@@ -146,7 +146,7 @@ public final class MainActivity extends Activity {
     private int networkCheckGeneration;
     private boolean googleReachable;
     private boolean cloudflareReachable;
-    private boolean latencyTimedOut;
+    private boolean nodeLatencyAvailable;
     private boolean confirmNextLatency = true;
 
     private TextView networkWarning;
@@ -308,10 +308,7 @@ public final class MainActivity extends Activity {
         add(service, notificationButton, 14);
         add(service, label("通知显示连接和网速。点模式或节点名，打开对应的切换浮窗。", 12, MUTED, false), 6);
         overlayPermissionButton = button("允许悬浮窗", false);
-        overlayPermissionButton.setOnClickListener(view -> {
-            try { startActivity(ProxyNotificationService.overlaySettings(this)); }
-            catch (android.content.ActivityNotFoundException error) { showMessage("请在系统设置中允许 MinClash 显示在其他应用上层。"); }
-        });
+        overlayPermissionButton.setOnClickListener(view -> showOverlayPermissionHelp(true));
         add(service, overlayPermissionButton, 8);
         foregroundAppButton = button("授权显示当前应用", false);
         foregroundAppButton.setOnClickListener(view -> {
@@ -483,6 +480,37 @@ public final class MainActivity extends Activity {
         }
         appPreferences().edit().putBoolean(NOTIFICATION_CONTROL, true).apply();
         render();
+        if (!Settings.canDrawOverlays(this)) showOverlayPermissionHelp(true);
+    }
+
+    private void showOverlayPermissionHelp(boolean mode) {
+        boolean allowed = Settings.canDrawOverlays(this);
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this)
+            .setTitle(allowed ? "检查悬浮窗权限" : "允许悬浮窗")
+            .setMessage(allowed
+                ? "Android 当前已允许 MinClash 显示在其他应用上层。如果仍打不开，请在系统设置检查 MinClash 的悬浮窗权限和后台弹出限制，或点「重试」。"
+                : "要从通知栏切换模式或节点，请在系统设置中选择 MinClash，开启「显示在其他应用上层」。")
+            .setNegativeButton("稍后", null)
+            .setPositiveButton(allowed ? "权限设置" : "去授权", (prompt, which) -> openOverlaySettings());
+        if (allowed) {
+            dialog.setNeutralButton("重试", (prompt, which) -> {
+                if (!ProxyNotificationService.requestPanel(this, mode)) {
+                    showMessage("请确认 TUN 正在运行且通知栏控制已开启，再从通知重试。");
+                }
+            });
+        }
+        dialog.show();
+    }
+
+    private void openOverlaySettings() {
+        try {
+            startActivity(ProxyNotificationService.overlaySettings(this));
+        } catch (android.content.ActivityNotFoundException unavailable) {
+            try { startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)); }
+            catch (android.content.ActivityNotFoundException error) {
+                showMessage("请在系统设置的特殊应用权限中允许 MinClash 显示在其他应用上层。");
+            }
+        }
     }
 
     @Override protected void onStop() {
@@ -496,10 +524,21 @@ public final class MainActivity extends Activity {
         super.onResume();
         UpdateInstallReceiver.listen(this::onUpdateInstallResult);
         render();
+        Intent intent = getIntent();
+        if (ProxyNotificationService.ACTION_OVERLAY_HELP.equals(intent.getAction())) {
+            intent.setAction(null);
+            selectPage(2);
+            showOverlayPermissionHelp(intent.getBooleanExtra(ProxyNotificationService.EXTRA_MODE_PANEL, true));
+        }
         if (pendingUpdateCheck != null) {
             showAppUpdate(pendingUpdateCheck.release());
             pendingUpdateCheck = null;
         }
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
     }
 
     @Override protected void onPause() {
@@ -516,12 +555,12 @@ public final class MainActivity extends Activity {
     }
 
     private void addNetworkCheckCard(LinearLayout overview) {
-        add(overview, label("本机 HTTPS", 12, MUTED, true), 14);
+        add(overview, label("连接延迟", 12, MUTED, true), 14);
         FrameLayout checks = new FrameLayout(this);
         checks.setMinimumHeight(dp(48));
         checks.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9), shape(CARD, 14, true), null));
         checks.setFocusable(true);
-        checks.setContentDescription("本机 HTTPS 延迟，点按重新测试");
+        checks.setContentDescription("Google 和 Cloudflare 节点延迟，百度直连延迟，点按重新测试");
         checks.setOnClickListener(view -> checkNetwork(true));
         networkCheckArea = checks;
 
@@ -529,7 +568,7 @@ public final class MainActivity extends Activity {
         row.setGravity(Gravity.CENTER_VERTICAL);
         for (NetworkCheck target : NetworkCheck.values()) {
             LinearLayout site = column();
-            TextView name = label(target.label, 11, TEXT, true);
+            TextView name = label(target == NetworkCheck.BAIDU ? "百度 · 直连" : target.label, 11, TEXT, true);
             name.setGravity(Gravity.CENTER);
             add(site, name, 0);
             TextView result = label("—", 12, MUTED, true);
@@ -562,12 +601,13 @@ public final class MainActivity extends Activity {
             scheduleLatency(2500);
             return;
         }
+        if (!hasProxyControl(status)) return;
         main.removeCallbacks(pollLatency);
         int generation = ++networkCheckGeneration;
         networkChecksPending = networkResults.length;
         googleReachable = false;
         cloudflareReachable = false;
-        latencyTimedOut = false;
+        nodeLatencyAvailable = false;
         boolean confirm = !manual && confirmNextLatency;
         if (confirm) confirmNextLatency = false;
         networkCheckArea.setEnabled(false);
@@ -575,46 +615,67 @@ public final class MainActivity extends Activity {
             if (manual || networkResults[target.ordinal()].getText().toString().equals("—")) {
                 showNetworkResult(target, "…", MUTED);
             }
-            measureNetworkTarget(generation, target, manual, confirm);
         }
-    }
-
-    private void measureNetworkTarget(int generation, NetworkCheck target, boolean manual, boolean confirm) {
-        networkWorker.execute(() -> {
-            NetworkCheck.Result result = manual ? target.run() : target.runOnce();
+        worker.execute(() -> {
+            String node = null;
+            try { node = Controller.primaryProxy(); }
+            catch (Exception ignored) { }
+            String outlet = node;
             main.post(() -> {
                 if (isDestroyed() || generation != networkCheckGeneration) return;
-                if (!confirm || result.state() == NetworkCheck.State.REACHABLE || !visible || selectedPage != 0) {
+                if (!visible || selectedPage != 0) {
+                    resetNetworkChecks();
+                    return;
+                }
+                nodeLatencyAvailable = outlet != null;
+                for (NetworkCheck target : NetworkCheck.values()) {
+                    String exit = target == NetworkCheck.BAIDU ? "DIRECT" : outlet;
+                    if (exit == null) finishNetworkCheck(generation, target, -1);
+                    else measureNetworkTarget(generation, exit, target, confirm);
+                }
+            });
+        });
+    }
+
+    private void measureNetworkTarget(int generation, String outlet, NetworkCheck target, boolean confirm) {
+        worker.execute(() -> {
+            int delay;
+            try { delay = Controller.testDelay(outlet, target); }
+            catch (Exception ignored) { delay = 0; }
+            int result = delay;
+            main.post(() -> {
+                if (isDestroyed() || generation != networkCheckGeneration) return;
+                if (!confirm || result > 0 || !visible || selectedPage != 0) {
                     finishNetworkCheck(generation, target, result);
                     return;
                 }
                 showNetworkResult(target, "复测中…", MUTED);
                 main.postDelayed(() -> {
                     if (isDestroyed() || generation != networkCheckGeneration) return;
-                    if (visible && selectedPage == 0) measureNetworkTarget(generation, target, false, false);
+                    if (visible && selectedPage == 0) measureNetworkTarget(generation, outlet, target, false);
                     else finishNetworkCheck(generation, target, result);
                 }, 1200);
             });
         });
     }
 
-    private void finishNetworkCheck(int generation, NetworkCheck target, NetworkCheck.Result result) {
+    private void finishNetworkCheck(int generation, NetworkCheck target, int delay) {
         if (isDestroyed() || generation != networkCheckGeneration) return;
-        boolean reachable = result.state() == NetworkCheck.State.REACHABLE;
-        latencyTimedOut |= result.state() == NetworkCheck.State.TIMEOUT;
+        boolean reachable = delay > 0;
         if (target == NetworkCheck.GOOGLE) googleReachable = reachable;
         if (target == NetworkCheck.CLOUDFLARE) cloudflareReachable = reachable;
-        showNetworkResult(target, result.display(), reachable ? MINT : AMBER);
+        showNetworkResult(target, reachable ? delay + " ms" : delay < 0 ? "—" : "失败",
+            reachable ? MINT : delay < 0 ? MUTED : AMBER);
         if (--networkChecksPending == 0) {
             networkCheckArea.setEnabled(!busy);
-            boolean foreignUnavailable = !googleReachable && !cloudflareReachable;
+            boolean foreignUnavailable = nodeLatencyAvailable && !googleReachable && !cloudflareReachable;
             if (hasProxyControl(status) && foreignUnavailable) {
-                networkWarning.setText("Google 和 Cloudflare 均未连通 · 查看诊断  →");
+                networkWarning.setText("节点的 Google 和 Cloudflare 测速均未通过 · 查看诊断  →");
                 networkWarning.setVisibility(View.VISIBLE);
             } else {
                 networkWarning.setVisibility(View.GONE);
             }
-            scheduleLatency(latencyTimedOut || foreignUnavailable ? 15000 : 5000);
+            scheduleLatency(foreignUnavailable ? 15000 : 5000);
         }
     }
 
@@ -1925,7 +1986,8 @@ public final class MainActivity extends Activity {
         updatingSwitch = false;
         boolean notification = notificationEnabled();
         notificationButton.setText(notification ? "关闭通知栏控制" : "开启通知栏控制");
-        overlayPermissionButton.setVisibility(notification && !Settings.canDrawOverlays(this) ? View.VISIBLE : View.GONE);
+        overlayPermissionButton.setVisibility(notification ? View.VISIBLE : View.GONE);
+        overlayPermissionButton.setText(notification && Settings.canDrawOverlays(this) ? "检查悬浮窗权限" : "允许悬浮窗");
         foregroundAppButton.setVisibility(notification ? View.VISIBLE : View.GONE);
         foregroundAppButton.setText(notification && ForegroundApp.allowed(this) ? "当前应用显示权限" : "授权显示当前应用");
         if (visible && !busy && status != null) ProxyNotificationService.sync(this, notification && enabled && isActive());

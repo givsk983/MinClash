@@ -19,6 +19,7 @@ import android.provider.Settings;
 import android.util.Log;
 import android.view.Display;
 import android.view.WindowManager;
+import android.widget.RemoteViews;
 import android.widget.Toast;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
@@ -26,6 +27,7 @@ import java.util.concurrent.Executors;
 
 public final class ProxyNotificationService extends Service {
     static final String ACTION_OPEN_PANEL = "io.minclash.app.OPEN_PROXY_PANEL";
+    static final String ACTION_OVERLAY_HELP = "io.minclash.app.OVERLAY_HELP";
     static final String EXTRA_MODE_PANEL = "mode_panel";
     private static final String CHANNEL = "proxy_status";
     private static final int NOTIFICATION_ID = 1;
@@ -63,6 +65,7 @@ public final class ProxyNotificationService extends Service {
     private ForegroundApp foregroundApp;
     private Sample current;
     private ProxyQuickControls panel;
+    private boolean overlayFailed;
     private long notificationSince;
     private int inactivePolls;
     // Owned by the worker.
@@ -78,6 +81,23 @@ public final class ProxyNotificationService extends Service {
 
     static Intent overlaySettings(Context context) {
         return new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.fromParts("package", context.getPackageName(), null));
+    }
+
+    static Intent overlayHelp(Context context, boolean mode) {
+        return new Intent(context, MainActivity.class).setAction(ACTION_OVERLAY_HELP).putExtra(EXTRA_MODE_PANEL, mode)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+    }
+
+    static boolean requestPanel(Context context, boolean mode) {
+        if (!started || !Settings.canDrawOverlays(context)) return false;
+        try {
+            context.startService(new Intent(context, ProxyNotificationService.class).setAction(ACTION_OPEN_PANEL)
+                .putExtra(EXTRA_MODE_PANEL, mode));
+            return true;
+        } catch (IllegalStateException | SecurityException error) {
+            Log.w("MinClash", "Cannot request proxy overlay", error);
+            return false;
+        }
     }
 
     static void sync(Context context, boolean enabled) {
@@ -103,8 +123,12 @@ public final class ProxyNotificationService extends Service {
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_OPEN_PANEL.equals(intent.getAction())) {
-            if (current == null) stopSelf(startId);
-            else showPanel(intent.getBooleanExtra(EXTRA_MODE_PANEL, false));
+            if (current == null) {
+                Toast.makeText(this, "请打开 MinClash，检查 TUN 和通知栏控制状态", Toast.LENGTH_SHORT).show();
+                stopSelf(startId);
+            } else {
+                showPanel(intent.getBooleanExtra(EXTRA_MODE_PANEL, false));
+            }
             return START_NOT_STICKY;
         }
         if (current == null) {
@@ -112,6 +136,7 @@ public final class ProxyNotificationService extends Service {
             current = new Sample(new Connection("代理模式", "正在读取连接…", false, false), "MinClash",
                 Speed.UNKNOWN, Settings.canDrawOverlays(this));
             startForeground(NOTIFICATION_ID, notification());
+            started = true;
             main.post(poll);
         }
         return START_NOT_STICKY;
@@ -138,6 +163,7 @@ public final class ProxyNotificationService extends Service {
                     || !getSystemService(PowerManager.class).isInteractive()) closePanel();
                 inactivePolls = sample.connection().inactive() ? inactivePolls + 1 : 0;
                 if (inactivePolls >= 2) { stopSelf(); return; }
+                if (sample.overlayAllowed() != current.overlayAllowed()) overlayFailed = false;
                 if (!sample.equals(current)) {
                     current = sample;
                     manager.notify(NOTIFICATION_ID, notification());
@@ -222,10 +248,13 @@ public final class ProxyNotificationService extends Service {
         ProxyNotificationCard card = new ProxyNotificationCard(this);
         PendingIntent modePicker = openPicker(true);
         PendingIntent nodePicker = openPicker(false);
+        String app = overlayFailed ? "浮窗受限 · 点此检查" : current.app();
+        RemoteViews controls = card.view(app, connection.mode(), connection.node(), current.speed(), modePicker, nodePicker);
         Notification.Builder builder = new Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification).setContentTitle("MinClash")
             .setContentText(connection.mode() + " · " + connection.node())
-            .setCustomContentView(card.view(current.app(), connection.mode(), connection.node(), current.speed(), modePicker, nodePicker))
+            .setCustomContentView(controls)
+            .setCustomBigContentView(new RemoteViews(controls))
             .setContentIntent(modePicker).setWhen(notificationSince).setShowWhen(false).setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_SERVICE).setVisibility(Notification.VISIBILITY_PRIVATE)
             .setPublicVersion(new Notification.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_notification)
@@ -236,17 +265,17 @@ public final class ProxyNotificationService extends Service {
     }
 
     private PendingIntent openPicker(boolean mode) {
-        Intent intent = current.overlayAllowed() ? new Intent(this, ProxyOverlayLauncher.class)
+        Intent intent = current.overlayAllowed() && !overlayFailed ? new Intent(this, ProxyOverlayLauncher.class)
             .putExtra(EXTRA_MODE_PANEL, mode)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK)
-            : overlaySettings(this).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            : overlayHelp(this, mode);
         return PendingIntent.getActivity(this, mode ? 1 : 2, intent, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
     }
 
     private void showPanel(boolean mode) {
         closePanel();
         if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "请先允许 MinClash 显示在其他应用上层", Toast.LENGTH_SHORT).show();
+            reportOverlayFailure("请点通知，允许 MinClash 显示在其他应用上层");
             return;
         }
         try {
@@ -263,10 +292,22 @@ public final class ProxyNotificationService extends Service {
             });
             next.show();
             panel = next;
+            if (overlayFailed) {
+                overlayFailed = false;
+                manager.notify(NOTIFICATION_ID, notification());
+            }
         } catch (WindowManager.BadTokenException | WindowManager.InvalidDisplayException | SecurityException error) {
             Log.w("MinClash", "Cannot show proxy overlay", error);
-            Toast.makeText(this, "浮窗暂不可用，请检查系统权限", Toast.LENGTH_SHORT).show();
+            reportOverlayFailure("系统未能打开浮窗，请点通知检查权限");
         }
+    }
+
+    private void reportOverlayFailure(String message) {
+        if (!overlayFailed) {
+            overlayFailed = true;
+            manager.notify(NOTIFICATION_ID, notification());
+        }
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
     }
 
     private void closePanel() {

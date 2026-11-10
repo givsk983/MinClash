@@ -114,6 +114,21 @@ final class Controller {
         catch (IOException error) { return 0; }
     }
 
+    static String primaryProxy() throws Exception {
+        Mode mode = mode();
+        if (mode == Mode.DIRECT) return null;
+        List<Group> groups = readGroups();
+        Group primary = primaryGroup(mode, groups);
+        if (primary == null) return null;
+        List<String> chain = route(primary, groups);
+        if (chain.isEmpty()) return null;
+        String node = chain.get(chain.size() - 1);
+        return switch (node) {
+            case "DIRECT", "REJECT", "REJECT-DROP" -> null;
+            default -> node;
+        };
+    }
+
     static Group primaryGroup(Mode mode, List<Group> groups) {
         Group primary = groups.stream().filter(group -> mode == Mode.GLOBAL
             ? ProxyGroupSection.isGlobal(group.name()) : ProxyGroupSection.isProxies(group.name())).findFirst().orElse(null);
