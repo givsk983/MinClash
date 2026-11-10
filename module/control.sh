@@ -158,6 +158,56 @@ tun_ready() {
         "$IP" -4 rule show | grep -Eq " lookup $TABLE( |$)"
 }
 
+uplink_routes() {
+    local family
+    for family in -4 -6; do
+        "$IP" "$family" route show table all 2>/dev/null |
+            awk -v family="$family" -v tun="$IFACE" '
+                $1 == "default" {
+                    dev = ""; via = ""; table = ""; down = 0
+                    for (i = 2; i <= NF; i++) {
+                        if ($i == "dev") dev = $(i+1)
+                        if ($i == "via") via = $(i+1)
+                        if ($i == "table") table = $(i+1)
+                        if ($i == "linkdown") down = 1
+                    }
+                    if (!down && dev != "" && dev != tun && dev != "lo" && dev !~ /^dummy/)
+                        print family, dev, via, table
+                }
+            '
+    done | sort -u
+}
+
+wait_boot_uplink() {
+    local previous= current
+    log 'Waiting for a stable system uplink at boot.'
+    while enabled; do
+        current=$(uplink_routes)
+        if [ -n "$current" ] && [ "$current" = "$previous" ]; then
+            boot_uplink="$current"
+            return 0
+        fi
+        previous="$current"
+        sleep 3
+    done
+    return 1
+}
+
+boot_uplink_changed() {
+    local next
+    [ "$boot_checks" -gt 0 ] || return 1
+    boot_checks=$((boot_checks - 1))
+    next=$(uplink_routes)
+    if [ -z "$next" ]; then
+        boot_lost=1
+    elif [ "$next" = "$boot_previous" ] && { [ "$next" != "$boot_uplink" ] || [ "$boot_lost" = 1 ]; }; then
+        boot_checks=0
+        return 0
+    fi
+    boot_previous="$next"
+    return 1
+}
+
 trim_log() {
     local bytes
     bytes=$(stat -c %s "$LOG" 2>/dev/null) || return 0
@@ -167,6 +217,7 @@ trim_log() {
 }
 
 run_supervisor() {
+    local boot_uplink= boot_previous= boot_lost=0 boot_checks=0
     exec 8>"$DATA/daemon.lock"
     lock_fd 8 || exit 0
     trap 'stop_core && clean_routes; write_state stopped; rm -f "$DATA/daemon.pid"' EXIT
@@ -175,6 +226,12 @@ run_supervisor() {
 
     # Recover an orphaned core after an abrupt supervisor exit.
     stop_core && clean_routes || fail 'Could not recover the previous core.'
+    if [ "${1:-manual}" = boot ]; then
+        write_state starting
+        wait_boot_uplink || return 0
+        boot_previous="$boot_uplink"
+        boot_checks=15
+    fi
     export SKIP_SYSTEM_IPV6_CHECK=1
     delay=3
     while enabled; do
@@ -187,6 +244,10 @@ run_supervisor() {
                 age=0
                 mode_restored=0
                 while enabled && read_pid core >/dev/null; do
+                    if boot_uplink_changed; then
+                        log 'System uplink changed after boot. Restarting TUN once.'
+                        break
+                    fi
                     if tun_ready; then
                         if [ "$mode_restored" = 0 ] && [ -S "$SOCKET" ]; then
                             if [ -s "$DATA/mode" ] && ! apply_mode "$(cat "$DATA/mode")"; then
@@ -236,7 +297,7 @@ start() {
     [ -x "$IP" ] || fail 'The Android ip command is unavailable.'
     read_pid daemon >/dev/null && return 0
     write_state starting || fail 'Cannot write MinClash state.'
-    "$BB" nohup "$BB" sh "$MODDIR/control.sh" run </dev/null >> "$LOG" 2>&1 9>&- &
+    "$BB" nohup "$BB" sh "$MODDIR/control.sh" run "${1:-manual}" </dev/null >> "$LOG" 2>&1 9>&- &
     count=0
     until read_pid daemon >/dev/null; do
         [ "$count" -lt 20 ] || fail 'Could not start the supervisor. Check logs.'
@@ -300,7 +361,7 @@ check_profile() {
 }
 
 case "${1:-}" in
-    run) run_supervisor; exit ;;
+    run) run_supervisor "${2:-manual}"; exit ;;
     status)
         if read_pid daemon >/dev/null; then
             state=$(cat "$DATA/state" 2>/dev/null) || state=starting
@@ -326,7 +387,7 @@ esac
 exec 9>"$DATA/action.lock"
 lock_fd 9 || fail 'Another MinClash operation is in progress or flock is unavailable.'
 case "${1:-}" in
-    boot) if [ ! -e "$DATA/boot-off" ] && [ -s "$PROFILE" ]; then start; fi ;;
+    boot) if [ ! -e "$DATA/boot-off" ] && [ -s "$PROFILE" ]; then start boot; fi ;;
     start) start ;;
     stop) stop ;;
     import|validate) check_profile "$1" ;;

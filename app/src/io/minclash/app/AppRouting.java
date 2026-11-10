@@ -96,7 +96,7 @@ final class AppRouting {
                 }
                 if (entries.isEmpty()) throw new IOException("系统和 Root 查询均未返回可选应用，请检查应用列表访问限制。");
             }
-            return new Inventory(List.copyOf(entries), root, empty, allowRoot, SystemClock.elapsedRealtime(), current);
+            return new Inventory(java.util.Collections.unmodifiableList(entries), root, empty, allowRoot, SystemClock.elapsedRealtime(), current);
         }
     }
 

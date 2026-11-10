@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.yaml.snakeyaml.Yaml;
 
 public final class AppRoutingCheck {
@@ -75,11 +76,21 @@ public final class AppRoutingCheck {
         byte[] mixed = Profile.normalize(bytes(SOURCE + "dns: {nameserver: ['127.0.0.1', 'https://dns.example/dns-query']}\n"));
         require(Profile.repairDns(mixed) == mixed, "preserve mixed DNS");
         require(parse(repaired).get("rules").equals(rules), "DNS repair retains routing rules");
+        AppRouting.Entry chrome = new AppRouting.Entry("Chrome", "com.android.chrome", "", true, false, true);
+        AppRouting.Entry play = new AppRouting.Entry("Play", "com.android.vending", "", true, true, false);
+        AppRouting.Entry system = new AppRouting.Entry("Settings", "com.android.settings", "", true, true, false);
+        AppCategories.Category custom = new AppCategories.Category("custom:test", "常用", Set.of(chrome.packageName()));
+        List<AppCategories.Category> categories = AppCategories.all(List.of(custom));
+        AppCategories.Category systemCategory = categories.stream().filter(category -> category.id().equals("system")).findFirst().orElseThrow();
+        AppCategories.Category googleCategory = categories.stream().filter(category -> category.id().equals("google")).findFirst().orElseThrow();
+        require(systemCategory.includes(system) && systemCategory.includes(play) && !systemCategory.includes(chrome), "system package flags");
+        require(googleCategory.includes(chrome) && googleCategory.includes(play) && !googleCategory.includes(system), "Google package matching");
+        require(custom.includes(chrome) && !custom.includes(play), "custom category membership");
         Files.createDirectories(Path.of(args[0]));
         Files.write(Path.of(args[0], "app-routing.yaml"), effective);
         Files.write(Path.of(args[0], "app-routing-nodes-only.yaml"), nodesOnly);
         Files.write(Path.of(args[0], "dns-repaired.yaml"), repaired);
-        System.out.println("PASS: personal priority, direct routing, subscription update, removal, missing groups, invalid packages, nodes-only and Unicode.");
+        System.out.println("PASS: routing overrides, DNS repair, subscription refresh, group validation and app categories.");
     }
 
     private static void reject(byte[] base, Map<String, String> rules) throws Exception {

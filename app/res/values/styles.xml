@@ -14,6 +14,17 @@
         <item name="android:windowActionModeOverlay">true</item>
         <item name="android:alertDialogTheme">@style/AppDialog</item>
     </style>
+    <style name="ProxyQuickControls" parent="android:style/Theme.Material.Dialog.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#79E7C9</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@drawable/dialog_background</item>
+        <item name="android:windowMinWidthMinor">88%</item>
+        <item name="android:windowMinWidthMajor">62%</item>
+        <item name="android:backgroundDimAmount">0.28</item>
+        <item name="android:windowSoftInputMode">stateAlwaysHidden|adjustResize</item>
+        <item name="android:alertDialogTheme">@style/AppDialog</item>
+    </style>
     <style name="AppDialog" parent="android:style/Theme.Material.Dialog.Alert">
         <item name="android:fontFamily">sans</item>
         <item name="android:colorAccent">#79E7C9</item>

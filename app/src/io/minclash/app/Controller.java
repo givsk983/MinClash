@@ -27,17 +27,24 @@ final class Controller {
         }
     }
 
-    record Group(String name, String current, List<String> options, boolean automatic) {}
+    record Group(String name, String current, List<String> options, boolean automatic, boolean selectable) {}
     record Groups(List<Group> values) {}
+    record Snapshot(Mode mode, String node, List<Group> groups) {}
 
     static Mode mode() throws Exception {
         JSONObject config = new JSONObject(request("GET", "/configs", ""));
         return Mode.valueOf(config.getString("mode").toUpperCase(Locale.ROOT));
     }
 
-    static Groups groups() throws Exception { return groups(true); }
+    static Groups groups() throws Exception { return new Groups(selectable(readGroups())); }
 
-    private static Groups groups(boolean selectableOnly) throws Exception {
+    private static List<Group> selectable(List<Group> groups) {
+        List<Group> visible = new ArrayList<>();
+        for (Group group : groups) if (group.selectable()) visible.add(group);
+        return visible;
+    }
+
+    private static List<Group> readGroups() throws Exception {
         JSONArray proxies = new JSONObject(request("GET", "/group", "")).getJSONArray("proxies");
         List<Group> groups = new ArrayList<>();
         for (int i = 0; i < proxies.length(); i++) {
@@ -45,44 +52,66 @@ final class Controller {
             String name = proxy.getString("name");
             String type = proxy.getString("type");
             boolean automatic = type.equals("URLTest") || type.equals("Fallback");
-            if (selectableOnly && ((!automatic && !type.equals("Selector")) || proxy.optBoolean("hidden"))) continue;
             JSONArray all = proxy.optJSONArray("all");
             if (all == null) continue;
             List<String> options = new ArrayList<>();
             for (int j = 0; j < all.length(); j++) options.add(all.getString(j));
-            if (!selectableOnly || !options.isEmpty()) groups.add(new Group(name, proxy.optString("now"), options, automatic));
+            boolean selectable = (automatic || type.equals("Selector")) && !proxy.optBoolean("hidden") && !options.isEmpty();
+            groups.add(new Group(name, proxy.optString("now"), options, automatic, selectable));
         }
         groups.sort(Comparator.comparing(Group::name, String.CASE_INSENSITIVE_ORDER));
-        return new Groups(groups);
+        return groups;
     }
 
     static String primaryNode(Mode mode) throws Exception {
-        List<Group> groups = groups(false).values();
+        return primaryNode(mode, readGroups());
+    }
+
+    static Snapshot snapshot() throws Exception {
+        Mode mode = mode();
+        if (mode == Mode.DIRECT) return new Snapshot(mode, "直连", java.util.Collections.emptyList());
+        List<Group> groups;
+        try { groups = readGroups(); }
+        catch (Exception error) { return new Snapshot(mode, "节点暂不可用", java.util.Collections.emptyList()); }
+        List<Group> visible = selectable(groups);
+        if (mode == Mode.RULE) visible.removeIf(group -> ProxyGroupSection.isGlobal(group.name()));
+        Group primary = primaryGroup(mode, visible);
+        if (primary != null) {
+            visible.remove(primary);
+            visible.add(0, primary);
+        }
+        return new Snapshot(mode, primaryNode(mode, groups), visible);
+    }
+
+    private static String primaryNode(Mode mode, List<Group> groups) {
         Group primary = primaryGroup(mode, groups);
         if (primary == null) return "未找到主代理";
         List<String> route = route(primary, groups);
         return route.isEmpty() ? "尚未选择" : outletLabel(route.get(route.size() - 1));
     }
 
-    static String testPrimaryOutlet(Mode mode) throws Exception {
-        if (mode == Mode.DIRECT) return "当前模式为直连";
-        List<Group> groups = groups(false).values();
+    enum OutletState { DIRECT_MODE, NO_GROUP, NO_SELECTION, DIRECT, REJECTED, HTTPS_OK, HTTPS_FAILED }
+    record OutletProbe(OutletState state, int delay) {}
+
+    static OutletProbe testPrimaryOutlet(Mode mode) throws Exception {
+        if (mode == Mode.DIRECT) return new OutletProbe(OutletState.DIRECT_MODE, 0);
+        List<Group> groups = readGroups();
         Group primary = primaryGroup(mode, groups);
-        if (primary == null) return "无法确定主代理组";
+        if (primary == null) return new OutletProbe(OutletState.NO_GROUP, 0);
         List<String> route = route(primary, groups);
-        if (route.isEmpty()) return "主代理组尚无选中出口";
+        if (route.isEmpty()) return new OutletProbe(OutletState.NO_SELECTION, 0);
         String outlet = route.get(route.size() - 1);
-        if (outlet.equals("DIRECT") || outlet.equals("REJECT") || outlet.equals("REJECT-DROP")) {
-            return "主代理组选中" + outletLabel(outlet);
-        }
-        String path = "/proxies/" + Uri.encode(outlet) + "/delay?timeout=5000&expected=204&url="
-            + Uri.encode("https://www.google.com/generate_204");
-        try {
-            int delay = new JSONObject(request("GET", path, "")).getInt("delay");
-            return "节点 HTTPS 探测通过 · " + delay + " ms";
-        } catch (IOException error) {
-            return "节点 HTTPS 探测失败";
-        }
+        if (outlet.equals("DIRECT")) return new OutletProbe(OutletState.DIRECT, 0);
+        if (outlet.equals("REJECT") || outlet.equals("REJECT-DROP")) return new OutletProbe(OutletState.REJECTED, 0);
+        int delay = testDelay(outlet, NetworkCheck.GOOGLE);
+        return new OutletProbe(delay > 0 ? OutletState.HTTPS_OK : OutletState.HTTPS_FAILED, delay);
+    }
+
+    static int testDelay(String outlet, NetworkCheck target) throws Exception {
+        String path = "/proxies/" + Uri.encode(outlet) + "/delay?timeout=3500&expected="
+            + target.expectedStatus + "&url=" + Uri.encode(target.endpoint.toString());
+        try { return new JSONObject(request("GET", path, "")).getInt("delay"); }
+        catch (IOException error) { return 0; }
     }
 
     static Group primaryGroup(Mode mode, List<Group> groups) {

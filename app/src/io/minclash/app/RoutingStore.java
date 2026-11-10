@@ -23,6 +23,9 @@ import org.json.JSONObject;
 final class RoutingStore {
     // Serialize configuration changes across Activities and scheduled subscription updates.
     static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
+    private static volatile int generation;
+
+    static int generation() { return generation; }
 
     record State(byte[] source, Map<String, String> applications, String subscription) {
         State(byte[] source, Map<String, String> applications) { this(source, applications, null); }
@@ -105,6 +108,7 @@ final class RoutingStore {
             output = file.startWrite();
             output.write(bytes);
             file.finishWrite(output);
+            generation++;
         } catch (Exception error) {
             if (output != null) file.failWrite(output);
             throw error;

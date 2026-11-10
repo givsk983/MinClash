@@ -69,6 +69,47 @@ final class Module {
         return bytes;
     }
 
+    record TunCounters(long received, long transmitted) {}
+
+    static TunCounters tunCounters() throws Exception {
+        String output = runRoot("""
+            read -r rx < /sys/class/net/minclash0/statistics/rx_bytes &&
+            read -r tx < /sys/class/net/minclash0/statistics/tx_bytes &&
+            printf '%s %s\\n' "$rx" "$tx"
+            """, null, null, 5);
+        String[] parts = output.split(" ");
+        if (parts.length != 2) throw new IOException("无法读取 TUN 流量计数。");
+        return new TunCounters(Long.parseLong(parts[0]), Long.parseLong(parts[1]));
+    }
+
+    static String diagnosticFacts() throws Exception {
+        // Raw lines can contain destination addresses and node names. Emit only fixed flags.
+        return runRoot("""
+            export PATH=/system/bin
+            IP=/system/bin/ip
+            if "$IP" link show dev minclash0 >/dev/null 2>&1; then echo IFACE; fi
+            for family in 4 6; do
+                if "$IP" "-$family" route show table 20882 2>/dev/null | grep -Eq ' dev minclash0( |$)' &&
+                   "$IP" "-$family" rule show 2>/dev/null | grep -Eq ' lookup 20882( |$)'; then
+                    echo "ROUTE$family"
+                fi
+            done
+            if recent=$(tail -c 12000 /data/adb/minclash/core.log 2>/dev/null); then
+                echo LOG_SAMPLE
+                match() { printf '%s\\n' "$recent" | grep -Eiq "$1" && echo "$2"; }
+                match 'dns resolve failed|no such host|all DNS requests failed' NODE_DNS
+                match "can't download (geo(site|ip)\\.dat|mmdb|asn)|geodata.*(failed|error)" GEODATA
+                match 'provider.*(download failed|initial error|update failed|could not)' PROVIDER
+                match 'certificate signed by unknown authority|x509:|tls handshake timeout' CORE_TLS
+                match 'TUN did not become ready|priorities .* already in use|Interface minclash0 is already in use' TUN_SETUP
+                match 'Waiting for a stable system uplink at boot' BOOT_UPLINK_WAIT
+                match 'System uplink changed after boot' BOOT_UPLINK_RESTART
+                match 'configuration (file .* )?test failed|parse config error' CONFIG
+            fi
+            exit 0
+            """, null, null, 10);
+    }
+
     static Status parseStatus(String output) throws IOException {
         String state = "";
         boolean profile = false;

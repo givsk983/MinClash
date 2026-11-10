@@ -7,13 +7,14 @@ import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLException;
 
 enum NetworkCheck {
     GOOGLE("Google", "https://www.google.com/generate_204", "GET", 204),
     BAIDU("百度", "https://www.baidu.com/", "HEAD", 200),
     CLOUDFLARE("Cloudflare", "https://www.cloudflare.com/cdn-cgi/trace", "GET", 200);
 
-    enum State { REACHABLE, TIMEOUT, DNS_ERROR, UNREACHABLE, HTTP_ERROR }
+    enum State { REACHABLE, TIMEOUT, DNS_ERROR, TLS_ERROR, UNREACHABLE, HTTP_ERROR }
     private record Sample(State state, long latencyMs, int responseCode) {}
     record Result(State state, long medianMs, int responseCode) {
         String display() {
@@ -21,6 +22,7 @@ enum NetworkCheck {
                 case REACHABLE -> medianMs + "\u00a0ms";
                 case TIMEOUT -> "超时";
                 case DNS_ERROR -> "DNS 失败";
+                case TLS_ERROR -> "TLS 失败";
                 case UNREACHABLE -> "失败";
                 case HTTP_ERROR -> "HTTP\u00a0" + responseCode;
             };
@@ -30,9 +32,9 @@ enum NetworkCheck {
     private static final int SAMPLE_COUNT = 3;
     private static final int SOCKET_TIMEOUT_MS = 5000;
     final String label;
-    private final URI endpoint;
+    final URI endpoint;
     private final String method;
-    private final int expectedStatus;
+    final int expectedStatus;
 
     NetworkCheck(String label, String endpoint, String method, int expectedStatus) {
         this.label = label;
@@ -57,6 +59,11 @@ enum NetworkCheck {
         return new Result(State.REACHABLE, median, expectedStatus);
     }
 
+    Result runOnce() {
+        Sample sample = sample();
+        return new Result(sample.state(), sample.latencyMs(), sample.responseCode());
+    }
+
     private Sample sample() {
         HttpsURLConnection connection = null;
         try {
@@ -79,6 +86,8 @@ enum NetworkCheck {
             return new Sample(State.TIMEOUT, 0, 0);
         } catch (UnknownHostException error) {
             return new Sample(State.DNS_ERROR, 0, 0);
+        } catch (SSLException error) {
+            return new Sample(State.TLS_ERROR, 0, 0);
         } catch (IOException error) {
             return new Sample(State.UNREACHABLE, 0, 0);
         } finally {

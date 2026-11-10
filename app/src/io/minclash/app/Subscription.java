@@ -14,11 +14,12 @@ final class Subscription {
     static final String PROXY_HINT = "如果该订阅需要代理，请先连接可用代理再重试。也可以下载 Clash / Mihomo YAML 后从本地导入。";
 
     static final class NetworkFailure extends IOException {
-        final String reason;
+        enum Kind { DNS, TIMEOUT, CONNECT }
+        final Kind kind;
 
-        private NetworkFailure(String reason) {
+        private NetworkFailure(Kind kind, String reason) {
             super(reason + "\n\n" + PROXY_HINT);
-            this.reason = reason;
+            this.kind = kind;
         }
     }
 
@@ -89,9 +90,9 @@ final class Subscription {
         if (error instanceof SSLException) {
             return new IOException("订阅服务器的 TLS 连接失败。请检查手机时间、服务器证书和订阅链接。");
         }
-        if (error instanceof UnknownHostException) return new NetworkFailure("无法解析订阅服务器域名。请检查网络和 DNS。");
-        if (error instanceof SocketTimeoutException) return new NetworkFailure("下载订阅超时。请检查当前网络。");
-        if (error instanceof SocketException) return new NetworkFailure("无法连接订阅服务器或连接已中断。请检查当前网络。");
+        if (error instanceof UnknownHostException) return new NetworkFailure(NetworkFailure.Kind.DNS, "无法解析订阅服务器域名。请检查网络和 DNS。");
+        if (error instanceof SocketTimeoutException) return new NetworkFailure(NetworkFailure.Kind.TIMEOUT, "下载订阅超时。请检查当前网络。");
+        if (error instanceof SocketException) return new NetworkFailure(NetworkFailure.Kind.CONNECT, "无法连接订阅服务器或连接已中断。请检查当前网络。");
         return new IOException("无法读取订阅。请检查网络和订阅链接。");
     }
 

@@ -77,9 +77,10 @@ def build_apk(yaml_jar, apache_license, module_archive):
     resources = BUILD / "res.zip"
     execute(sdk_tool("aapt2"), "compile", "--dir", ROOT / "app/res", "-o", resources)
     base = BUILD / "unsigned.apk"
+    generated = BUILD / "generated"
     execute(sdk_tool("aapt2"), "link", "-I", android_jar, "--manifest",
-            ROOT / "app/AndroidManifest.xml", "-o", base, resources)
-    sources = sorted((ROOT / "app/src").rglob("*.java"))
+            ROOT / "app/AndroidManifest.xml", "--java", generated, "-o", base, resources)
+    sources = sorted((ROOT / "app/src").rglob("*.java")) + sorted(generated.rglob("R.java"))
     execute(jdk_tool("javac"), "-encoding", "UTF-8", "--release", "17", "-classpath",
             os.pathsep.join(map(str, (android_jar, yaml_jar))), "-d", classes, *sources)
 
