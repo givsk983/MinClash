@@ -9,7 +9,9 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.ArrayList;
 import java.util.Map;
 import java.util.TreeMap;
@@ -203,18 +205,49 @@ final class Profile {
         MappingNode root = routingRoot(content);
         Set<String> names = new LinkedHashSet<>();
         names.add("DIRECT");
-        for (NodeTuple tuple : root.getValue()) {
-            if (!keyOf(tuple).equals("proxy-groups") || !(tuple.getValueNode() instanceof SequenceNode groups)) continue;
-            for (Node group : groups.getValue()) {
-                if (!(group instanceof MappingNode mapping)) continue;
-                for (NodeTuple field : mapping.getValue()) {
-                    if (keyOf(field).equals("name") && field.getValueNode() instanceof ScalarNode name) {
-                        names.add(name.getValue());
-                    }
+        names.addAll(namedEntries(field(root, "proxy-groups")).keySet());
+        return new ArrayList<>(names);
+    }
+
+    record PreviewGroup(Set<String> members, boolean allNodes, boolean providerNodes) {}
+    record PreviewLayout(Set<String> nodes, Map<String, PreviewGroup> groups, boolean hasProviders) {}
+
+    static PreviewLayout previewLayout(byte[] content) throws IOException {
+        MappingNode root = routingRoot(content);
+        Set<String> nodes = namedEntries(field(root, "proxies")).keySet();
+        boolean hasProviders = field(root, "proxy-providers") instanceof MappingNode providers && !providers.getValue().isEmpty();
+        Map<String, PreviewGroup> groups = new TreeMap<>();
+        namedEntries(field(root, "proxy-groups")).forEach((name, group) -> {
+            Set<String> members = new HashSet<>();
+            if (field(group, "proxies") instanceof SequenceNode list) {
+                for (Node node : list.getValue()) if (node instanceof ScalarNode member) members.add(member.getValue());
+            }
+            boolean all = enabled(group, "include-all");
+            boolean usesProviders = field(group, "use") instanceof SequenceNode use && !use.getValue().isEmpty();
+            groups.put(name, new PreviewGroup(members, all || enabled(group, "include-all-proxies"),
+                usesProviders || hasProviders && (all || enabled(group, "include-all-providers"))));
+        });
+        return new PreviewLayout(nodes, groups, hasProviders);
+    }
+
+    private static Map<String, MappingNode> namedEntries(Node nodeList) {
+        Map<String, MappingNode> entries = new LinkedHashMap<>();
+        if (nodeList instanceof SequenceNode sequence) {
+            for (Node node : sequence.getValue()) {
+                if (node instanceof MappingNode item && field(item, "name") instanceof ScalarNode name) {
+                    entries.put(name.getValue(), item);
                 }
             }
         }
-        return new ArrayList<>(names);
+        return entries;
+    }
+
+    private static boolean enabled(MappingNode mapping, String key) {
+        if (!(field(mapping, key) instanceof ScalarNode flag)) return false;
+        return switch (flag.getValue().toLowerCase(Locale.ROOT)) {
+            case "true", "yes", "on", "y" -> true;
+            default -> false;
+        };
     }
 
     // Always merge into the saved subscription source, never into an earlier merged profile.

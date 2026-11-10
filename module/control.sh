@@ -16,6 +16,7 @@ PROFILE=$DATA/config.yaml
 LOG=$DATA/core.log
 IFACE=minclash0
 TABLE=20882
+FORWARD_RULE=8799
 FIRST_RULE=8800
 LAST_RULE=8810
 LIMIT=2097152
@@ -73,8 +74,34 @@ owned_priorities() {
     awk -v first="$FIRST_RULE" -v last="$LAST_RULE" -F: '$1+0 >= first && $1+0 <= last { print $1+0 }'
 }
 
+forwarding_rule() {
+    "$IP" "$1" rule "$2" pref "$FORWARD_RULE" not iif lo goto "$LAST_RULE"
+}
+
+prepare_forwarding() {
+    # Android should route tethering in both directions. Keep interception for local sockets.
+    printf '%s\n' "$BOOT_ID" > "$DATA/forwarding-owned" &&
+        forwarding_rule -4 add && forwarding_rule -6 add
+}
+
+clean_forwarding() {
+    local family rules
+    [ -f "$DATA/forwarding-owned" ] || return 0
+    if [ "$(cat "$DATA/forwarding-owned")" = "$BOOT_ID" ]; then
+        for family in -4 -6; do
+            forwarding_rule "$family" del 2>/dev/null || :
+            rules=$("$IP" "$family" rule show) || return 1
+            if printf '%s\n' "$rules" | grep -Eq "^$FORWARD_RULE:[[:space:]]+not from all iif lo goto $LAST_RULE([[:space:]]|$)"; then
+                return 1
+            fi
+        done
+    fi
+    rm -f "$DATA/forwarding-owned"
+}
+
 clean_routes() {
     local family priority rules
+    clean_forwarding || return 1
     [ -f "$DATA/routes-owned" ] || return 0
     if [ "$(cat "$DATA/routes-owned")" = "$BOOT_ID" ]; then
         for family in -4 -6; do
@@ -97,6 +124,10 @@ check_routes() {
     fi
     for family in -4 -6; do
         rules=$("$IP" "$family" rule show) || return 1
+        if printf '%s\n' "$rules" | grep -q "^$FORWARD_RULE:"; then
+            log "Forwarding rule priority $FORWARD_RULE is already in use."
+            return 1
+        fi
         if [ -n "$(printf '%s\n' "$rules" | owned_priorities)" ] ||
            printf '%s\n' "$rules" | grep -Eq "lookup $TABLE( |$)" ||
            [ -n "$("$IP" "$family" route show table "$TABLE" 2>/dev/null)" ]; then
@@ -238,6 +269,7 @@ run_supervisor() {
         write_state starting
         if check_routes; then
             printf '%s\n' "$BOOT_ID" > "$DATA/routes-owned" || fail 'Cannot record routing ownership.'
+            prepare_forwarding || fail 'Could not preserve Android forwarding routes.'
             "$CORE" -d "$DATA" -f "$PROFILE" -ext-ctl-unix "$SOCKET" </dev/null >> "$LOG" 2>&1 8>&- &
             child=$!
             if save_pid core "$child"; then
@@ -365,7 +397,8 @@ case "${1:-}" in
     status)
         if read_pid daemon >/dev/null; then
             state=$(cat "$DATA/state" 2>/dev/null) || state=starting
-        elif read_pid core >/dev/null || [ "$(cat "$DATA/routes-owned" 2>/dev/null)" = "$BOOT_ID" ]; then
+        elif read_pid core >/dev/null || [ "$(cat "$DATA/routes-owned" 2>/dev/null)" = "$BOOT_ID" ] ||
+            [ "$(cat "$DATA/forwarding-owned" 2>/dev/null)" = "$BOOT_ID" ]; then
             state=orphaned
         else
             state=stopped

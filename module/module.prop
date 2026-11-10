@@ -1,7 +1,7 @@
 id=minclash
 name=MinClash Root TUN
-version=0.0.4
-versionCode=13
-revision=3
+version=0.0.5
+versionCode=14
+revision=4
 author=MinClash
-description=Mihomo v1.19.33 ARM64, with boot startup and a root TUN supervisor managed by the MinClash app.
+description=Mihomo v1.19.33 ARM64 with a root TUN supervisor and Android hotspot forwarding compatibility.

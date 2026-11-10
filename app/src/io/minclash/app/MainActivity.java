@@ -71,7 +71,7 @@ public final class MainActivity extends Activity {
     private static final int APP_LIST_SETTINGS = 4;
     private static final int REQUEST_NOTIFICATIONS = 5;
     private static final int UPDATE_INSTALL_PERMISSION = 6;
-    private static final String NOTIFICATION_CONTROL = "notification_control";
+    static final String NOTIFICATION_CONTROL = "notification_control";
     private static final String ROOT_INVENTORY = "root_app_inventory";
     private static final int BG = 0xff0d131a;
     private static final int CARD = 0xff17212b;
@@ -524,6 +524,7 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         UpdateInstallReceiver.listen(this::onUpdateInstallResult);
+        if (appPreferences().getBoolean("connected", false)) main.post(poll);
         render();
         Intent intent = getIntent();
         if (ProxyNotificationService.ACTION_OVERLAY_HELP.equals(intent.getAction())) {
@@ -955,10 +956,7 @@ public final class MainActivity extends Activity {
         entries.add(entry);
         dialog.dismiss();
         if (activate && canApplySubscription()) {
-            execute("订阅已保存并启用。", true, () -> {
-                subscriptionCatalog.save(entries);
-                return applySubscription(entry.address());
-            });
+            previewSubscription(entry, true);
         } else {
             saveSubscriptions(entries, "订阅已保存。");
         }
@@ -993,14 +991,54 @@ public final class MainActivity extends Activity {
 
     private void activateSubscription(SubscriptionCatalog.Entry entry) {
         if (entry == null || !canApplySubscription()) return;
-        boolean active = entry.address().equals(subscriptions.activeAddress());
-        execute(active ? "订阅已更新。" : "已切换到「" + entry.name() + "」。", true,
-            () -> applySubscription(entry.address()));
+        previewSubscription(entry, false);
     }
 
-    private Module.Status applySubscription(String address) throws Exception {
+    private void previewSubscription(SubscriptionCatalog.Entry entry, boolean adding) {
+        showMessage("正在下载订阅并比较配置…");
+        execute("", () -> {
+            byte[] source = Subscription.fetch(entry.address());
+            Module.Status current = Module.status();
+            List<Controller.Group> selections = null;
+            if (hasProxyControl(current)) {
+                try { selections = Controller.groups().values(); }
+                catch (Exception unavailable) { selections = null; }
+            }
+            return SubscriptionPreview.compare(entry, source, RoutingStore.generation(), adding,
+                new RoutingStore(this).loadIfAvailable(current), selections);
+        });
+    }
+
+    private void showSubscriptionPreview(SubscriptionPreview preview) {
+        showMessage("");
+        AlertDialog.Builder dialog = textDialog("订阅变更预览 · " + preview.entry().name(), preview.summary())
+            .setNegativeButton("关闭", null);
+        if (!preview.conflicts()) dialog.setPositiveButton("应用配置", (view, which) -> {
+            if (!canApplySubscription()) {
+                showMessage("当前 TUN 状态不允许应用订阅，请稍后重试。");
+                return;
+            }
+            execute("订阅配置已应用。", true, () -> applySubscription(preview));
+        });
+        dialog.show();
+    }
+
+    private Module.Status applySubscription(SubscriptionPreview preview) throws Exception {
+        String address = preview.entry().address();
         try {
-            new RoutingStore(this).importProfile(Subscription.fetch(address), address);
+            if (preview.generation() != RoutingStore.generation()) {
+                throw new IOException("当前配置已变化，请重新预览订阅。");
+            }
+            Module.Status current = Module.status();
+            if (!canApplySubscription(current)) throw new IOException("当前 TUN 状态不允许应用订阅，请稍后重试。");
+            List<SubscriptionCatalog.Entry> entries = new ArrayList<>(subscriptionCatalog.load().entries());
+            boolean exists = entries.stream().anyMatch(entry -> entry.address().equals(address));
+            if (exists == preview.adding()) throw new IOException("订阅列表已变化，请重新预览。");
+            if (preview.adding()) {
+                entries.add(preview.entry());
+                subscriptionCatalog.save(entries);
+            }
+            new RoutingStore(this).importProfile(preview.source(), address);
         } finally {
             refreshSubscriptionCatalog();
         }
@@ -1807,6 +1845,7 @@ public final class MainActivity extends Activity {
         int[] chosen = {targets.indexOf(app.target())};
         new AlertDialog.Builder(this).setTitle(app.label() + " · 出口")
             .setSingleChoiceItems(labels, chosen[0], (dialog, index) -> chosen[0] = index)
+            .setNeutralButton("当前连接", (dialog, which) -> showAppConnections(app))
             .setNegativeButton("取消", null).setPositiveButton("保存", (dialog, which) -> {
                 if (chosen[0] < 0) return;
                 String target = targets.get(chosen[0]);
@@ -1822,6 +1861,66 @@ public final class MainActivity extends Activity {
                     return routingLoader.load(this, appPreferences().getBoolean(ROOT_INVENTORY, false), Module.status());
                 });
             }).show();
+    }
+
+    private void showAppConnections(AppRouting.Entry app) {
+        TextView result = label("", 13, TEXT, false);
+        result.setPadding(dp(16), dp(12), dp(16), dp(12));
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(result);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(app.label() + " · 当前连接")
+            .setView(scroll).setNegativeButton("关闭", null).setPositiveButton("刷新", null)
+            .setNeutralButton("临时识别应用", null).create();
+        dialog.show();
+        Button refresh = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        Button identify = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+        Runnable read = () -> {
+            refresh.setEnabled(false);
+            identify.setVisibility(View.GONE);
+            result.setText("正在读取当前连接…");
+            networkWorker.execute(() -> {
+                LiveConnections.View snapshot;
+                try { snapshot = LiveConnections.read(app.packageName(), getPackageManager()); }
+                catch (Exception error) {
+                    snapshot = new LiveConnections.View("暂时无法读取连接，请确认 TUN 正在运行后重试。", false);
+                }
+                LiveConnections.View data = snapshot;
+                main.post(() -> {
+                    if (isDestroyed() || !dialog.isShowing()) return;
+                    result.setText(data.details());
+                    scroll.scrollTo(0, 0);
+                    identify.setVisibility(data.offerIdentification() ? View.VISIBLE : View.GONE);
+                    refresh.setEnabled(true);
+                });
+            });
+        };
+        identify.setOnClickListener(view -> new AlertDialog.Builder(this).setTitle("临时识别应用")
+            .setMessage("在本次 TUN 运行期间，Mihomo 会尝试识别新连接来自哪个应用。开启后请让该应用重新产生流量，再刷新查看。")
+            .setNegativeButton("取消", null).setPositiveButton("开启", (confirm, which) -> {
+                identify.setEnabled(false);
+                refresh.setEnabled(false);
+                worker.execute(() -> {
+                    boolean enabled;
+                    try {
+                        Controller.identifyProcessesForSession();
+                        enabled = true;
+                    } catch (Exception error) { enabled = false; }
+                    boolean success = enabled;
+                    main.post(() -> {
+                        if (isDestroyed() || !dialog.isShowing()) return;
+                        identify.setEnabled(true);
+                        if (success) {
+                            identify.setVisibility(View.GONE);
+                            result.setText("已开启临时识别。请让应用重新产生流量，再点刷新。");
+                        } else {
+                            result.setText("暂时无法开启识别，请确认 TUN 状态后重试。");
+                        }
+                        refresh.setEnabled(true);
+                    });
+                });
+            }).show());
+        refresh.setOnClickListener(view -> read.run());
+        read.run();
     }
 
     private void runDiagnostics(Subscription.NetworkFailure subscriptionFailure) {
@@ -1867,6 +1966,7 @@ public final class MainActivity extends Activity {
                         if (result instanceof DiagnosticReport report) showDiagnosticReport(report.text());
                         if (result instanceof Controller.Mode mode) showModes(mode);
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
+                        if (result instanceof SubscriptionPreview preview) showSubscriptionPreview(preview);
                         if (result instanceof AppRouting.Screen screen) {
                             checkNetworkAfterStatus(screen.status(), summary, checkConnection);
                             status = screen.status();
@@ -1907,8 +2007,12 @@ public final class MainActivity extends Activity {
     private boolean isActive() { return status != null && status.installed() && !status.state.equals("stopped"); }
 
     private boolean canApplySubscription() {
-        return !busy && status != null && status.installed() && status.enabled
-            && (status.state.equals("stopped") || status.state.equals("running"));
+        return !busy && canApplySubscription(status);
+    }
+
+    private static boolean canApplySubscription(Module.Status current) {
+        return current != null && current.installed() && current.enabled
+            && (current.state.equals("stopped") || current.state.equals("running"));
     }
 
     private void render() {

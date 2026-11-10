@@ -54,6 +54,11 @@ final class RoutingStore {
         return saved == null ? new State(Profile.normalize(Module.readProfile()), Collections.emptyMap()) : saved;
     }
 
+    State loadIfAvailable(Module.Status status) throws Exception {
+        if (status.profile) return load();
+        return read();
+    }
+
     void importProfile(byte[] source, String subscription) throws Exception {
         State saved = read();
         apply(new State(source, saved == null ? Collections.emptyMap() : saved.applications(), subscription));

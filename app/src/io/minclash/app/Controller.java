@@ -42,6 +42,16 @@ final class Controller {
 
     static Groups groups() throws Exception { return new Groups(selectable(readGroups())); }
 
+    static JSONObject connections() throws Exception { return new JSONObject(probe("/connections")); }
+
+    static boolean identifiesAllProcesses() throws Exception {
+        return new JSONObject(probe("/configs")).optString("find-process-mode").equalsIgnoreCase("always");
+    }
+
+    static void identifyProcessesForSession() throws Exception {
+        request("PATCH", "/configs", "{\"find-process-mode\":\"always\"}");
+    }
+
     private static List<Group> selectable(List<Group> groups) {
         List<Group> visible = new ArrayList<>();
         for (Group group : groups) if (group.selectable()) visible.add(group);
