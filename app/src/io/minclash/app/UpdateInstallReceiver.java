@@ -9,7 +9,7 @@ import java.util.function.Consumer;
 public final class UpdateInstallReceiver extends BroadcastReceiver {
     private static Intent pending;
     private static Consumer<Intent> listener;
-    static boolean installing;
+    static volatile boolean installing;
 
     static void listen(Consumer<Intent> callback) {
         listener = callback;

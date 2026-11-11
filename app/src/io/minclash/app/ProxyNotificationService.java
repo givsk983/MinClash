@@ -61,6 +61,7 @@ public final class ProxyNotificationService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Runnable poll = this::pollStatus;
+    private final RefreshGate refreshGate = new RefreshGate();
     private NotificationManager manager;
     private ForegroundApp foregroundApp;
     private Sample current;
@@ -178,10 +179,12 @@ public final class ProxyNotificationService extends Service {
 
     private void pollStatus() {
         if (!enabled(this) || !canShow(this)) { stopSelf(); return; }
+        if (!refreshGate.request()) return;
         worker.execute(() -> {
             Sample sample = sample();
             main.post(() -> {
                 if (worker.isShutdown()) return;
+                boolean followUp = refreshGate.finish();
                 if (!sample.overlayAllowed() || sample.connection().inactive()
                     || !getSystemService(PowerManager.class).isInteractive()) closePanel();
                 inactivePolls = sample.connection().inactive() ? inactivePolls + 1 : 0;
@@ -191,7 +194,8 @@ public final class ProxyNotificationService extends Service {
                     current = sample;
                     manager.notify(NOTIFICATION_ID, notification());
                 }
-                schedulePoll();
+                if (followUp) { main.removeCallbacks(poll); main.post(poll); }
+                else schedulePoll();
             });
         });
     }

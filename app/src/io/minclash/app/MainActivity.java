@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInstaller;
@@ -62,6 +63,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
@@ -105,8 +107,9 @@ public final class MainActivity extends Activity {
     private Switch autoUpdateSwitch;
     private TextView autoUpdateSummary;
     private AppUpdate.Release pendingUpdate;
-    private UpdateCheck pendingUpdateCheck;
-    private record UpdateCheck(AppUpdate.Release release) {}
+    private BackgroundWork background;
+    private AlertDialog backgroundDialog;
+    private boolean resumed;
     private TextView subscriptionSummary;
     private SubscriptionCatalog subscriptionCatalog;
     private SubscriptionCatalog.Snapshot subscriptions;
@@ -164,6 +167,8 @@ public final class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        Object retained = getLastNonConfigurationInstance();
+        background = retained instanceof BackgroundWork work ? work : new BackgroundWork();
         routingIcons = new AppIconLoader(this);
         subscriptionCatalog = new SubscriptionCatalog(appPreferences(), new RoutingStore(this));
         LinearLayout root = column();
@@ -388,8 +393,11 @@ public final class MainActivity extends Activity {
         checkAppUpdateButton = button("检查更新", false);
         checkAppUpdateButton.setOnClickListener(view -> {
             if (UpdateInstallReceiver.installing) return;
-            showMessage("正在检查 App 更新…");
-            execute("", () -> new UpdateCheck(AppUpdate.check(appVersion())));
+            String version = appVersion();
+            if (background.updateCheck.start(BackgroundWork.DOWNLOADS, () -> AppUpdate.check(version))) {
+                showMessage("正在检查 App 更新…");
+                render();
+            }
         });
         add(identity, checkAppUpdateButton, 14);
 
@@ -463,6 +471,8 @@ public final class MainActivity extends Activity {
         state.putSerializable("pendingUpdate", pendingUpdate);
         super.onSaveInstanceState(state);
     }
+
+    @Override public Object onRetainNonConfigurationInstance() { return background; }
 
     @Override protected void onStart() {
         super.onStart();
@@ -542,6 +552,11 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onStop() {
+        background.stopObserving();
+        if (backgroundDialog != null) {
+            backgroundDialog.dismiss();
+            backgroundDialog = null;
+        }
         if (networkObserver != null) { networkObserver.close(); networkObserver = null; }
         visible = false;
         main.removeCallbacks(poll);
@@ -552,6 +567,8 @@ public final class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        resumed = true;
+        background.observe(main::post, this::deliverBackgroundResults);
         UpdateInstallReceiver.listen(this::onUpdateInstallResult);
         if (appPreferences().getBoolean("connected", false)) main.post(poll);
         render();
@@ -561,10 +578,7 @@ public final class MainActivity extends Activity {
             selectPage(2);
             showOverlayPermissionHelp(intent.getBooleanExtra(ProxyNotificationService.EXTRA_MODE_PANEL, true));
         }
-        if (pendingUpdateCheck != null) {
-            showAppUpdate(pendingUpdateCheck.release());
-            pendingUpdateCheck = null;
-        }
+        deliverBackgroundResults();
     }
 
     @Override protected void onNewIntent(Intent intent) {
@@ -573,11 +587,14 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onPause() {
+        resumed = false;
+        background.stopObserving();
         UpdateInstallReceiver.listen(null);
         super.onPause();
     }
 
     @Override protected void onDestroy() {
+        background.stopObserving();
         main.removeCallbacks(poll);
         main.removeCallbacks(pollLatency);
         routingIcons.close();
@@ -749,6 +766,7 @@ public final class MainActivity extends Activity {
                     proxySummary = summary;
                     render();
                     schedulePoll();
+                    deliverBackgroundResults();
                 });
             } catch (Exception error) {
                 main.post(() -> {
@@ -811,16 +829,22 @@ public final class MainActivity extends Activity {
     private void showAppUpdate(AppUpdate.Release release) {
         showMessage("");
         if (release == null) {
+            background.updateCheck.clearResult();
             showMessage("当前已是最新版本 " + appVersion() + "。");
             return;
         }
-        new AlertDialog.Builder(this).setTitle("发现新版 MinClash " + release.version())
+        backgroundDialog = new AlertDialog.Builder(this).setTitle("发现新版 MinClash " + release.version())
             .setMessage(release.notes().isEmpty() ? "下载完成后，由 Android 确认安装。" : release.notes())
-            .setNegativeButton("稍后", null).setPositiveButton("下载并安装", (dialog, which) -> startAppUpdate(release)).show();
+            .setNegativeButton("稍后", (dialog, which) -> dismissBackgroundResult(background.updateCheck))
+            .setPositiveButton("下载并安装", (dialog, which) -> {
+                dismissBackgroundResult(background.updateCheck);
+                startAppUpdate(release);
+            }).setOnCancelListener(dialog -> dismissBackgroundResult(background.updateCheck)).show();
     }
 
     private void startAppUpdate(AppUpdate.Release release) {
-        if (busy || UpdateInstallReceiver.installing) return;
+        if (UpdateInstallReceiver.installing || background.updateDownload.running()
+            || background.updateDownload.outcome() != null) return;
         if (!getPackageManager().canRequestPackageInstalls()) {
             pendingUpdate = release;
             try {
@@ -835,14 +859,59 @@ public final class MainActivity extends Activity {
         }
         showMessage("正在下载新版 MinClash…");
         UpdateInstallReceiver.installing = true;
-        execute("", () -> {
-            try { AppUpdate.downloadAndInstall(getApplicationContext(), release); }
+        Context context = getApplicationContext();
+        background.updateDownload.start(BackgroundWork.DOWNLOADS, () -> {
+            try { AppUpdate.downloadAndInstall(context, release); }
             catch (Exception error) {
-                main.post(() -> UpdateInstallReceiver.installing = false);
+                UpdateInstallReceiver.installing = false;
                 throw error;
             }
             return null;
         });
+        render();
+    }
+
+    private void dismissBackgroundResult(RetainedTask<?> task) {
+        task.clearResult();
+        backgroundDialog = null;
+        main.post(this::deliverBackgroundResults);
+    }
+
+    private boolean showBackgroundError(RetainedTask<?> task) {
+        RetainedTask.Outcome<?> outcome = task.outcome();
+        if (outcome == null || outcome.error() == null) return false;
+        if (task == background.updateDownload) UpdateInstallReceiver.installing = false;
+        Exception error = outcome.error();
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("操作未完成")
+            .setMessage(error.getMessage() == null ? "操作失败，请重试。" : error.getMessage())
+            .setNegativeButton("关闭", (view, which) -> dismissBackgroundResult(task))
+            .setOnCancelListener(view -> dismissBackgroundResult(task));
+        if (error instanceof Subscription.NetworkFailure failure) {
+            dialog.setPositiveButton("诊断网络", (view, which) -> {
+                dismissBackgroundResult(task);
+                runDiagnostics(failure);
+            });
+        }
+        backgroundDialog = dialog.show();
+        return true;
+    }
+
+    private void deliverBackgroundResults() {
+        if (!resumed || isDestroyed()) return;
+        render();
+        if (busy || backgroundDialog != null) return;
+        if (showBackgroundError(background.updateDownload) || showBackgroundError(background.preview)
+            || showBackgroundError(background.updateCheck)) {
+            render();
+            return;
+        }
+        if (background.updateDownload.outcome() != null) background.updateDownload.clearResult();
+        if (background.preview.outcome() != null) {
+            if (status == null) return;
+            showSubscriptionPreview(background.preview.outcome().value());
+        }
+        else if (background.updateCheck.outcome() != null) showAppUpdate(background.updateCheck.outcome().value());
+        render();
     }
 
     private void onUpdateInstallResult(Intent result) {
@@ -1025,32 +1094,48 @@ public final class MainActivity extends Activity {
     }
 
     private void previewSubscription(SubscriptionCatalog.Entry entry, boolean adding) {
-        showMessage("正在下载订阅并比较配置…");
-        execute("", () -> {
+        Context context = getApplicationContext();
+        if (background.preview.start(BackgroundWork.DOWNLOADS, () -> {
             byte[] source = Subscription.fetch(entry.address());
-            Module.Status current = Module.status();
-            List<Controller.Group> selections = null;
-            if (hasProxyControl(current)) {
-                try { selections = Controller.groups().values(); }
-                catch (Exception unavailable) { selections = null; }
+            // Snapshot and configuration writes share the same queue; downloading does not.
+            try {
+                return worker.submit(() -> {
+                    Module.Status current = Module.status();
+                    List<Controller.Group> selections = null;
+                    if (hasProxyControl(current)) {
+                        try { selections = Controller.groups().values(); }
+                        catch (Exception unavailable) { selections = null; }
+                    }
+                    return SubscriptionPreview.compare(entry, source, RoutingStore.generation(), adding,
+                        new RoutingStore(context).loadIfAvailable(current), selections);
+                }).get();
+            } catch (ExecutionException error) {
+                if (error.getCause() instanceof Exception cause) throw cause;
+                throw error;
             }
-            return SubscriptionPreview.compare(entry, source, RoutingStore.generation(), adding,
-                new RoutingStore(this).loadIfAvailable(current), selections);
-        });
+        })) {
+            showMessage("正在下载订阅并比较配置…");
+            render();
+        }
     }
 
     private void showSubscriptionPreview(SubscriptionPreview preview) {
         showMessage("");
         AlertDialog.Builder dialog = textDialog("订阅变更预览 · " + preview.entry().name(), preview.summary())
-            .setNegativeButton("关闭", null);
-        if (!preview.conflicts()) dialog.setPositiveButton("应用配置", (view, which) -> {
+            .setNegativeButton("关闭", (view, which) -> dismissBackgroundResult(background.preview))
+            .setOnCancelListener(view -> dismissBackgroundResult(background.preview));
+        if (!preview.conflicts()) dialog.setPositiveButton("应用配置", null);
+        AlertDialog shown = dialog.show();
+        backgroundDialog = shown;
+        if (!preview.conflicts()) shown.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
             if (!canApplySubscription()) {
-                showMessage("当前 TUN 状态不允许应用订阅，请稍后重试。");
+                shown.setMessage(preview.summary() + "\n\n当前 TUN 状态不允许应用订阅，请等待状态刷新后重试。");
                 return;
             }
+            dismissBackgroundResult(background.preview);
+            shown.dismiss();
             execute("订阅配置已应用。", true, () -> applySubscription(preview));
         });
-        dialog.show();
     }
 
     private Module.Status applySubscription(SubscriptionPreview preview) throws Exception {
@@ -1982,10 +2067,6 @@ public final class MainActivity extends Activity {
                     busy = false;
                     if (!success.isEmpty()) showMessage(success);
                     if (result instanceof DiagnosticReport) showMessage("");
-                    if (result instanceof UpdateCheck update) {
-                        if (visible) showAppUpdate(update.release());
-                        else pendingUpdateCheck = update;
-                    }
                     if (result instanceof Module.Status updated) {
                         checkNetworkAfterStatus(updated, summary, checkConnection);
                         status = updated;
@@ -1996,7 +2077,6 @@ public final class MainActivity extends Activity {
                         if (result instanceof DiagnosticReport report) showDiagnosticReport(report.text());
                         if (result instanceof Controller.Mode mode) showModes(mode);
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
-                        if (result instanceof SubscriptionPreview preview) showSubscriptionPreview(preview);
                         if (result instanceof AppRouting.Screen screen) {
                             checkNetworkAfterStatus(screen.status(), summary, checkConnection);
                             status = screen.status();
@@ -2006,6 +2086,7 @@ public final class MainActivity extends Activity {
                     }
                     render();
                     schedulePoll();
+                    deliverBackgroundResults();
                 });
             } catch (Exception error) {
                 main.post(() -> {
@@ -2021,6 +2102,7 @@ public final class MainActivity extends Activity {
                             .setNegativeButton("关闭", null).setPositiveButton("内核日志", (dialog, which) ->
                                 execute("", () -> Module.run(Module.Command.LOGS, null))).show();
                     }
+                    deliverBackgroundResults();
                 });
             }
         });
@@ -2088,7 +2170,8 @@ public final class MainActivity extends Activity {
         subscriptionButton.setEnabled(!busy && subscriptions != null);
         boolean subscribed = active != null && installed && status.profile;
         updateButton.setVisibility(subscribed ? View.VISIBLE : View.GONE);
-        updateButton.setEnabled(canApplySubscription() && subscribed);
+        updateButton.setEnabled(canApplySubscription() && subscribed && !background.preview.running()
+            && background.preview.outcome() == null);
         boolean hasControl = hasProxyControl(status);
         boolean canControl = !busy && hasControl;
         modeButton.setEnabled(canControl);
@@ -2104,7 +2187,10 @@ public final class MainActivity extends Activity {
         networkCheckArea.setEnabled(!busy && networkChecksPending == 0);
         logsButton.setEnabled(!busy && installed);
         diagnosticsButton.setEnabled(!busy);
-        checkAppUpdateButton.setEnabled(!busy && !UpdateInstallReceiver.installing);
+        checkAppUpdateButton.setEnabled(!background.updateCheck.running() && background.updateCheck.outcome() == null
+            && !background.updateDownload.running() && !UpdateInstallReceiver.installing);
+        checkAppUpdateButton.setText(background.updateDownload.running() ? "正在下载更新…"
+            : background.updateCheck.running() ? "正在检查更新…" : "检查更新");
         repairDnsButton.setEnabled(!busy && enabled && status.profile
             && (status.state.equals("stopped") || status.state.equals("running")));
         autoUpdateSummary.setText(SubscriptionUpdateJob.summary(this, appPreferences()));

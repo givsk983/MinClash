@@ -54,6 +54,17 @@ def jdk_tool(name):
     raise RuntimeError("Set JAVA_HOME to a JDK 17 or newer.")
 
 
+def reset_compilation_directory(name):
+    directory = (BUILD / name).resolve()
+    if (name not in ("classes", "generated") or directory.parent != BUILD.resolve()
+            or not directory.is_relative_to(ROOT.resolve())):
+        raise RuntimeError("Compilation output must stay directly inside the build directory.")
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir()
+    return directory
+
+
 def build_apk(yaml_jar, apache_license, module_archive, keystore, release):
     properties = dict(line.split("=", 1) for line in
                       (ROOT / "module/module.prop").read_text(encoding="utf-8").splitlines() if "=" in line)
@@ -74,12 +85,11 @@ def build_apk(yaml_jar, apache_license, module_archive, keystore, release):
         return tools / (name + (".exe" if os.name == "nt" else ""))
 
     java = jdk_tool("java")
-    classes = BUILD / "classes"
-    classes.mkdir(exist_ok=True)
+    classes = reset_compilation_directory("classes")
+    generated = reset_compilation_directory("generated")
     resources = BUILD / "res.zip"
     execute(sdk_tool("aapt2"), "compile", "--dir", ROOT / "app/res", "-o", resources)
     base = BUILD / "unsigned.apk"
-    generated = BUILD / "generated"
     execute(sdk_tool("aapt2"), "link", "-I", android_jar, "--manifest",
             ROOT / "app/AndroidManifest.xml", "--java", generated, "-o", base, resources)
     sources = sorted((ROOT / "app/src").rglob("*.java")) + sorted(generated.rglob("R.java"))

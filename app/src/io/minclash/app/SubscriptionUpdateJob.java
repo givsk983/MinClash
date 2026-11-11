@@ -51,7 +51,7 @@ public final class SubscriptionUpdateJob extends JobService {
     }
 
     @Override public boolean onStopJob(JobParameters params) {
-        active = null;
+        if (active == params) active = null;
         return preferences().getBoolean(ENABLED, false);
     }
 
@@ -62,30 +62,66 @@ public final class SubscriptionUpdateJob extends JobService {
     private void refresh(JobParameters params) {
         SharedPreferences preferences = preferences();
         try {
-            if (active != params || !preferences.getBoolean(ENABLED, false)) return;
+            if (active != params || !preferences.getBoolean(ENABLED, false)) { finish(params, null); return; }
             RoutingStore routing = new RoutingStore(this);
             SubscriptionCatalog.Entry current = new SubscriptionCatalog(preferences, routing).load().active();
-            if (current == null) return;
+            if (current == null) { finish(params, null); return; }
             Module.Status status = Module.status();
             if (!status.enabled || !status.profile || !status.state.equals("running") && !status.state.equals("stopped")) {
-                record(preferences, "跳过，模块或配置未就绪");
+                finish(params, "跳过，模块或配置未就绪");
                 return;
             }
-            byte[] source = Subscription.fetch(current.address());
-            if (active != params || !preferences.getBoolean(ENABLED, false)) return;
-            routing.importProfile(source, current.address());
-            record(preferences, "更新成功");
-        } catch (RoutingStore.SelectionRestoreFailure warning) {
-            if (active == params) record(preferences, "已更新，请检查节点选择");
+            int generation = RoutingStore.generation();
+            BackgroundWork.DOWNLOADS.execute(() -> download(params, current, generation));
         } catch (Exception error) {
-            if (active == params) record(preferences, "更新失败，请在配置页手动重试");
-        } finally {
-            main.post(() -> {
-                if (active != params) return;
-                active = null;
-                jobFinished(params, false);
-            });
+            finish(params, "更新失败，请在配置页手动重试");
         }
+    }
+
+    private void download(JobParameters params, SubscriptionCatalog.Entry current, int generation) {
+        if (active != params || !preferences().getBoolean(ENABLED, false)) { finish(params, null); return; }
+        try {
+            byte[] source = Subscription.fetch(current.address());
+            RoutingStore.WORKER.execute(() -> apply(params, current, generation, source));
+        } catch (Exception error) {
+            finish(params, "更新失败，请在配置页手动重试");
+        }
+    }
+
+    private void apply(JobParameters params, SubscriptionCatalog.Entry current, int generation, byte[] source) {
+        SharedPreferences preferences = preferences();
+        String outcome = null;
+        try {
+            if (active != params || !preferences.getBoolean(ENABLED, false)) return;
+            RoutingStore routing = new RoutingStore(this);
+            SubscriptionCatalog.Entry latest = new SubscriptionCatalog(preferences, routing).load().active();
+            if (generation != RoutingStore.generation() || latest == null || !latest.address().equals(current.address())) {
+                outcome = "跳过，下载期间配置或当前订阅已变化";
+                return;
+            }
+            Module.Status status = Module.status();
+            if (!status.enabled || !status.profile || !status.state.equals("running") && !status.state.equals("stopped")) {
+                outcome = "跳过，模块或配置未就绪";
+                return;
+            }
+            routing.importProfile(source, current.address());
+            outcome = "更新成功";
+        } catch (RoutingStore.SelectionRestoreFailure warning) {
+            outcome = "已更新，请检查节点选择";
+        } catch (Exception error) {
+            outcome = "更新失败，请在配置页手动重试";
+        } finally {
+            finish(params, outcome);
+        }
+    }
+
+    private void finish(JobParameters params, String outcome) {
+        main.post(() -> {
+            if (active != params) return;
+            if (outcome != null) record(preferences(), outcome);
+            active = null;
+            jobFinished(params, false);
+        });
     }
 
     private static void record(SharedPreferences preferences, String outcome) {
