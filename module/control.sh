@@ -16,10 +16,13 @@ PROFILE=$DATA/config.yaml
 LOG=$DATA/core.log
 IFACE=minclash0
 TABLE=20882
+TETHER_DNS_RULE=8795
 FORWARD_RULE=8799
 FIRST_RULE=8800
 LAST_RULE=8810
 LIMIT=2097152
+. "$MODDIR/hotspot.sh" || exit 1
+. "$MODDIR/runtime.sh" || exit 1
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
@@ -78,6 +81,32 @@ forwarding_rule() {
     "$IP" "$1" rule "$2" pref "$FORWARD_RULE" not iif lo goto "$LAST_RULE"
 }
 
+tether_dns_rule() {
+    # Android's dns_tether daemon must return real answers for native tethering.
+    # Sharing mode captures client DNS in PREROUTING before it reaches this daemon.
+    "$IP" "$1" rule "$2" pref "$TETHER_DNS_RULE" iif lo uidrange 1052-1052 goto "$LAST_RULE"
+}
+
+prepare_tether_dns() {
+    printf '%s\n' "$BOOT_ID" > "$DATA/tether-dns-owned" &&
+        tether_dns_rule -4 add && tether_dns_rule -6 add
+}
+
+clean_tether_dns() {
+    local family rules
+    [ -f "$DATA/tether-dns-owned" ] || return 0
+    if [ "$(cat "$DATA/tether-dns-owned")" = "$BOOT_ID" ]; then
+        for family in -4 -6; do
+            tether_dns_rule "$family" del 2>/dev/null || :
+            rules=$("$IP" "$family" rule show) || return 1
+            if printf '%s\n' "$rules" | grep -Eq "^$TETHER_DNS_RULE:[[:space:]]+from all iif lo uidrange 1052-1052 goto $LAST_RULE([[:space:]]|$)"; then
+                return 1
+            fi
+        done
+    fi
+    rm -f "$DATA/tether-dns-owned"
+}
+
 prepare_forwarding() {
     # Android should route tethering in both directions. Keep interception for local sockets.
     printf '%s\n' "$BOOT_ID" > "$DATA/forwarding-owned" &&
@@ -101,6 +130,8 @@ clean_forwarding() {
 
 clean_routes() {
     local family priority rules
+    clean_hotspot || return 1
+    clean_tether_dns || return 1
     clean_forwarding || return 1
     [ -f "$DATA/routes-owned" ] || return 0
     if [ "$(cat "$DATA/routes-owned")" = "$BOOT_ID" ]; then
@@ -124,6 +155,10 @@ check_routes() {
     fi
     for family in -4 -6; do
         rules=$("$IP" "$family" rule show) || return 1
+        if printf '%s\n' "$rules" | grep -q "^$TETHER_DNS_RULE:"; then
+            log "Tether DNS priority $TETHER_DNS_RULE is already in use."
+            return 1
+        fi
         if printf '%s\n' "$rules" | grep -q "^$FORWARD_RULE:"; then
             log "Forwarding rule priority $FORWARD_RULE is already in use."
             return 1
@@ -189,6 +224,11 @@ tun_ready() {
         "$IP" -4 rule show | grep -Eq " lookup $TABLE( |$)"
 }
 
+tun6_ready() {
+    "$IP" -6 route show table "$TABLE" 2>/dev/null | grep -Eq " dev $IFACE( |$)" &&
+        "$IP" -6 rule show | grep -Eq " lookup $TABLE( |$)"
+}
+
 uplink_routes() {
     local family
     for family in -4 -6; do
@@ -224,21 +264,6 @@ wait_boot_uplink() {
     return 1
 }
 
-boot_uplink_changed() {
-    local next
-    [ "$boot_checks" -gt 0 ] || return 1
-    boot_checks=$((boot_checks - 1))
-    next=$(uplink_routes)
-    if [ -z "$next" ]; then
-        boot_lost=1
-    elif [ "$next" = "$boot_previous" ] && { [ "$next" != "$boot_uplink" ] || [ "$boot_lost" = 1 ]; }; then
-        boot_checks=0
-        return 0
-    fi
-    boot_previous="$next"
-    return 1
-}
-
 trim_log() {
     local bytes
     bytes=$(stat -c %s "$LOG" 2>/dev/null) || return 0
@@ -248,7 +273,7 @@ trim_log() {
 }
 
 run_supervisor() {
-    local boot_uplink= boot_previous= boot_lost=0 boot_checks=0
+    local boot_uplink= uplink_baseline= uplink_candidate= uplink_samples=0 uplink_missing=0 uplink_restart_after=0
     exec 8>"$DATA/daemon.lock"
     lock_fd 8 || exit 0
     trap 'stop_core && clean_routes; write_state stopped; rm -f "$DATA/daemon.pid"' EXIT
@@ -260,8 +285,6 @@ run_supervisor() {
     if [ "${1:-manual}" = boot ]; then
         write_state starting
         wait_boot_uplink || return 0
-        boot_previous="$boot_uplink"
-        boot_checks=15
     fi
     export SKIP_SYSTEM_IPV6_CHECK=1
     delay=3
@@ -269,25 +292,32 @@ run_supervisor() {
         write_state starting
         if check_routes; then
             printf '%s\n' "$BOOT_ID" > "$DATA/routes-owned" || fail 'Cannot record routing ownership.'
-            prepare_forwarding || fail 'Could not preserve Android forwarding routes.'
+            prepare_tether_dns && prepare_forwarding || fail 'Could not preserve Android tethering routes and DNS.'
+            uplink_watch_reset
             "$CORE" -d "$DATA" -f "$PROFILE" -ext-ctl-unix "$SOCKET" </dev/null >> "$LOG" 2>&1 8>&- &
             child=$!
             if save_pid core "$child"; then
                 age=0
                 mode_restored=0
                 while enabled && read_pid core >/dev/null; do
-                    if boot_uplink_changed; then
-                        log 'System uplink changed after boot. Restarting TUN once.'
+                    if uplink_changed; then
+                        log 'System uplink changed. Rebuilding TUN after stable network recovery.'
                         break
                     fi
                     if tun_ready; then
+                        if ! sync_hotspot; then
+                            [ "$(cat "$DATA/hotspot-state" 2>/dev/null)" = error ] ||
+                                log 'Hotspot proxy setup failed. Check tethering and firewall support.'
+                            hotspot_state error
+                        fi
                         if [ "$mode_restored" = 0 ] && [ -S "$SOCKET" ]; then
                             if [ -s "$DATA/mode" ] && ! apply_mode "$(cat "$DATA/mode")"; then
                                 log 'Could not restore the selected mode.'
                             fi
                             mode_restored=1
                         fi
-                        write_state running
+                        if [ "$uplink_missing" = 1 ]; then write_state waiting_network; else write_state running; fi
+                        sync_notification
                         delay=3
                         age=0
                     else
@@ -394,7 +424,8 @@ check_profile() {
 
 case "${1:-}" in
     run) run_supervisor "${2:-manual}"; exit ;;
-    status)
+    status|status-notification)
+        [ "$1" != status-notification ] || notification_heartbeat
         if read_pid daemon >/dev/null; then
             state=$(cat "$DATA/state" 2>/dev/null) || state=starting
         elif read_pid core >/dev/null || [ "$(cat "$DATA/routes-owned" 2>/dev/null)" = "$BOOT_ID" ] ||
@@ -404,10 +435,25 @@ case "${1:-}" in
             state=stopped
         fi
         printf 'state=%s\n' "$state"
+        echo health=1
+        if read_pid core >/dev/null; then echo core_running=1; fi
+        if tun_ready; then echo tun4=1; fi
+        if tun6_ready; then echo tun6=1; fi
+        if [ -S "$SOCKET" ] && read_pid core >/dev/null; then echo controller_ready=1; fi
         if [ -s "$PROFILE" ]; then echo profile=1; else echo profile=0; fi
         if [ -e "$DATA/boot-off" ]; then echo boot=0; else echo boot=1; fi
         if enabled; then echo enabled=1; else echo enabled=0; fi
         if [ -x "$SOCKET_REQUEST" ]; then echo control=1; fi
+        echo hotspot=1
+        if [ -f "$DATA/hotspot-on" ]; then echo hotspot_enabled=1; else echo hotspot_enabled=0; fi
+        printf 'hotspot_state=%s\n' "$(cat "$DATA/hotspot-state" 2>/dev/null)"
+        printf 'hotspot_reason=%s\n' "$(cat "$DATA/hotspot-reason" 2>/dev/null)"
+        if [ -s "$DATA/hotspot-traffic" ]; then
+            read -r sent received < "$DATA/hotspot-traffic"
+            printf 'hotspot_sent=%s\nhotspot_received=%s\n' "$sent" "$received"
+        fi
+        echo notification_recovery=1
+        if [ -f "$DATA/notification-on" ]; then echo notification_enabled=1; fi
         echo validate=1
         exit ;;
     logs)
@@ -428,5 +474,8 @@ case "${1:-}" in
     mode-rule|mode-global|mode-direct) set_mode "${1#mode-}" ;;
     boot-on) rm -f "$DATA/boot-off" ;;
     boot-off) : > "$DATA/boot-off" ;;
-    *) fail 'Usage: control.sh status|start|stop|logs|boot-on|boot-off|import|validate|api|mode-rule|mode-global|mode-direct' ;;
+    hotspot-on|hotspot-off) set_hotspot "${1#hotspot-}" ;;
+    notification-on) : > "$DATA/notification-on"; rm -f "$DATA/notification-attempt" ;;
+    notification-off) rm -f "$DATA/notification-on" "$DATA/notification-heartbeat" "$DATA/notification-attempt" ;;
+    *) fail 'Usage: control.sh status|start|stop|logs|boot-on|boot-off|hotspot-on|hotspot-off|import|validate|api|mode-rule|mode-global|mode-direct' ;;
 esac

@@ -1,7 +1,7 @@
 id=minclash
 name=MinClash Root TUN
-version=0.0.5
-versionCode=14
-revision=4
+version=0.0.8
+versionCode=17
+revision=7
 author=MinClash
-description=Mihomo v1.19.33 ARM64 with a root TUN supervisor and Android hotspot forwarding compatibility.
+description=Mihomo v1.19.33 ARM64 with a root TUN supervisor and optional hotspot proxy sharing.

@@ -58,7 +58,7 @@ record DiagnosticReport(String text) {
         } else {
             report.append("模块  ").append(safeVersion(status.version)).append(" / 修订 ").append(status.functionalRevision()).append('\n')
                 .append("启用  ").append(status.enabled ? "是" : "否").append(" · 配置  ").append(status.profile ? "已导入" : "无").append('\n')
-                .append("状态  ").append(stateCode(status.state)).append('\n');
+                .append("状态  ").append(status.phase().name()).append('\n');
         }
         report.append("TUN 接口  ").append(factResult(facts, Fact.IFACE)).append('\n')
             .append("IPv4 路由与规则  ").append(factResult(facts, Fact.ROUTE4)).append('\n')
@@ -107,17 +107,6 @@ record DiagnosticReport(String text) {
 
     private static String safeVersion(String version) {
         return version.matches("v?[0-9]{1,6}(\\.[0-9]{1,6}){1,3}") ? version : "未知";
-    }
-
-    private static String stateCode(String state) {
-        return switch (state) {
-            case "running" -> "RUNNING";
-            case "starting" -> "STARTING";
-            case "retrying" -> "RETRYING";
-            case "orphaned" -> "ORPHANED";
-            case "stopped" -> "STOPPED";
-            default -> "UNKNOWN";
-        };
     }
 
     private static String factResult(Set<Fact> facts, Fact fact) {

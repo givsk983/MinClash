@@ -91,6 +91,7 @@ public final class MainActivity extends Activity {
     private boolean busy;
     private boolean polling;
     private boolean visible;
+    private NetworkObserver networkObserver;
     private boolean updatingSwitch;
     private TextView stateText;
     private TextView detailText;
@@ -129,6 +130,8 @@ public final class MainActivity extends Activity {
     private Button logsButton;
     private Button diagnosticsButton;
     private Switch bootSwitch;
+    private Switch hotspotSwitch;
+    private TextView hotspotSummary;
     private Button notificationButton;
     private Button overlayPermissionButton;
     private Button foregroundAppButton;
@@ -303,10 +306,27 @@ public final class MainActivity extends Activity {
             });
         });
         add(service, bootSwitch, 0);
+        hotspotSwitch = new Switch(this);
+        hotspotSwitch.setText("个人热点共享代理");
+        hotspotSwitch.setTextColor(TEXT);
+        hotspotSwitch.setTextSize(16);
+        hotspotSwitch.setMinHeight(dp(48));
+        hotspotSwitch.setThumbTintList(bootSwitch.getThumbTintList());
+        hotspotSwitch.setTrackTintList(bootSwitch.getTrackTintList());
+        hotspotSwitch.setOnCheckedChangeListener((button, checked) -> {
+            if (updatingSwitch) return;
+            execute(checked ? "已开启热点共享代理，请重新开启系统热点；若下方提示需重启手机，请重启后使用。" : "已关闭热点共享代理。", () -> {
+                Module.run(checked ? Module.Command.HOTSPOT_ON : Module.Command.HOTSPOT_OFF, null);
+                return Module.status();
+            });
+        });
+        add(service, hotspotSwitch, 10);
+        hotspotSummary = label("", 12, MUTED, false);
+        add(service, hotspotSummary, 6);
         notificationButton = button("开启通知栏控制", false);
         notificationButton.setOnClickListener(view -> toggleNotificationControl());
         add(service, notificationButton, 14);
-        add(service, label("通知显示连接和网速。点模式或节点名，打开对应的切换浮窗。", 12, MUTED, false), 6);
+        add(service, label("通知在退出界面后继续显示连接和网速，开机后自动恢复。点模式或节点名可切换。", 12, MUTED, false), 6);
         overlayPermissionButton = button("允许悬浮窗", false);
         overlayPermissionButton.setOnClickListener(view -> showOverlayPermissionHelp(true));
         add(service, overlayPermissionButton, 8);
@@ -449,6 +469,14 @@ public final class MainActivity extends Activity {
         // Permissions and installed packages may have changed while outside the app.
         invalidateAppRouting();
         visible = true;
+        networkObserver = new NetworkObserver(this, () -> {
+            if (!visible || !appPreferences().getBoolean("connected", false)) return;
+            ProxyNotificationService.connectionChanged();
+            resetNetworkChecks();
+            scheduleLatency(1000);
+            main.removeCallbacks(poll);
+            main.post(poll);
+        });
         confirmNextLatency = true;
         if (appPreferences().getBoolean("connected", false)) main.post(poll);
         scheduleLatency(0);
@@ -514,6 +542,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onStop() {
+        if (networkObserver != null) { networkObserver.close(); networkObserver = null; }
         visible = false;
         main.removeCallbacks(poll);
         main.removeCallbacks(pollLatency);
@@ -735,11 +764,12 @@ public final class MainActivity extends Activity {
 
     private void schedulePoll() {
         main.removeCallbacks(poll);
-        if (visible && !busy && isActive()) main.postDelayed(poll, 4000);
+        // Root's boot service, a tile, or a repair can start TUN while this screen says stopped.
+        if (visible && !busy && status != null && status.installed()) main.postDelayed(poll, 4000);
     }
 
     private static boolean hasProxyControl(Module.Status status) {
-        return status != null && status.installed() && status.enabled && status.control && status.state.equals("running");
+        return status != null && status.running() && status.control;
     }
 
     private static ProxySummary readProxySummary(Module.Status status) {
@@ -2004,7 +2034,7 @@ public final class MainActivity extends Activity {
         scheduleLatency(0);
     }
 
-    private boolean isActive() { return status != null && status.installed() && !status.state.equals("stopped"); }
+    private boolean isActive() { return status != null && status.active(); }
 
     private boolean canApplySubscription() {
         return !busy && canApplySubscription(status);
@@ -2021,22 +2051,20 @@ public final class MainActivity extends Activity {
         boolean enabled = installed && status.enabled;
         boolean moduleUpdate = installed && bundledModule.valid() && status.updateAvailable(bundledModule.revision());
         if (installed) {
-            stateText.setText(switch (status.state) {
-                case "running" -> "TUN 运行中";
-                case "starting" -> "正在建立 TUN";
-                case "retrying" -> "等待重试";
-                case "orphaned" -> "需要停止并清理";
-                default -> enabled ? "已停止" : "模块已禁用";
-            });
-            stateText.setTextColor(status.state.equals("running") ? MINT : TEXT);
-            detailText.setText(status.profile ? "配置已就绪 · 本机流量接管" : "导入订阅或本地配置，开始连接。" );
+            stateText.setText(status.phase().label);
+            stateText.setTextColor(status.running() ? MINT : TEXT);
+            detailText.setText(status.profile ? status.hotspotEnabled
+                ? status.running() && status.hotspotState.startsWith("active") ? "配置已就绪 · 本机与热点共享代理"
+                    : "配置已就绪 · 热点共享待就绪"
+                : "配置已就绪 · 本机流量接管"
+                : "导入订阅或本地配置，开始连接。" );
         } else {
             stateText.setText(pending ? "等待重启" : status == null ? "准备连接" : "完成初始化");
             stateText.setTextColor(TEXT);
             detailText.setText(pending ? "重启手机后，内置模块将生效。"
                 : status == null ? "先检测环境，再导入你的配置。" : "前往设置，安装 App 内置的模块。" );
         }
-        boolean running = installed && status.state.equals("running");
+        boolean running = installed && status.running();
         statusBadge.setText(running ? "● TUN 就绪" : busy ? "处理中" : pending ? "待重启" : "未连接");
         statusBadge.setTextColor(running ? MINT : MUTED);
         statusBadge.setBackground(shape(running ? 0xff203a35 : 0xff25313c, 10, false));
@@ -2092,6 +2120,9 @@ public final class MainActivity extends Activity {
         updatingSwitch = true;
         bootSwitch.setChecked(installed && status.boot);
         bootSwitch.setEnabled(!busy && enabled);
+        hotspotSwitch.setChecked(installed && status.hotspotEnabled);
+        hotspotSwitch.setEnabled(!busy && enabled && status.hotspot);
+        hotspotSummary.setText(installed ? status.hotspotSummary() : "安装新版内置模块并重启后可用。");
         updatingSwitch = false;
         boolean notification = notificationEnabled();
         notificationButton.setText(notification ? "关闭通知栏控制" : "开启通知栏控制");
@@ -2100,6 +2131,7 @@ public final class MainActivity extends Activity {
         foregroundAppButton.setVisibility(notification ? View.VISIBLE : View.GONE);
         foregroundAppButton.setText(notification && ForegroundApp.allowed(this) ? "当前应用显示权限" : "授权显示当前应用");
         if (visible && !busy && status != null) ProxyNotificationService.sync(this, notification && enabled && isActive());
+        NotificationRecovery.sync(this, status);
         messageText.setVisibility(messageText.length() == 0 ? View.GONE : View.VISIBLE);
         warmAppRouting();
     }

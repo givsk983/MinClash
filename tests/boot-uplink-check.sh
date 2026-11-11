@@ -52,14 +52,14 @@ boot_uplink=
 if wait_boot_uplink; then echo 'Missing route accepted'; exit 1; fi
 [ "$polls" -eq 5 ] && [ -z "$boot_uplink" ] || exit 1
 
-# A handoff needs two stable samples and permits only one automatic restart.
+# Runtime handoffs use the same stable route signatures, continuously after boot.
+. "${CONTROL%/*}/runtime.sh"
+runtime_now() { printf '100\n'; }
 uplink_routes() { printf '%s\n' "$route"; }
-boot_uplink=mobile
-boot_previous=mobile
-boot_checks=5
-boot_lost=0
+route=mobile
+uplink_watch_reset
 route=wifi
-if boot_uplink_changed; then echo 'Transient uplink triggered a restart'; exit 1; fi
-boot_uplink_changed
-if boot_uplink_changed; then echo 'Restart guard allowed a second restart'; exit 1; fi
-echo 'PASS: boot waits for a stable physical route, can stop offline, and recovers one handoff.'
+if uplink_changed; then echo 'Transient uplink triggered a restart'; exit 1; fi
+uplink_changed
+if uplink_changed; then echo 'Unchanged network triggered a restart'; exit 1; fi
+echo 'PASS: stable boot uplink, offline stop, and runtime handoff recovery.'

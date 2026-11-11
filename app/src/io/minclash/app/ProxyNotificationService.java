@@ -68,6 +68,8 @@ public final class ProxyNotificationService extends Service {
     private boolean overlayFailed;
     private long notificationSince;
     private int inactivePolls;
+    private long restoreUntil;
+    private NetworkObserver networkObserver;
     // Owned by the worker.
     private Connection sampledConnection;
     private long connectionTime;
@@ -105,12 +107,26 @@ public final class ProxyNotificationService extends Service {
         if (enabled && !started && canShow(context)) {
             try {
                 context.startForegroundService(intent);
-                started = true;
             } catch (IllegalStateException | SecurityException error) {
                 Log.w("MinClash", "Cannot start proxy status notification", error);
             }
-        } else if (!enabled && started) {
+        } else if (!enabled) {
             context.stopService(intent);
+        }
+    }
+
+    static boolean enabled(Context context) {
+        return context.getSharedPreferences("MainActivity", MODE_PRIVATE)
+            .getBoolean(MainActivity.NOTIFICATION_CONTROL, false);
+    }
+
+    static void restore(Context context) {
+        if (!enabled(context) || !canShow(context)) return;
+        try {
+            context.startForegroundService(new Intent(context, ProxyNotificationService.class)
+                .putExtra("restore", true));
+        } catch (IllegalStateException | SecurityException error) {
+            Log.w("MinClash", "Cannot restore proxy status notification", error);
         }
     }
 
@@ -119,17 +135,20 @@ public final class ProxyNotificationService extends Service {
         manager = getSystemService(NotificationManager.class);
         manager.createNotificationChannel(new NotificationChannel(CHANNEL, "代理状态与快捷控制", NotificationManager.IMPORTANCE_LOW));
         foregroundApp = new ForegroundApp(this);
+        networkObserver = new NetworkObserver(this, () -> {
+            refreshConnection = true;
+            if (current != null) { main.removeCallbacks(poll); main.post(poll); }
+        });
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && ACTION_OPEN_PANEL.equals(intent.getAction())) {
-            if (current == null) {
-                Toast.makeText(this, "请打开 MinClash，检查 TUN 和通知栏控制状态", Toast.LENGTH_SHORT).show();
-                stopSelf(startId);
-            } else {
-                showPanel(intent.getBooleanExtra(EXTRA_MODE_PANEL, false));
-            }
+        // Also runs for a null intent when Android recreates this sticky foreground service.
+        if (!enabled(this) || !canShow(this)) {
+            stopSelf(startId);
             return START_NOT_STICKY;
+        }
+        if (intent != null && intent.getBooleanExtra("restore", false)) {
+            restoreUntil = SystemClock.elapsedRealtime() + 180000;
         }
         if (current == null) {
             notificationSince = System.currentTimeMillis();
@@ -139,12 +158,16 @@ public final class ProxyNotificationService extends Service {
             started = true;
             main.post(poll);
         }
-        return START_NOT_STICKY;
+        if (intent != null && ACTION_OPEN_PANEL.equals(intent.getAction())) {
+            showPanel(intent.getBooleanExtra(EXTRA_MODE_PANEL, false));
+        }
+        return START_STICKY;
     }
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
     @Override public void onDestroy() {
+        if (networkObserver != null) networkObserver.close();
         main.removeCallbacksAndMessages(null);
         closePanel();
         worker.shutdownNow();
@@ -154,7 +177,7 @@ public final class ProxyNotificationService extends Service {
     }
 
     private void pollStatus() {
-        if (!canShow(this)) { stopSelf(); return; }
+        if (!enabled(this) || !canShow(this)) { stopSelf(); return; }
         worker.execute(() -> {
             Sample sample = sample();
             main.post(() -> {
@@ -162,7 +185,7 @@ public final class ProxyNotificationService extends Service {
                 if (!sample.overlayAllowed() || sample.connection().inactive()
                     || !getSystemService(PowerManager.class).isInteractive()) closePanel();
                 inactivePolls = sample.connection().inactive() ? inactivePolls + 1 : 0;
-                if (inactivePolls >= 2) { stopSelf(); return; }
+                if (inactivePolls >= 2 && SystemClock.elapsedRealtime() >= restoreUntil) { stopSelf(); return; }
                 if (sample.overlayAllowed() != current.overlayAllowed()) overlayFailed = false;
                 if (!sample.equals(current)) {
                     current = sample;
@@ -218,17 +241,12 @@ public final class ProxyNotificationService extends Service {
 
     private static Connection readConnection() {
         try {
-            Module.Status status = Module.status();
-            if (!status.installed() || !status.enabled || status.state.equals("stopped")) {
+            Module.Status status = Module.notificationStatus();
+            if (!status.active()) {
                 return new Connection("TUN 已停止", "暂无节点", false, true);
             }
-            if (!status.state.equals("running")) {
-                String detail = switch (status.state) {
-                    case "starting" -> "正在建立 TUN";
-                    case "retrying" -> "TUN 等待重连";
-                    default -> "TUN 未就绪";
-                };
-                return new Connection(detail, "等待连接", false, false);
+            if (!status.running()) {
+                return new Connection(status.phase().label, "等待连接", false, false);
             }
             if (status.control) {
                 try {

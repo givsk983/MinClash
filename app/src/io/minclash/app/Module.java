@@ -12,11 +12,26 @@ final class Module {
     enum Command {
         STATUS("status"), START("start"), STOP("stop"), IMPORT("import"), VALIDATE("validate"),
         BOOT_ON("boot-on"), BOOT_OFF("boot-off"), LOGS("logs"), API("api"),
+        HOTSPOT_ON("hotspot-on"), HOTSPOT_OFF("hotspot-off"),
+        STATUS_NOTIFICATION("status-notification"), NOTIFICATION_ON("notification-on"), NOTIFICATION_OFF("notification-off"),
         MODE_RULE("mode-rule"), MODE_GLOBAL("mode-global"), MODE_DIRECT("mode-direct");
 
         final String argument;
         Command(String argument) { this.argument = argument; }
     }
+
+    enum Phase {
+        MISSING("需要安装模块", false), DISABLED("模块已禁用", false), STOPPED("已停止", false),
+        STARTING("正在建立 TUN", true), WAITING_NETWORK("等待系统网络", true), RETRYING("等待重试", true),
+        ORPHANED("需要停止并清理", true), DEGRADED("连接待恢复", true), RUNNING("TUN 运行中", true);
+        final String label;
+        final boolean active;
+        Phase(String label, boolean active) { this.label = label; this.active = active; }
+    }
+
+    record RuntimeStatus(boolean reported, boolean core, boolean tun4, boolean tun6, boolean controller,
+                         boolean notificationRecovery, boolean notificationEnabled, String hotspotReason,
+                         long hotspotSent, long hotspotReceived) {}
 
     static final class Status {
         final String state;
@@ -28,9 +43,14 @@ final class Module {
         final String version;
         final String pendingVersion;
         final int revision;
+        final boolean hotspot;
+        final boolean hotspotEnabled;
+        final String hotspotState;
+        final RuntimeStatus runtime;
 
         Status(String state, boolean profile, boolean boot, boolean enabled, boolean control, boolean validate,
-               String version, String pendingVersion, int revision) {
+               String version, String pendingVersion, int revision, boolean hotspot, boolean hotspotEnabled, String hotspotState,
+               RuntimeStatus runtime) {
             this.state = state;
             this.profile = profile;
             this.boot = boot;
@@ -40,9 +60,55 @@ final class Module {
             this.version = version;
             this.pendingVersion = pendingVersion;
             this.revision = revision;
+            this.hotspot = hotspot;
+            this.hotspotEnabled = hotspotEnabled;
+            this.hotspotState = hotspotState;
+            this.runtime = runtime;
         }
 
         boolean installed() { return !state.equals("missing"); }
+
+        Phase phase() {
+            if (!installed()) return Phase.MISSING;
+            if (!enabled) return runtime.core() || !state.equals("stopped") ? Phase.ORPHANED : Phase.DISABLED;
+            return switch (state) {
+                case "running" -> runtime.reported() && (!runtime.core() || !runtime.tun4() || !runtime.controller())
+                    ? Phase.DEGRADED : Phase.RUNNING;
+                case "waiting_network" -> Phase.WAITING_NETWORK;
+                case "starting" -> Phase.STARTING;
+                case "retrying" -> Phase.RETRYING;
+                case "orphaned" -> Phase.ORPHANED;
+                default -> runtime.core() ? Phase.ORPHANED : Phase.STOPPED;
+            };
+        }
+
+        boolean active() { return phase().active; }
+        boolean running() { return phase() == Phase.RUNNING; }
+
+        String hotspotSummary() {
+            if (!hotspot) return "安装新版内置模块并重启后可用。";
+            if (!hotspotEnabled) return "热点设备沿用当前模式、规则和节点。首次启用部分系统需重启手机。";
+            if (hotspotState.equals("reboot")) return "系统网络共享加速仍在运行，请重启手机后使用共享。";
+            if (!running()) return "已开启，等待 TUN 和系统网络就绪。";
+            String reason = switch (runtime.hotspotReason()) {
+                case "nat4" -> "手机内核不支持 IPv4 NAT，无法共享代理。";
+                case "filter6" -> "缺少 IPv6 防火墙能力，无法防止流量绕过代理。";
+                case "commands" -> "缺少共享所需的系统命令。";
+                case "bpf_unknown" -> "暂时无法确认系统共享加速状态，等待重新检查。";
+                case "offload" -> "共享加速设置暂不可用，正在重试；本机 TUN 继续运行。";
+                default -> "共享规则建立失败，正在重试，请查看内核日志。";
+            };
+            return switch (hotspotState) {
+                case "unsupported", "error" -> reason;
+                case "waiting_network" -> "等待可用的 IPv4 上游网络，恢复后自动共享。";
+                case "active", "active_ipv4" -> (hotspotState.equals("active_ipv4")
+                    ? "IPv4 兼容共享 · 已阻止热点 IPv6 绕过代理。" : "双栈代理共享。")
+                    + (runtime.hotspotReceived() > 0 ? "已检测到热点回包。"
+                        : runtime.hotspotSent() > 0 ? "已收到请求，暂未检测到回包。" : "等待热点设备产生流量。")
+                    + "应用分流仅适用于手机本机。";
+                default -> "等待系统热点接口，热点开启后自动识别。";
+            };
+        }
 
         int functionalRevision() {
             if (revision > 0) return revision;
@@ -60,6 +126,13 @@ final class Module {
 
     static Status status() throws Exception {
         return parseStatus(run(Command.STATUS, null));
+    }
+
+    private static boolean notificationStatusSupported;
+    static Status notificationStatus() throws Exception {
+        Status status = parseStatus(run(notificationStatusSupported ? Command.STATUS_NOTIFICATION : Command.STATUS, null));
+        notificationStatusSupported = status.runtime.notificationRecovery();
+        return status;
     }
 
     static byte[] readProfile() throws Exception {
@@ -120,6 +193,13 @@ final class Module {
         String version = "";
         String pendingVersion = "";
         int revision = 0;
+        boolean hotspot = false;
+        boolean hotspotEnabled = false;
+        String hotspotState = "off";
+        boolean health = false, core = false, tun4 = false, tun6 = false, controller = false;
+        boolean notificationRecovery = false, notificationEnabled = false;
+        String hotspotReason = "none";
+        long hotspotSent = 0, hotspotReceived = 0;
         for (String line : output.split("\\r?\\n")) {
             if (line.startsWith("state=")) state = line.substring(6);
             if (line.equals("profile=1")) profile = true;
@@ -127,6 +207,28 @@ final class Module {
             if (line.equals("enabled=1")) enabled = true;
             if (line.equals("control=1")) control = true;
             if (line.equals("validate=1")) validate = true;
+            if (line.equals("hotspot=1")) hotspot = true;
+            if (line.equals("hotspot_enabled=1")) hotspotEnabled = true;
+            if (line.equals("health=1")) health = true;
+            if (line.equals("core_running=1")) core = true;
+            if (line.equals("tun4=1")) tun4 = true;
+            if (line.equals("tun6=1")) tun6 = true;
+            if (line.equals("controller_ready=1")) controller = true;
+            if (line.equals("notification_recovery=1")) notificationRecovery = true;
+            if (line.equals("notification_enabled=1")) notificationEnabled = true;
+            if (line.startsWith("hotspot_sent=")) hotspotSent = nonnegativeLong(line.substring(13));
+            if (line.startsWith("hotspot_received=")) hotspotReceived = nonnegativeLong(line.substring(17));
+            if (line.startsWith("hotspot_reason=")) hotspotReason = switch (line.substring(15)) {
+                case "nat4", "filter6", "commands", "bpf_unknown", "offload", "setup", "bpf", "no_uplink4" -> line.substring(15);
+                default -> "none";
+            };
+            if (line.startsWith("hotspot_state=")) {
+                String value = line.substring(14);
+                hotspotState = switch (value) {
+                    case "active", "active_ipv4", "waiting", "waiting_network", "unsupported", "error", "reboot" -> value;
+                    default -> "off";
+                };
+            }
             if (line.startsWith("version=")) version = line.substring(8);
             if (line.startsWith("pending=")) pendingVersion = line.substring(8);
             if (line.startsWith("revision=")) {
@@ -135,15 +237,22 @@ final class Module {
             }
         }
         switch (state) {
-            case "running", "starting", "retrying", "orphaned", "stopped", "missing" -> { }
+            case "running", "starting", "waiting_network", "retrying", "orphaned", "stopped", "missing" -> { }
             default -> throw new IOException("无法读取 KernelSU / Magisk 模块的状态。");
         }
-        return new Status(state, profile, boot, enabled, control, validate, version, pendingVersion, revision);
+        return new Status(state, profile, boot, enabled, control, validate, version, pendingVersion, revision,
+            hotspot, hotspotEnabled, hotspotState, new RuntimeStatus(health, core, tun4, tun6, controller,
+                notificationRecovery, notificationEnabled, hotspotReason, hotspotSent, hotspotReceived));
+    }
+
+    private static long nonnegativeLong(String value) {
+        try { return Math.max(0, Long.parseLong(value)); }
+        catch (NumberFormatException ignored) { return 0; }
     }
 
     static String run(Command command, byte[] payload) throws Exception {
         String script = "/data/adb/modules/minclash/control.sh";
-        String metadata = command == Command.STATUS
+        String metadata = command == Command.STATUS || command == Command.STATUS_NOTIFICATION
             ? "grep -E '^(version|revision)=' /data/adb/modules/minclash/module.prop 2>/dev/null; "
                 + "if [ -f /data/adb/modules_update/minclash/module.prop ]; then "
                 + "sed -n 's/^version=/pending=/p' /data/adb/modules_update/minclash/module.prop; fi; "

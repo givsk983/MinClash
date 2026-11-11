@@ -1,4 +1,4 @@
-# MinClash 0.1.2
+# MinClash 0.1.3
 
 MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模块和 Mihomo v1.19.33 Android ARM64 内核。发布时只需要分发 `dist/MinClash.apk`。适用于 ARM64、Android 9 及以上，且内核支持 `/dev/tun` 或 `/dev/net/tun` 的 Root 手机。
 
@@ -28,7 +28,9 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 「关于 → 诊断与反馈」可分别检查 IPv4/IPv6 TUN 路由、主代理出口和手机 HTTPS 路径。分享前可预览记录，导出的文本仅包含必要版本、探测结果和固定故障码。配置中某组 DNS 上游全部指向本机时，重新导入、更新订阅或点击「修复本机 DNS 配置」可将该组替换为直连的公共加密 DNS（阿里云和 Cloudflare）。
 
-在「设置」开启通知栏控制并允许通知后，TUN 运行期间可查看上传与下载速率。通过「允许悬浮窗」为 MinClash 授权「显示在其他应用上层」后，点按模式或节点名会在当前应用上方打开对应的选择窗。给 MinClash 授予「使用情况访问」后，通知也会显示前台应用名称。手机重启后若模块自动连接，打开 App 即可恢复通知栏控制。
+在「设置」开启通知栏控制并允许通知后，TUN 运行期间可查看上传与下载速率。退出界面或划掉最近任务后，通知服务继续运行；被系统回收后请求自动重建，手机启动和覆盖安装后自动恢复已开启的通知栏控制，无需先打开 App。系统设置中的「强行停止」以及部分厂商的后台限制仍可能阻止恢复，可在系统应用设置中允许后台运行。通过「允许悬浮窗」为 MinClash 授权「显示在其他应用上层」后，点按模式或节点名会在当前应用上方打开对应的选择窗。给 MinClash 授予「使用情况访问」后，通知也会显示前台应用名称。
+
+「设置 → 个人热点共享代理」让热点设备沿用当前代理模式、订阅规则和节点，无需在客户端手动设置代理。建议使用内置模块 0.0.8（修订号 7），包含热点 DNS 修复、能力预检和持续恢复。安装后重启手机。开启共享开关后，启动 TUN，再开启系统个人热点；若提示系统网络共享加速仍在运行，需重启手机，让系统加载新的加速设置。共享状态会区分规则就绪、等待客户端流量、已有请求及已检测到回包；这些计数不代替客户端实际联网测试。应用分流按手机包名匹配，只适用于手机本机。关闭共享开关后，热点恢复系统网络共享。
 
 下拉 Android 快捷设置，在编辑磁贴界面添加「MinClash TUN」。磁贴可启停 TUN，并显示运行、启动或重试状态。
 
@@ -40,8 +42,14 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 - 内置模块使用 SHA-256 校验后，通过 `ksud module install` 或 `magisk --install-module` 安装。保留 `/data/adb/minclash` 中已有的配置和日志，安装完成后提示用户重启，不自动重启设备。App 识别已安装版本和待重启的模块更新。
 - App 和模块独立更新。界面、应用分流、图标或权限等 App 功能更新不会要求重装模块。仅模块功能修订号增加或现有模块缺少必要能力时提示更新；已发布的模块 0.0.1 与 0.0.2 功能一致，都可继续使用。模块安装确认、版本展示与导出文件名均读取内置模块自己的信息。
 - `service.sh` 在 Android 完成启动后启动守护进程。守护进程监测 `minclash0`、策略路由和内核进程，故障后按 3 秒至 60 秒的间隔退避重试。停止时先发 `SIGTERM`，再检查并清理本次启动占用的规则。模块保留 `20882` 路由表及 `8799–8810` 优先级段，启动前会检查冲突。
-- 手机热点客户端沿用 Android 原生网络共享。手机本机仍由 TUN 接管，热点客户端通过手机的系统上游联网。
-- 导入保留 YAML 的节点、策略组和规则。只有节点或节点提供者的 YAML 会补上默认选择组和匹配规则。模块统一使用 Mihomo `mips` TUN、自动路由和 53 端口 DNS 接管。导入配置中的额外监听、外部控制器和 NTP 设置会被移除。未填写 DNS 上游时使用 Mihomo 内置默认值。支持范围为手机本机流量。请在测试时先关闭其他 VPN 或透明代理模块，Android 的私人 DNS 也可能绕过 53 端口接管。
+- 网络恢复覆盖整个运行过程。Wi-Fi、移动网络、双卡上游或默认路由发生变化时，连续两次稳定采样后重建 TUN，并设置 30 秒冷却，避免网络抖动引起反复重连。无系统上游时显示「等待系统网络」；App 和通知同时通过 Android 网络回调及时刷新状态，模块独立运行。
+- 热点共享代理默认关闭，此时热点客户端沿用 Android 原生网络共享。开启后，模块根据 Android 的转发规则和 `local_network` 表识别活动热点接口，为 IPv4/IPv6 添加到 TUN 的策略路由、局域网与回包路由、双向转发放行，以及 TCP/UDP 53 端口的 DNS 接管。接口变化时重建规则；停止 TUN、关闭共享或发生部分安装失败时，清理本模块记录的规则，不清空系统防火墙或共享路由表。额外保留策略优先级 `8796–8798`，检测冲突后拒绝安装共享规则。
+- Android 热点 DNS 服务 `dns_tether`（UID 1052）通过优先级 `8795` 绕过本机 TUN，向直连的热点客户端返回真实 IP，避免订阅启用 Fake-IP 后将 `198.18.x.x` 发往运营商网络。该例外只匹配系统热点 DNS 服务，本机应用 DNS 继续由 TUN 处理。开启共享时，客户端 DNS 在 PREROUTING 即送往 TUN，仍使用当前配置的 DNS 与规则。
+- 为防止网络共享加速绕过代理，共享开关开启期间会关闭系统硬件转发加速和可配置的 BPF 转发加速，原值保存在 Root 数据目录。关闭共享开关或卸载模块时恢复原值；期间用户或系统自行更改的值不会被覆盖。BPF 加速状态由系统服务在初始化时读取，部分系统首次开启共享需重启手机，App 会显示此状态。设备缺少 IPv6 NAT 时自动使用 IPv4 共享，并拒绝热点客户端的 IPv6 转发，供客户端回退 IPv4；界面会显示兼容模式。后台设置命令通过管道交给系统服务，避免将 Root 日志描述符传入 Binder；设置暂不可用时重试，不终止本机 TUN。
+- 开启共享前检测系统命令、IPv4 NAT 与双栈防火墙；运行时确认 IPv4 上游可用性。每 15 秒复查加速设置、每 30 秒复查系统 BPF 实际状态和基础能力，发现设置漂移后重新应用。若实际 BPF 状态仍开启，会撤销共享规则并提示重启；无法确认加速状态时不会显示共享成功。本机 TUN 保持独立运行。
+- App、通知和快捷磁贴共用会话状态判断。新版模块报告内核存活、IPv4/IPv6 路由及控制套接字就绪情况；状态文件与实际能力不一致时显示「连接待恢复」。旧模块继续按原状态协议工作。
+- 通知控制开启后，App 将这一选择同步给支持恢复的新模块。模块检查通知心跳，服务中断或模块在后台重连后，最多每分钟尝试恢复一次当前用户的通知服务。不会修改系统通知权限，也不会越过用户在系统设置中的强行停止；取消通知开关后停止恢复。
+- 导入保留 YAML 的节点、策略组和规则。只有节点或节点提供者的 YAML 会补上默认选择组和匹配规则。模块统一使用 Mihomo `mips` TUN、自动路由和 53 端口 DNS 接管。导入配置中的额外监听、外部控制器和 NTP 设置会被移除。未填写 DNS 上游时使用 Mihomo 内置默认值。支持手机本机流量，以及开启共享后的热点流量。请在测试时先关闭其他 VPN 或透明代理模块，Android 的私人 DNS 也可能绕过 53 端口接管。
 - App 通过 Root 访问数据目录里的 Unix 套接字控制 Mihomo。手动切换的模式会在下次启动 TUN 时恢复。节点选择由 Mihomo 的 `profile.store-selected` 设置控制是否记忆。
 - 应用分流按 Android 包名匹配，排在订阅规则之前。App 在私有数据中分别保存订阅源配置与个人应用设置，每次导入或更新时重新合并；恢复「跟随订阅规则」会移除对应的个人规则。更换订阅时若指定的代理组不存在，会拒绝更新并保留原配置，需先重新选择出口。保存失败时尝试恢复原配置和连接。应用列表需要查询已安装应用的权限，不上传应用清单。
 - 应用列表优先申请设备支持的 `GET_INSTALLED_APPS` 动态权限，再通过普通接口查询。`QUERY_ALL_PACKAGES` 是安装时自动授予的普通权限，不能弹窗申请。若系统没有动态申请入口或授权后仍返回空列表，会提供应用设置和「用 Root 读取」选项；Root 仅在选择后启用，并在界面标明来源。记住选择后仍优先尝试普通查询，不调整系统权限。读取失败会明确提示，而非显示为搜索无结果。
@@ -51,7 +59,7 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 准备 Python 3.11 或以上、JDK 17 或以上、Android SDK Platform 36、Build Tools 36.0.0 和 NDK 27.0.12077973。通过 `ANDROID_HOME` 指定 SDK 目录，再运行 `python build.py`。如果 NDK 安装在其他位置，可通过 `ANDROID_NDK_HOME` 指定其目录。脚本校验下载文件的 SHA-256，在 `build` 中生成模块 ZIP，再将其和校验值嵌入 `dist/MinClash.apk`。发布时运行 `python build.py --release`，脚本会校验签名指纹并输出 APK 的 SHA-256。请私下备份现有的 `build/debug.keystore`，也可用 `MINCLASH_KEYSTORE` 指向备份位置。
 
-App 当前展示版本为 `0.1.2`，构建 `versionCode=22`。内置模块为 `0.0.5`、`versionCode=14`、功能修订号 `revision=4`。从旧模块升级时，安装内置模块后需重启以启用热点修复。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
+App 当前展示版本为 `0.1.3`，构建 `versionCode=26`。内置模块为 `0.0.8`、`versionCode=17`、功能修订号 `revision=7`。界面统一状态和网络回调随 App 升级生效；持续网络恢复、热点预检和通知心跳恢复需要新版模块。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
 
 上游版本、模块安装规范和 TUN 参数可查阅 [Mihomo v1.19.33](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33)、[Magisk 开发文档](https://topjohnwu.github.io/Magisk/guides.html) 和 [Mihomo TUN 文档](https://wiki.metacubex.one/config/inbound/tun/)。
 
@@ -60,3 +68,9 @@ App 当前展示版本为 `0.1.2`，构建 `versionCode=22`。内置模块为 `0
 保留了首次 PID 检测误报修复，以及每 4 秒静默刷新状态的逻辑，自动查询不会反复禁用按钮。PID 回归检查可使用 Root 管理器的 BusyBox 运行 `tests/pid-check.sh /path/to/control.sh`，覆盖有效 PID、PID 重用、旧开机标识及失效记录。
 
 `tests/AndroidInventoryCheck.java` 通过 Android `app_process` 和专用临时目录验证应用清单缓存、规则及代理组更新、缓存失效、异步图标加载和失败后的重新读取，不修改正在使用的配置。
+
+`tests/hotspot-forwarding-check.sh module/control.sh` 检查默认的本机流量接管及双栈清理。`tests/hotspot-sharing-check.sh module/control.sh` 使用模拟路由和防火墙验证热点识别、双栈共享、DNS、接口变化、重复刷新、丢失规则恢复、部分失败回滚与冲突保护，不修改宿主网络。真机还需验证退出最近任务后的通知、开机恢复，以及热点客户端的 DNS 和实际代理出口。
+
+`tests/runtime-recovery-check.sh module/control.sh` 验证持续网络切换、双卡路由变化、离线恢复、防抖冷却、通知心跳与用户停止状态。兼容场景和验证边界见 [兼容性回归矩阵](tests/COMPATIBILITY.md)。
+
+通知恢复使用 Android 的 [sticky 前台服务](https://developer.android.com/reference/android/app/Service#START_STICKY)及[开机与覆盖安装广播的启动豁免](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start)。BPF 状态检查依据 AOSP [BpfCoordinator 初始化时缓存加速状态的实现](https://android.googlesource.com/platform/packages/modules/Connectivity/+/refs/heads/main/Tethering/src/com/android/networkstack/tethering/BpfCoordinator.java)。

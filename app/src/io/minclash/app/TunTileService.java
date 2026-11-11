@@ -101,6 +101,10 @@ public final class TunTileService extends TileService {
 
     private void finish(Module.Status current, boolean failed) {
         operating = false;
+        if (current != null) {
+            ProxyNotificationService.sync(this, ProxyNotificationService.enabled(this)
+                && current.enabled && active(current));
+        }
         if (!listening) return;
         renderStatus(current);
         if (failed && canToggle(current)) render(active(current) ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE, "操作失败");
@@ -113,7 +117,7 @@ public final class TunTileService extends TileService {
     }
 
     private static boolean active(Module.Status current) {
-        return current.installed() && !current.state.equals("stopped");
+        return current.active();
     }
 
     private static boolean canToggle(Module.Status current) {
@@ -129,13 +133,8 @@ public final class TunTileService extends TileService {
             render(Tile.STATE_UNAVAILABLE, reason);
             return;
         }
-        String detail = switch (current.state) {
-            case "running" -> "运行中";
-            case "starting" -> "启动中";
-            case "retrying" -> "重试中";
-            case "orphaned" -> "需要清理";
-            default -> "已停止";
-        };
+        String detail = current.phase().label;
+        NotificationRecovery.sync(this, current);
         render(active(current) ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE, detail);
     }
 
