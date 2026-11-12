@@ -136,6 +136,7 @@ public final class MainActivity extends Activity {
     private Switch hotspotSwitch;
     private TextView hotspotSummary;
     private Button notificationButton;
+    private Button backgroundPermissionButton;
     private Button overlayPermissionButton;
     private Button foregroundAppButton;
     private Button launcherIconButton;
@@ -331,7 +332,10 @@ public final class MainActivity extends Activity {
         notificationButton = button("开启通知栏控制", false);
         notificationButton.setOnClickListener(view -> toggleNotificationControl());
         add(service, notificationButton, 14);
-        add(service, label("通知在退出界面后继续显示连接和网速，开机后自动恢复。点模式或节点名可切换。", 12, MUTED, false), 6);
+        add(service, label("通知显示连接和网速，点模式或节点名可切换。若划掉后台后通知消失，请检查后台运行设置。", 12, MUTED, false), 6);
+        backgroundPermissionButton = button("后台运行设置", false);
+        backgroundPermissionButton.setOnClickListener(view -> showBackgroundRunHelp());
+        add(service, backgroundPermissionButton, 8);
         overlayPermissionButton = button("允许悬浮窗", false);
         overlayPermissionButton.setOnClickListener(view -> showOverlayPermissionHelp(true));
         add(service, overlayPermissionButton, 8);
@@ -481,7 +485,7 @@ public final class MainActivity extends Activity {
         visible = true;
         networkObserver = new NetworkObserver(this, () -> {
             if (!visible || !appPreferences().getBoolean("connected", false)) return;
-            ProxyNotificationService.connectionChanged();
+            ProxyNotificationService.connectionChanged(this);
             resetNetworkChecks();
             scheduleLatency(1000);
             main.removeCallbacks(poll);
@@ -494,12 +498,15 @@ public final class MainActivity extends Activity {
     }
 
     private boolean notificationEnabled() {
-        return appPreferences().getBoolean(NOTIFICATION_CONTROL, false);
+        return ProxyNotificationService.enabled(this);
     }
 
     private void toggleNotificationControl() {
         if (notificationEnabled()) {
-            appPreferences().edit().putBoolean(NOTIFICATION_CONTROL, false).apply();
+            if (!ProxyNotificationService.setEnabled(this, false)) {
+                showMessage("无法保存通知设置，请重试。");
+                return;
+            }
             ProxyNotificationService.sync(this, false);
             render();
         } else if (Build.VERSION.SDK_INT >= 33
@@ -516,7 +523,10 @@ public final class MainActivity extends Activity {
                 .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()));
             return;
         }
-        appPreferences().edit().putBoolean(NOTIFICATION_CONTROL, true).apply();
+        if (!ProxyNotificationService.setEnabled(this, true)) {
+            showMessage("无法保存通知设置，请重试。");
+            return;
+        }
         render();
         if (!Settings.canDrawOverlays(this)) showOverlayPermissionHelp(true);
     }
@@ -538,6 +548,41 @@ public final class MainActivity extends Activity {
             });
         }
         dialog.show();
+    }
+
+    private void showBackgroundRunHelp() {
+        boolean xiaomi = "Xiaomi".equalsIgnoreCase(Build.MANUFACTURER)
+            || "Redmi".equalsIgnoreCase(Build.MANUFACTURER);
+        AlertDialog.Builder help = new AlertDialog.Builder(this)
+            .setTitle("允许通知在后台运行")
+            .setMessage(xiaomi
+                ? "请为 MinClash 开启「自启动」，并在「应用信息 → 省电策略」选择「无限制」。\n\n"
+                    + "部分小米系统会在划掉后台时清理前台服务。允许自启动后，通知可在清理后自动恢复，期间可能短暂消失。"
+                : "请在 MinClash 的应用信息中允许后台运行，并检查电池或省电限制。部分系统会在划掉后台时连同前台通知一起清理。")
+            .setNegativeButton("关闭", null);
+        if (xiaomi) {
+            help.setPositiveButton("自启动设置", (dialog, which) -> openBackgroundSettings(true));
+            help.setNeutralButton("应用信息", (dialog, which) -> openBackgroundSettings(false));
+        } else {
+            help.setPositiveButton("应用信息", (dialog, which) -> openBackgroundSettings(false));
+        }
+        help.show();
+    }
+
+    private void openBackgroundSettings(boolean autostart) {
+        if (autostart) {
+            try {
+                startActivity(new Intent().setComponent(new android.content.ComponentName("com.miui.securitycenter",
+                    "com.miui.permcenter.autostart.AutoStartManagementActivity")));
+                return;
+            } catch (android.content.ActivityNotFoundException | SecurityException unavailable) { }
+        }
+        try {
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", getPackageName(), null)));
+        } catch (android.content.ActivityNotFoundException | SecurityException unavailable) {
+            showMessage("请在系统设置中打开 MinClash 的应用信息，允许自启动和后台运行。");
+        }
     }
 
     private void openOverlaySettings() {
@@ -2112,6 +2157,7 @@ public final class MainActivity extends Activity {
         boolean running = hasProxyControl(updated);
         if (!requested && running == hasProxyControl(status)
             && (!running || summary == null || summary.equals(proxySummary))) return;
+        ProxyNotificationService.connectionChanged(this);
         resetNetworkChecks();
         scheduleLatency(0);
     }
@@ -2212,6 +2258,7 @@ public final class MainActivity extends Activity {
         updatingSwitch = false;
         boolean notification = notificationEnabled();
         notificationButton.setText(notification ? "关闭通知栏控制" : "开启通知栏控制");
+        backgroundPermissionButton.setVisibility(notification ? View.VISIBLE : View.GONE);
         overlayPermissionButton.setVisibility(notification ? View.VISIBLE : View.GONE);
         overlayPermissionButton.setText(notification && Settings.canDrawOverlays(this) ? "检查悬浮窗权限" : "允许悬浮窗");
         foregroundAppButton.setVisibility(notification ? View.VISIBLE : View.GONE);

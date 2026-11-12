@@ -16,7 +16,9 @@ final class NotificationRecovery {
         pending = true;
         RoutingStore.WORKER.execute(() -> {
             try {
-                Module.run(desired ? Module.Command.NOTIFICATION_ON : Module.Command.NOTIFICATION_OFF, null);
+                // The UI may have changed the durable preference while this query was queued.
+                Module.run(ProxyNotificationService.enabled(context)
+                    ? Module.Command.NOTIFICATION_ON : Module.Command.NOTIFICATION_OFF, null);
             } catch (Exception error) {
                 Log.w("MinClash", "Cannot synchronize notification recovery preference", error);
             } finally {

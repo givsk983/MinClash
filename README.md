@@ -1,4 +1,4 @@
-# MinClash 0.1.4
+# MinClash 0.1.5
 
 MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模块和 Mihomo v1.19.33 Android ARM64 内核。发布时只需要分发 `dist/MinClash.apk`。适用于 ARM64、Android 9 及以上，且内核支持 `/dev/tun` 或 `/dev/net/tun` 的 Root 手机。
 
@@ -34,6 +34,8 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 在「设置」开启通知栏控制并允许通知后，TUN 运行期间可查看上传与下载速率。退出界面或划掉最近任务后，通知服务继续运行；被系统回收后请求自动重建，手机启动和覆盖安装后自动恢复已开启的通知栏控制，无需先打开 App。系统设置中的「强行停止」以及部分厂商的后台限制仍可能阻止恢复，可在系统应用设置中允许后台运行。通过「允许悬浮窗」为 MinClash 授权「显示在其他应用上层」后，点按模式或节点名会在当前应用上方打开对应的选择窗。给 MinClash 授予「使用情况访问」后，通知也会显示前台应用名称。
 
+若小米／Redmi 手机划掉后台后通知一直消失，在「设置 → 后台运行设置」打开系统自启动管理，允许 MinClash 自启动，并检查应用信息中的省电策略。真机发现未允许自启动时，系统会把划掉任务处理为强行停止整个应用；仅使用独立进程无法避免。允许自启动后通知可在系统清理后恢复，期间可能短暂消失。覆盖升级后若系统重置了自启动选项，需重新允许。
+
 「设置 → 个人热点共享代理」让热点设备沿用当前代理模式、订阅规则和节点，无需在客户端手动设置代理。建议使用内置模块 0.0.8（修订号 7），包含热点 DNS 修复、能力预检和持续恢复。安装后重启手机。开启共享开关后，启动 TUN，再开启系统个人热点；若提示系统网络共享加速仍在运行，需重启手机，让系统加载新的加速设置。共享状态会区分规则就绪、等待客户端流量、已有请求及已检测到回包；这些计数不代替客户端实际联网测试。应用分流按手机包名匹配，只适用于手机本机。关闭共享开关后，热点恢复系统网络共享。
 
 下拉 Android 快捷设置，在编辑磁贴界面添加「MinClash TUN」。磁贴可启停 TUN，并显示运行、启动或重试状态。
@@ -63,7 +65,7 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 准备 Python 3.11 或以上、JDK 17 或以上、Android SDK Platform 36、Build Tools 36.0.0 和 NDK 27.0.12077973。通过 `ANDROID_HOME` 指定 SDK 目录，再运行 `python build.py`。如果 NDK 安装在其他位置，可通过 `ANDROID_NDK_HOME` 指定其目录。脚本校验下载文件的 SHA-256，在 `build` 中生成模块 ZIP，再将其和校验值嵌入 `dist/MinClash.apk`。发布时运行 `python build.py --release`，脚本会校验签名指纹并输出 APK 的 SHA-256。请私下备份现有的 `build/debug.keystore`，也可用 `MINCLASH_KEYSTORE` 指向备份位置。
 
-App 当前展示版本为 `0.1.4`，构建 `versionCode=27`。内置模块为 `0.0.8`、`versionCode=17`、功能修订号 `revision=7`。界面统一状态和网络回调随 App 升级生效；持续网络恢复、热点预检和通知心跳恢复需要新版模块。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
+App 当前展示版本为 `0.1.5`，构建 `versionCode=29`。内置模块为 `0.0.8`、`versionCode=17`、功能修订号 `revision=7`。0.1.5 的通知独立进程、通知开关持久化与刷新优化随 App 升级生效，无需重装模块或重启手机；持续网络恢复、热点预检和通知心跳恢复需要支持这些能力的模块。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
 
 上游版本、模块安装规范和 TUN 参数可查阅 [Mihomo v1.19.33](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33)、[Magisk 开发文档](https://topjohnwu.github.io/Magisk/guides.html) 和 [Mihomo TUN 文档](https://wiki.metacubex.one/config/inbound/tun/)。
 
@@ -76,5 +78,7 @@ App 当前展示版本为 `0.1.4`，构建 `versionCode=27`。内置模块为 `0
 `tests/hotspot-forwarding-check.sh module/control.sh` 检查默认的本机流量接管及双栈清理。`tests/hotspot-sharing-check.sh module/control.sh` 使用模拟路由和防火墙验证热点识别、双栈共享、DNS、接口变化、重复刷新、丢失规则恢复、部分失败回滚与冲突保护，不修改宿主网络。真机还需验证退出最近任务后的通知、开机恢复，以及热点客户端的 DNS 和实际代理出口。
 
 `tests/runtime-recovery-check.sh module/control.sh` 验证持续网络切换、双卡路由变化、离线恢复、防抖冷却、通知心跳与用户停止状态。兼容场景和验证边界见 [兼容性回归矩阵](tests/COMPATIBILITY.md)。
+
+`tests/NotificationLifecycleCheck.java` 在 JVM 验证旧通知偏好兼容、独立进程写入后实时读取、未完成／失败写入、短暂重连与持续停止、系统重建后的等待时限。Android 上的进程与最近任务生命周期仍需真机验证。
 
 通知恢复使用 Android 的 [sticky 前台服务](https://developer.android.com/reference/android/app/Service#START_STICKY)及[开机与覆盖安装广播的启动豁免](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start)。BPF 状态检查依据 AOSP [BpfCoordinator 初始化时缓存加速状态的实现](https://android.googlesource.com/platform/packages/modules/Connectivity/+/refs/heads/main/Tethering/src/com/android/networkstack/tethering/BpfCoordinator.java)。

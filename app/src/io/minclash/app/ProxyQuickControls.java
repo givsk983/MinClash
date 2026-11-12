@@ -177,7 +177,7 @@ final class ProxyQuickControls extends Dialog {
             if (change != null) {
                 try {
                     change.run();
-                    ProxyNotificationService.connectionChanged();
+                    ProxyNotificationService.connectionChanged(getContext());
                     if (modePanel) {
                         main.post(this::dismiss);
                         return;

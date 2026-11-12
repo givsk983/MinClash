@@ -85,7 +85,7 @@ public final class TunTileService extends TileService {
                 preferences.edit().putBoolean("connected", true).apply();
                 Module.Status result = current;
                 main.post(() -> {
-                    ProxyNotificationService.sync(this, preferences.getBoolean(MainActivity.NOTIFICATION_CONTROL, false)
+                    ProxyNotificationService.sync(this, ProxyNotificationService.enabled(this)
                         && result.enabled && active(result));
                     finish(result, false);
                 });

@@ -7,6 +7,8 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
 import android.hardware.display.DisplayManager;
 import android.net.Uri;
 import android.os.Build;
@@ -29,14 +31,21 @@ public final class ProxyNotificationService extends Service {
     static final String ACTION_OPEN_PANEL = "io.minclash.app.OPEN_PROXY_PANEL";
     static final String ACTION_OVERLAY_HELP = "io.minclash.app.OVERLAY_HELP";
     static final String EXTRA_MODE_PANEL = "mode_panel";
+    private static final String ACTION_REFRESH = "io.minclash.app.REFRESH_PROXY_STATUS";
     private static final String CHANNEL = "proxy_status";
     private static final int NOTIFICATION_ID = 1;
     private static final long SAMPLE_INTERVAL = 3000;
     private static final long CONNECTION_INTERVAL = 9000;
-    private static boolean started;
-    private static volatile boolean refreshConnection;
+    private volatile boolean refreshConnection;
 
-    static void connectionChanged() { refreshConnection = true; }
+    static void connectionChanged(Context context) {
+        if (!isRunning(context)) return;
+        try {
+            context.startService(new Intent(context, ProxyNotificationService.class).setAction(ACTION_REFRESH));
+        } catch (IllegalStateException | SecurityException error) {
+            Log.w("MinClash", "Cannot refresh proxy status notification", error);
+        }
+    }
 
     private record Connection(String mode, String node, boolean running, boolean inactive) {}
 
@@ -62,15 +71,21 @@ public final class ProxyNotificationService extends Service {
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Runnable poll = this::pollStatus;
     private final RefreshGate refreshGate = new RefreshGate();
+    private final NotificationLifetime lifetime = new NotificationLifetime();
     private NotificationManager manager;
     private ForegroundApp foregroundApp;
     private Sample current;
     private ProxyQuickControls panel;
     private boolean overlayFailed;
     private long notificationSince;
-    private int inactivePolls;
-    private long restoreUntil;
+    private boolean destroyed;
     private NetworkObserver networkObserver;
+    private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) closePanel();
+            requestRefresh();
+        }
+    };
     // Owned by the worker.
     private Connection sampledConnection;
     private long connectionTime;
@@ -80,6 +95,16 @@ public final class ProxyNotificationService extends Service {
         NotificationManager manager = context.getSystemService(NotificationManager.class);
         NotificationChannel channel = manager.getNotificationChannel(CHANNEL);
         return manager.areNotificationsEnabled() && (channel == null || channel.getImportance() != NotificationManager.IMPORTANCE_NONE);
+    }
+
+    private static boolean isRunning(Context context) {
+        // Static fields belong to the caller's process, not necessarily the service's.
+        for (android.service.notification.StatusBarNotification item :
+                context.getSystemService(NotificationManager.class).getActiveNotifications()) {
+            if (item.getId() == NOTIFICATION_ID && item.getTag() == null
+                && (item.getNotification().flags & Notification.FLAG_FOREGROUND_SERVICE) != 0) return true;
+        }
+        return false;
     }
 
     static Intent overlaySettings(Context context) {
@@ -92,7 +117,7 @@ public final class ProxyNotificationService extends Service {
     }
 
     static boolean requestPanel(Context context, boolean mode) {
-        if (!started || !Settings.canDrawOverlays(context)) return false;
+        if (!enabled(context) || !isRunning(context) || !Settings.canDrawOverlays(context)) return false;
         try {
             context.startService(new Intent(context, ProxyNotificationService.class).setAction(ACTION_OPEN_PANEL)
                 .putExtra(EXTRA_MODE_PANEL, mode));
@@ -105,7 +130,7 @@ public final class ProxyNotificationService extends Service {
 
     static void sync(Context context, boolean enabled) {
         Intent intent = new Intent(context, ProxyNotificationService.class);
-        if (enabled && !started && canShow(context)) {
+        if (enabled && !isRunning(context) && canShow(context)) {
             try {
                 context.startForegroundService(intent);
             } catch (IllegalStateException | SecurityException error) {
@@ -117,8 +142,24 @@ public final class ProxyNotificationService extends Service {
     }
 
     static boolean enabled(Context context) {
-        return context.getSharedPreferences("MainActivity", MODE_PRIVATE)
-            .getBoolean(MainActivity.NOTIFICATION_CONTROL, false);
+        try {
+            return new NotificationPreference(context.getFilesDir()).enabled(
+                context.getSharedPreferences("MainActivity", MODE_PRIVATE)
+                    .getBoolean(MainActivity.NOTIFICATION_CONTROL, false));
+        } catch (java.io.IOException error) {
+            Log.w("MinClash", "Cannot read notification preference", error);
+            return false;
+        }
+    }
+
+    static boolean setEnabled(Context context, boolean enabled) {
+        try {
+            new NotificationPreference(context.getFilesDir()).setEnabled(enabled);
+            return true;
+        } catch (java.io.IOException error) {
+            Log.w("MinClash", "Cannot save notification preference", error);
+            return false;
+        }
     }
 
     static void restore(Context context) {
@@ -136,29 +177,31 @@ public final class ProxyNotificationService extends Service {
         manager = getSystemService(NotificationManager.class);
         manager.createNotificationChannel(new NotificationChannel(CHANNEL, "代理状态与快捷控制", NotificationManager.IMPORTANCE_LOW));
         foregroundApp = new ForegroundApp(this);
-        networkObserver = new NetworkObserver(this, () -> {
-            refreshConnection = true;
-            if (current != null) { main.removeCallbacks(poll); main.post(poll); }
-        });
+        networkObserver = new NetworkObserver(this, this::requestRefresh);
+        IntentFilter screen = new IntentFilter(Intent.ACTION_SCREEN_ON);
+        screen.addAction(Intent.ACTION_SCREEN_OFF);
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(screenReceiver, screen, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(screenReceiver, screen);
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         // Also runs for a null intent when Android recreates this sticky foreground service.
-        if (!enabled(this) || !canShow(this)) {
-            stopSelf(startId);
-            return START_NOT_STICKY;
-        }
-        if (intent != null && intent.getBooleanExtra("restore", false)) {
-            restoreUntil = SystemClock.elapsedRealtime() + 180000;
-        }
         if (current == null) {
             notificationSince = System.currentTimeMillis();
             current = new Sample(new Connection("代理模式", "正在读取连接…", false, false), "MinClash",
                 Speed.UNKNOWN, Settings.canDrawOverlays(this));
             startForeground(NOTIFICATION_ID, notification());
-            started = true;
             main.post(poll);
         }
+        // Satisfy startForegroundService even if the user disabled controls during startup.
+        if (!enabled(this) || !canShow(this)) {
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+        if (intent == null || intent.getBooleanExtra("restore", false)) {
+            lifetime.restoring(SystemClock.elapsedRealtime());
+        }
+        if (intent != null && ACTION_REFRESH.equals(intent.getAction())) requestRefresh();
         if (intent != null && ACTION_OPEN_PANEL.equals(intent.getAction())) {
             showPanel(intent.getBooleanExtra(EXTRA_MODE_PANEL, false));
         }
@@ -167,17 +210,41 @@ public final class ProxyNotificationService extends Service {
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
+    @Override public void onTaskRemoved(Intent rootIntent) {
+        // Notification taps finish a temporary task before the requested panel opens.
+        if (rootIntent != null && rootIntent.getComponent() != null
+            && ProxyOverlayLauncher.class.getName().equals(rootIntent.getComponent().getClassName())) {
+            super.onTaskRemoved(rootIntent);
+            return;
+        }
+        // The launcher task can disappear while this foreground process continues running.
+        closePanel();
+        if (enabled(this) && canShow(this) && current != null) {
+            startForeground(NOTIFICATION_ID, notification());
+            requestRefresh();
+        }
+        super.onTaskRemoved(rootIntent);
+    }
+
     @Override public void onDestroy() {
+        destroyed = true;
         if (networkObserver != null) networkObserver.close();
+        unregisterReceiver(screenReceiver);
         main.removeCallbacksAndMessages(null);
         closePanel();
         worker.shutdownNow();
         stopForeground(STOP_FOREGROUND_REMOVE);
-        started = false;
         super.onDestroy();
     }
 
+    private void requestRefresh() {
+        if (destroyed) return;
+        refreshConnection = true;
+        if (current != null) { main.removeCallbacks(poll); main.post(poll); }
+    }
+
     private void pollStatus() {
+        if (destroyed) return;
         if (!enabled(this) || !canShow(this)) { stopSelf(); return; }
         if (!refreshGate.request()) return;
         worker.execute(() -> {
@@ -187,8 +254,7 @@ public final class ProxyNotificationService extends Service {
                 boolean followUp = refreshGate.finish();
                 if (!sample.overlayAllowed() || sample.connection().inactive()
                     || !getSystemService(PowerManager.class).isInteractive()) closePanel();
-                inactivePolls = sample.connection().inactive() ? inactivePolls + 1 : 0;
-                if (inactivePolls >= 2 && SystemClock.elapsedRealtime() >= restoreUntil) { stopSelf(); return; }
+                if (lifetime.shouldStop(sample.connection().inactive(), SystemClock.elapsedRealtime())) { stopSelf(); return; }
                 if (sample.overlayAllowed() != current.overlayAllowed()) overlayFailed = false;
                 if (!sample.equals(current)) {
                     current = sample;
@@ -243,9 +309,10 @@ public final class ProxyNotificationService extends Service {
         return Speed.UNKNOWN;
     }
 
-    private static Connection readConnection() {
+    private Connection readConnection() {
         try {
             Module.Status status = Module.notificationStatus();
+            NotificationRecovery.sync(this, status);
             if (!status.active()) {
                 return new Connection("TUN 已停止", "暂无节点", false, true);
             }

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="io.minclash.app" android:versionCode="27" android:versionName="0.1.4">
+    package="io.minclash.app" android:versionCode="29" android:versionName="0.1.5">
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="36" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -17,6 +17,7 @@
         android:theme="@style/AppTheme" android:allowBackup="false" android:usesCleartextTraffic="true">
         <activity android:name=".MainActivity" android:exported="true" />
         <activity android:name=".ProxyOverlayLauncher" android:exported="false"
+            android:process=":notification"
             android:theme="@android:style/Theme.NoDisplay" android:taskAffinity=""
             android:excludeFromRecents="true" android:noHistory="true" />
         <receiver android:name=".UpdateInstallReceiver" android:exported="false" />
@@ -58,7 +59,7 @@
             </intent-filter>
         </activity-alias>
         <service android:name=".ProxyNotificationService" android:exported="false"
-            android:foregroundServiceType="specialUse" android:stopWithTask="false">
+            android:process=":notification" android:foregroundServiceType="specialUse" android:stopWithTask="false">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Display and refresh user-enabled controls for the active Root TUN session" />
         </service>
