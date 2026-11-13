@@ -10,6 +10,8 @@ final class BackgroundWork {
     final RetainedTask<SubscriptionPreview> preview = new RetainedTask<>();
     final RetainedTask<Void> updateDownload = new RetainedTask<>();
     final RetainedTask<Object> backup = new RetainedTask<>();
+    final RetainedTask<UsageResult> usage = new RetainedTask<>();
+    record UsageResult(SubscriptionCatalog.Entry entry, SubscriptionUsage value) {}
     byte[] pendingExport;
     boolean backupRestoring;
     record BackupExport(byte[] bytes) {}
@@ -22,6 +24,7 @@ final class BackgroundWork {
         preview.observe(dispatcher, callback);
         updateDownload.observe(dispatcher, callback);
         backup.observe(dispatcher, callback);
+        usage.observe(dispatcher, callback);
     }
 
     void stopObserving() {
@@ -29,5 +32,6 @@ final class BackgroundWork {
         preview.stopObserving();
         updateDownload.stopObserving();
         backup.stopObserving();
+        usage.stopObserving();
     }
 }

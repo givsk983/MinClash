@@ -8,6 +8,9 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.UnknownHostException;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.zip.GZIPInputStream;
 import javax.net.ssl.SSLException;
 
 final class Subscription {
@@ -26,14 +29,31 @@ final class Subscription {
     static String host(String address) throws IOException { return parse(null, address).getHost(); }
 
     static byte[] fetch(String address) throws IOException {
+        return download(address).source();
+    }
+
+    record Download(byte[] source, SubscriptionUsage usage) {}
+
+    static Download download(String address) throws IOException {
+        return response(address, true);
+    }
+
+    static SubscriptionUsage usage(String address) throws IOException {
+        return response(address, false).usage();
+    }
+
+    private static Download response(String address, boolean includeConfig) throws IOException {
         URL url = parse(null, address);
+        Set<String> visited = new HashSet<>();
         for (int redirects = 0; redirects <= 5; redirects++) {
+            if (!visited.add(url.toExternalForm())) throw new IOException("订阅服务器出现循环重定向，请检查服务商链接。");
             HttpURLConnection connection = (HttpURLConnection) url.openConnection();
             try {
                 connection.setConnectTimeout(12000);
                 connection.setReadTimeout(12000);
                 connection.setInstanceFollowRedirects(false);
                 connection.setRequestProperty("User-Agent", "clash.meta/1.19.33");
+                connection.setRequestProperty("Accept-Encoding", "gzip, identity");
                 int status;
                 try {
                     status = connection.getResponseCode();
@@ -41,7 +61,9 @@ final class Subscription {
                     throw downloadError(error);
                 }
                 if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
-                    URL next = parse(url, connection.getHeaderField("Location"));
+                    URL next;
+                    try { next = parse(url, connection.getHeaderField("Location")); }
+                    catch (IOException invalid) { throw new IOException("订阅服务器返回了无效的重定向地址。"); }
                     if (url.getProtocol().equals("https") && next.getProtocol().equals("http")) {
                         throw new IOException("订阅从 HTTPS 重定向到了 HTTP，请使用服务商提供的 HTTPS 链接。");
                     }
@@ -49,11 +71,18 @@ final class Subscription {
                     continue;
                 }
                 if (status != 200) throw new IOException("订阅服务器返回 HTTP " + status + "，请检查链接是否有效。");
+                SubscriptionUsage usage = SubscriptionUsage.parse(connection.getHeaderField("Subscription-Userinfo"), System.currentTimeMillis());
+                if (!includeConfig) return new Download(null, usage);
                 if (connection.getContentLengthLong() > Profile.MAX_BYTES) {
                     throw new IOException("订阅配置最大为 2 MiB。");
                 }
                 byte[] content;
-                try (InputStream input = connection.getInputStream()) {
+                String encoding = connection.getContentEncoding();
+                if (encoding != null && !encoding.equalsIgnoreCase("identity") && !encoding.equalsIgnoreCase("gzip")) {
+                    throw new IOException("订阅使用了不支持的压缩格式，请使用 Clash / Mihomo 订阅链接。");
+                }
+                try (InputStream raw = connection.getInputStream();
+                     InputStream input = "gzip".equalsIgnoreCase(encoding) ? new GZIPInputStream(raw) : raw) {
                     content = Profile.readLimited(input);
                 } catch (Profile.TooLarge error) {
                     throw error;
@@ -61,7 +90,7 @@ final class Subscription {
                     throw downloadError(error);
                 }
                 try {
-                    return Profile.normalize(content);
+                    return new Download(Profile.normalize(content), usage);
                 } catch (IOException error) {
                     throw new IOException("无法导入订阅，请使用机场提供的 Clash / Mihomo YAML 链接。\n"
                         + error.getMessage());

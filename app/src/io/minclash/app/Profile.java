@@ -80,7 +80,9 @@ final class Profile {
     }
 
     static byte[] normalize(byte[] content) throws IOException {
+        if (content.length > MAX_BYTES) throw new TooLarge();
         String source = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(content)).toString();
+        if (source.startsWith("\uFEFF")) source = source.substring(1);
         LoaderOptions options = new LoaderOptions();
         options.setAllowDuplicateKeys(false);
         options.setMaxAliasesForCollections(50);
@@ -252,8 +254,12 @@ final class Profile {
 
     // Always merge into the saved subscription source, never into an earlier merged profile.
     static byte[] withAppRules(byte[] source, Map<String, String> applications) throws IOException {
+        return withPersonalRules(source, applications, java.util.Collections.emptyList());
+    }
+
+    static byte[] withPersonalRules(byte[] source, Map<String, String> applications, List<PersonalRules.Rule> personal) throws IOException {
         byte[] base = repairDns(normalize(source));
-        if (applications.isEmpty()) return base;
+        if (applications.isEmpty() && personal.isEmpty()) return base;
         Yaml yaml = new Yaml();
         MappingNode root = routingRoot(base);
         Set<String> targets = new HashSet<>(routingTargets(base));
@@ -268,6 +274,16 @@ final class Profile {
             }
             rules.add(yaml.represent("PROCESS-NAME," + entry.getKey() + "," + entry.getValue()));
         }
+        Set<String> unique = new HashSet<>();
+        if (personal.size() > 2000) throw new IOException("自定义规则最多 2000 条。");
+        for (PersonalRules.Rule saved : personal) {
+            PersonalRules.Rule rule = PersonalRules.create(saved.type(), saved.value(), saved.target());
+            if (!targets.contains(rule.target()) && !rule.target().equals("REJECT")) {
+                throw new IOException("自定义规则「" + rule.value() + "」指定的出口已不存在，请先调整自定义分流。");
+            }
+            if (!unique.add(rule.type() + "," + rule.value())) throw new IOException("有重复的自定义规则。");
+            rules.add(yaml.represent(rule.line()));
+        }
         for (NodeTuple tuple : root.getValue()) {
             if (!keyOf(tuple).equals("rules")) continue;
             if (!(tuple.getValueNode() instanceof SequenceNode imported)) {
@@ -275,8 +291,8 @@ final class Profile {
             }
             rules.addAll(imported.getValue());
         }
-        root.getValue().removeIf(tuple -> keyOf(tuple).equals("rules") || keyOf(tuple).equals("find-process-mode"));
-        root.getValue().add(new NodeTuple(yaml.represent("find-process-mode"), yaml.represent("always")));
+        root.getValue().removeIf(tuple -> keyOf(tuple).equals("rules") || !applications.isEmpty() && keyOf(tuple).equals("find-process-mode"));
+        if (!applications.isEmpty()) root.getValue().add(new NodeTuple(yaml.represent("find-process-mode"), yaml.represent("always")));
         root.getValue().add(new NodeTuple(yaml.represent("rules"), new SequenceNode(Tag.SEQ, rules,
             org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK)));
         StringWriter output = new StringWriter();

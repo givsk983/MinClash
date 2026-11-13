@@ -113,6 +113,7 @@ public final class MainActivity extends Activity {
     private AlertDialog backgroundDialog;
     private AlertDialog policyDialog;
     private AlertDialog backupPasswordDialog;
+    private AlertDialog managementDialog;
     private boolean resumed;
     private TextView subscriptionSummary;
     private SubscriptionCatalog subscriptionCatalog;
@@ -122,6 +123,9 @@ public final class MainActivity extends Activity {
     private record ProxySummary(Controller.Mode mode, String node) {}
     private ProxySummary proxySummary;
     private Button routingButton;
+    private Button personalRulesButton;
+    private Button connectionsButton;
+    private record RulesScreen(RoutingStore.State state, int generation, List<String> targets) {}
     private String routingFilter = AppCategories.APPS;
     private String routingQuery = "";
     private final AppRouting.Loader routingLoader = new AppRouting.Loader();
@@ -240,6 +244,9 @@ public final class MainActivity extends Activity {
             control.setEllipsize(TextUtils.TruncateAt.END);
         }
         buttonRow(overview, modeButton, groupsButton, 10);
+        connectionsButton = button("连接管理", false);
+        connectionsButton.setOnClickListener(view -> startActivity(new Intent(this, ConnectionsActivity.class)));
+        add(overview, connectionsButton, 10);
         proxyHint = label("", 13, MUTED, false);
         add(overview, proxyHint, 10);
 
@@ -292,6 +299,9 @@ public final class MainActivity extends Activity {
         routingButton = button("管理应用分流", false);
         routingButton.setOnClickListener(view -> openAppRouting());
         add(routing, routingButton, 16);
+        personalRulesButton = button("自定义域名／IP 分流", false);
+        personalRulesButton.setOnClickListener(view -> execute("", this::readPersonalRules));
+        add(routing, personalRulesButton, 10);
         add(routing, label("在规则模式下生效。运行中保存会短暂重连。", 12, MUTED, false), 12);
         LinearLayout instructions = card(profiles, 14);
         add(instructions, label("开始使用", 15, TEXT, true), 0);
@@ -362,7 +372,7 @@ public final class MainActivity extends Activity {
 
         LinearLayout backups = card(preferences, 14);
         add(backups, label("备份与恢复", 17, TEXT, true), 0);
-        add(backups, label("备份配置、订阅、应用分流、分类、节点收藏及偏好。支持密码加密，恢复前可预览。", 13, MUTED, false), 8);
+        add(backups, label("备份配置、订阅、应用分流、自定义分流、分类、节点收藏及偏好。支持密码加密，恢复前可预览。", 13, MUTED, false), 8);
         backupExportButton = button("导出备份", false);
         backupExportButton.setOnClickListener(view -> showBackupExport());
         backupImportButton = button("从备份恢复", false);
@@ -659,6 +669,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        if (managementDialog != null) managementDialog.dismiss();
         if (policyDialog != null) policyDialog.dismiss();
         if (backupPasswordDialog != null) backupPasswordDialog.dismiss();
         if (backgroundDialog != null) backgroundDialog.dismiss();
@@ -974,13 +985,20 @@ public final class MainActivity extends Activity {
             autoUpdateSwitch.setChecked(appPreferences().getBoolean(SubscriptionUpdateJob.ENABLED, false));
         }
         render();
-        if (busy || backgroundDialog != null) return;
-        if (showBackgroundError(background.backup) || showBackgroundError(background.updateDownload) || showBackgroundError(background.preview)
+        if (busy || backgroundDialog != null || managementDialog != null && managementDialog.isShowing()) return;
+        if (showBackgroundError(background.usage) || showBackgroundError(background.backup) || showBackgroundError(background.updateDownload) || showBackgroundError(background.preview)
             || showBackgroundError(background.updateCheck)) {
             render();
             return;
         }
         if (background.updateDownload.outcome() != null) background.updateDownload.clearResult();
+        if (background.usage.outcome() != null) {
+            BackgroundWork.UsageResult result = background.usage.outcome().value();
+            AlertDialog shown = usageDialog(result.entry(), result.value(), () -> dismissBackgroundResult(background.usage));
+            backgroundDialog = shown;
+            worker.execute(this::refreshSubscriptionCatalog);
+            return;
+        }
         if (background.backup.outcome() != null) {
             showBackupResult(background.backup.outcome().value());
             return;
@@ -1053,11 +1071,28 @@ public final class MainActivity extends Activity {
         if (entries.isEmpty()) {
             dialog.setMessage("还没有保存的订阅。可添加 Clash / Mihomo 订阅链接。");
         } else {
-            String[] names = entries.stream().map(entry -> entry.name() +
-                (entry.address().equals(subscriptions.activeAddress()) ? "  ·  当前使用" : "")).toArray(String[]::new);
-            dialog.setItems(names, (view, index) -> showSubscriptionActions(entries.get(index)));
+            AppUi ui = new AppUi(this);
+            AppUi.Summaries adapter = ui.new Summaries();
+            List<AppUi.Summary> rows = new ArrayList<>();
+            for (int i = 0; i < entries.size(); i++) {
+                SubscriptionCatalog.Entry entry = entries.get(i);
+                rows.add(new AppUi.Summary(entry.name(), SubscriptionUsage.load(appPreferences(), entry.address()).summary(),
+                    entry.address().equals(subscriptions.activeAddress()) ? "当前使用" : "", i));
+            }
+            adapter.set(rows); dialog.setAdapter(adapter, (view, index) -> {
+                AppUi.Summary row = adapter.getItem(index); if (row != null) showSubscriptionActions(entries.get(row.sourceIndex()));
+            });
         }
-        dialog.show();
+        AlertDialog shown = dialog.show(); trackManagement(shown); if (!entries.isEmpty()) new AppUi(this).styleList(shown);
+    }
+
+    private void trackManagement(AlertDialog dialog) {
+        if (managementDialog != null && managementDialog != dialog) managementDialog.dismiss();
+        managementDialog = dialog;
+        dialog.setOnDismissListener(view -> {
+            if (managementDialog == dialog) managementDialog = null;
+            main.post(this::deliverBackgroundResults);
+        });
     }
 
     private void showSubscriptionActions(SubscriptionCatalog.Entry entry) {
@@ -1066,21 +1101,72 @@ public final class MainActivity extends Activity {
         List<String> actions = new ArrayList<>();
         if (canApplySubscription()) actions.add(use);
         actions.add("重命名");
+        actions.add("流量与有效期");
         if (!active) actions.add("删除");
-        new AlertDialog.Builder(this).setTitle(entry.name())
+        trackManagement(new AlertDialog.Builder(this).setTitle(entry.name())
             .setItems(actions.toArray(new String[0]), (dialog, index) -> {
                 switch (actions.get(index)) {
+                    case "流量与有效期" -> showUsage(entry);
                     case "重命名" -> renameSubscription(entry);
-                    case "删除" -> new AlertDialog.Builder(this).setTitle("删除订阅")
+                    case "删除" -> trackManagement(new AlertDialog.Builder(this).setTitle("删除订阅")
                         .setMessage("从列表移除「" + entry.name() + "」？")
                         .setNegativeButton("取消", null).setPositiveButton("删除", (view, which) -> {
                             List<SubscriptionCatalog.Entry> entries = new ArrayList<>(subscriptions.entries());
                             entries.remove(entry);
                             saveSubscriptions(entries, "已删除订阅。");
-                        }).show();
+                        }).show());
                     default -> activateSubscription(entry);
                 }
-            }).setNegativeButton("返回", (dialog, which) -> showSubscriptions()).show();
+            }).setNegativeButton("返回", (dialog, which) -> showSubscriptions()).show());
+    }
+
+    private void showUsage(SubscriptionCatalog.Entry entry) {
+        trackManagement(usageDialog(entry, SubscriptionUsage.load(appPreferences(), entry.address()), null));
+    }
+
+    private AlertDialog usageDialog(SubscriptionCatalog.Entry entry, SubscriptionUsage usage, Runnable dismiss) {
+        AppUi ui = new AppUi(this);
+        LinearLayout form = ui.column(); form.setPadding(dp(20), dp(8), dp(20), dp(8));
+        ui.add(form, ui.label(entry.name(), 14, MINT, true), 0);
+        ui.add(form, ui.label(usage.checkedAt() == 0 ? "尚未读取" : usage.used() < 0 ? "用量未提供" : SubscriptionUsage.bytes(usage.used()), 28, TEXT, true), 12);
+        ui.add(form, ui.label("已用流量 / 总额 " + SubscriptionUsage.bytes(usage.total()), 12, MUTED, false), 4);
+        if (usage.used() >= 0 && usage.total() > 0) {
+            android.widget.ProgressBar progress = new android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+            progress.setMax(1000); progress.setProgress((int) Math.min(1000, (double) usage.used() / usage.total() * 1000));
+            progress.setProgressTintList(ColorStateList.valueOf(usage.used() > usage.total() ? AMBER : MINT));
+            ui.add(form, progress, 12);
+        }
+        String expiry = usage.expire() < 0 ? "未提供" : java.text.DateFormat.getDateTimeInstance().format(new java.util.Date(usage.expire() * 1000));
+        boolean expired = usage.expire() > 0 && usage.expire() <= System.currentTimeMillis() / 1000;
+        ui.add(form, ui.label("剩余  " + SubscriptionUsage.bytes(usage.remaining()) + "\n上传  " + SubscriptionUsage.bytes(usage.upload())
+            + "\n下载  " + SubscriptionUsage.bytes(usage.download()), 14, TEXT, false), 14);
+        ui.add(form, ui.label("到期时间  " + expiry + (expired ? " · 已到期" : ""), 13, expired ? AMBER : MUTED, false), 14);
+        ui.add(form, ui.label("最近读取  " + (usage.checkedAt() == 0 ? "尚未读取" : java.text.DateFormat.getDateTimeInstance().format(new java.util.Date(usage.checkedAt()))), 11, MUTED, false), 8);
+        ui.add(form, ui.label(usage.checkedAt() == 0 ? "点击刷新读取服务商用量，不会切换订阅或应用配置。"
+            : "服务商返回的最近一次快照，不是实时流量。缺失字段明确标注；总额 0 不推断是否不限量。", 11, MUTED, false), 12);
+        ScrollView scroll = new ScrollView(this); scroll.addView(form);
+        return new AlertDialog.Builder(this).setTitle("流量与有效期").setView(scroll)
+            .setNegativeButton("关闭", (view, which) -> { if (dismiss != null) dismiss.run(); })
+            .setOnCancelListener(view -> { if (dismiss != null) dismiss.run(); })
+            .setPositiveButton("刷新用量", (view, which) -> { if (dismiss != null) dismiss.run(); refreshUsage(entry); }).show();
+    }
+
+    private void refreshUsage(SubscriptionCatalog.Entry entry) {
+                if (background.usage.running() || background.usage.outcome() != null) { showMessage("正在读取另一份订阅用量，请稍后重试。"); return; }
+                Context context = getApplicationContext();
+                background.usage.start(BackgroundWork.DOWNLOADS, () -> {
+                    SubscriptionUsage usage = Subscription.usage(entry.address());
+                    return worker.submit(() -> {
+                        SharedPreferences prefs = context.getSharedPreferences("MainActivity", MODE_PRIVATE);
+                        SubscriptionCatalog catalog = new SubscriptionCatalog(prefs, new RoutingStore(context));
+                        if (catalog.load().entries().stream().noneMatch(saved -> saved.address().equals(entry.address()))) {
+                            throw new IOException("此订阅已被移除，未保存用量。");
+                        }
+                        usage.save(prefs, entry.address());
+                        return new BackgroundWork.UsageResult(entry, usage);
+                    }).get();
+                });
+                showMessage("正在读取服务商用量，不会切换或应用配置…");
     }
 
     private EditText subscriptionInput(String hint, int inputType) {
@@ -1111,6 +1197,7 @@ public final class MainActivity extends Activity {
         if (canActivate) builder.setNeutralButton("仅保存", null);
         AlertDialog dialog = builder.show();
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> addSubscription(dialog, nameInput, input, canActivate));
+        trackManagement(dialog);
         if (canActivate) dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
             .setOnClickListener(view -> addSubscription(dialog, nameInput, input, false));
     }
@@ -1149,6 +1236,7 @@ public final class MainActivity extends Activity {
         add(content, input, 0);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("重命名订阅")
             .setView(content).setNegativeButton("取消", null).setPositiveButton("保存", null).show();
+        trackManagement(dialog);
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
             String name = input.getText().toString().trim();
             if (name.isEmpty()) { input.setError("请输入订阅名称。"); return; }
@@ -1175,10 +1263,15 @@ public final class MainActivity extends Activity {
     private void previewSubscription(SubscriptionCatalog.Entry entry, boolean adding) {
         Context context = getApplicationContext();
         if (background.preview.start(BackgroundWork.DOWNLOADS, () -> {
-            byte[] source = Subscription.fetch(entry.address());
+            Subscription.Download downloaded = Subscription.download(entry.address());
+            byte[] source = downloaded.source();
             // Snapshot and configuration writes share the same queue; downloading does not.
             try {
                 return worker.submit(() -> {
+                    if (adding || new SubscriptionCatalog(context.getSharedPreferences("MainActivity", MODE_PRIVATE), new RoutingStore(context))
+                        .load().entries().stream().anyMatch(saved -> saved.address().equals(entry.address()))) {
+                        downloaded.usage().cache(context.getSharedPreferences("MainActivity", MODE_PRIVATE), entry.address());
+                    }
                     Module.Status current = Module.status();
                     List<Controller.Group> selections = null;
                     if (hasProxyControl(current)) {
@@ -1438,11 +1531,11 @@ public final class MainActivity extends Activity {
             for (Object value : data.preferences().values()) if (value instanceof Set<?> set) favorites += set.size();
             try { categories = new org.json.JSONArray((String) data.preferences().getOrDefault("routing_categories", "[]")).length(); }
             catch (org.json.JSONException invalid) { /* Already validated by BackupArchive. */ }
-            String summary = "备份版本  " + data.appVersion() + "\n备份时间  "
+            String summary = "自定义分流  " + data.state().rules().size() + " 条\n备份版本  " + data.appVersion() + "\n备份时间  "
                 + java.text.DateFormat.getDateTimeInstance().format(new java.util.Date(data.createdAt()))
                 + "\n订阅  " + data.subscriptions().size() + " 个\n应用分流  " + data.state().applications().size()
                 + " 项\n自定义分类  " + categories + " 个\n节点收藏  " + favorites + " 项\n配置  " + data.state().source().length / 1024 + " KiB"
-                + "\n\n将替换当前配置、全部订阅、应用分流、分类、收藏和订阅自动更新／节点列表偏好。"
+                + "\n\n将替换当前配置、全部订阅、应用分流、自定义分流、分类、收藏和订阅自动更新／节点列表偏好。"
                 + "\n\n请先停止 TUN。恢复后不会自动启动 TUN；通知、图标、系统授权、开机与热点设置保留本机选择。";
             AlertDialog dialog = textDialog("恢复备份 · 内容预览", summary)
                 .setNegativeButton("取消", (view, which) -> dismissBackgroundResult(background.backup))
@@ -2374,10 +2467,132 @@ public final class MainActivity extends Activity {
                     Map<String, String> rules = new TreeMap<>(latest.applications());
                     if (target.isEmpty()) rules.remove(app.packageName());
                     else rules.put(app.packageName(), target);
-                    routing.apply(new RoutingStore.State(latest.source(), rules, latest.subscription()));
+                    routing.apply(latest.withApplications(rules));
                     return routingLoader.load(this, appPreferences().getBoolean(ROOT_INVENTORY, false), Module.status());
                 });
             }).show();
+    }
+
+    private RulesScreen readPersonalRules() throws Exception {
+        RoutingStore.State state = new RoutingStore(this).load();
+        List<String> targets = Profile.routingTargets(state.source());
+        targets.add("REJECT");
+        return new RulesScreen(state, RoutingStore.generation(), targets);
+    }
+
+    private void showPersonalRules(RulesScreen screen) {
+        List<PersonalRules.Rule> rules = screen.state().rules();
+        AppUi ui = new AppUi(this);
+        LinearLayout heading = column();
+        heading.setPadding(dp(20), dp(16), dp(20), dp(12));
+        add(heading, label("自定义分流", 20, TEXT, true), 0);
+        add(heading, label("应用分流 → 本列表顺序 → 订阅规则", 12, MUTED, false), 6);
+        EditText search = ui.search("搜索域名、网段或出口"); add(heading, search, 12);
+        TextView count = label("共 " + rules.size() + " 条 · 仅规则模式生效", 11, MUTED, false); add(heading, count, 8);
+        AppUi.Summaries adapter = ui.new Summaries();
+        java.util.function.Consumer<String> filter = query -> {
+            List<AppUi.Summary> rows = new ArrayList<>();
+            for (int i = 0; i < rules.size(); i++) {
+                PersonalRules.Rule rule = rules.get(i);
+                String type = new String[] {"精确域名", "域名及子域名", "IPv4 网段", "IPv6 网段"}[java.util.Arrays.asList(PersonalRules.TYPES).indexOf(rule.type())];
+                if ((type + " " + rule.type() + " " + rule.value() + " " + rule.target()).toLowerCase(Locale.ROOT).contains(query.toLowerCase(Locale.ROOT).trim())) {
+                    rows.add(new AppUi.Summary(rule.value(), type + " · 出口 " + Controller.outletLabel(rule.target()), "#" + (i + 1), i));
+                }
+            }
+            adapter.empty(rules.isEmpty() ? "还没有自定义规则\n点击“添加规则”开始设置" : "没有匹配的规则\n试试清空搜索或更换关键词");
+            adapter.set(rows); count.setText("共 " + rules.size() + " 条 · 匹配 " + rows.size() + " 条 · 规则模式生效");
+        };
+        filter.accept("");
+        search.addTextChangedListener(new TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            public void onTextChanged(CharSequence s, int start, int before, int count) { filter.accept(s.toString()); }
+            public void afterTextChanged(Editable value) {}
+        });
+        AlertDialog.Builder builder = new AlertDialog.Builder(this).setCustomTitle(heading)
+            .setAdapter(adapter, null)
+            .setNegativeButton("关闭", null).setPositiveButton("添加规则", (dialog, which) -> editPersonalRule(screen, -1));
+        AlertDialog shown = builder.show(); trackManagement(shown); ui.styleList(shown); enableSearchKeyboard(shown);
+        shown.getListView().setOnItemClickListener((parent, view, position, id) -> {
+            AppUi.Summary row = adapter.getItem(position); if (row == null) return;
+            int index = row.sourceIndex(); shown.dismiss();
+            List<String> actions = new ArrayList<>(); actions.add("编辑");
+            if (index > 0) actions.add("上移"); if (index + 1 < rules.size()) actions.add("下移"); actions.add("删除");
+            trackManagement(new AlertDialog.Builder(this).setTitle(rules.get(index).value())
+                .setItems(actions.toArray(new String[0]), (selection, which) -> {
+                    String choice = actions.get(which);
+                    if (choice.equals("编辑")) { editPersonalRule(screen, index); return; }
+                    List<PersonalRules.Rule> changed = new ArrayList<>(rules);
+                    if (choice.equals("删除")) {
+                        trackManagement(new AlertDialog.Builder(this).setTitle("删除这条规则？")
+                            .setMessage(rules.get(index).type() + " · " + rules.get(index).value())
+                            .setNegativeButton("取消", (confirm, buttonIndex) -> showPersonalRules(screen))
+                            .setPositiveButton("删除", (confirm, item) -> { changed.remove(index); savePersonalRules(screen, changed); }).show());
+                    } else {
+                        int next = choice.equals("上移") ? index - 1 : index + 1;
+                        if (next >= 0 && next < changed.size()) {
+                            java.util.Collections.swap(changed, index, next);
+                            savePersonalRules(screen, changed);
+                        } else showPersonalRules(screen);
+                    }
+                }).setNegativeButton("返回", (selection, which) -> showPersonalRules(screen)).show());
+        });
+    }
+
+    private void editPersonalRule(RulesScreen screen, int index) {
+        AppUi ui = new AppUi(this);
+        PersonalRules.Rule original = index < 0 ? null : screen.state().rules().get(index);
+        LinearLayout form = column();
+        form.setPadding(dp(20), dp(4), dp(20), dp(4));
+        android.widget.Spinner type = new android.widget.Spinner(this);
+        type.setAdapter(ui.spinner(
+            new String[] {"精确域名", "域名及子域名", "IPv4 地址／网段", "IPv6 地址／网段"}));
+        type.setSelection(original == null ? 1 : java.util.Arrays.asList(PersonalRules.TYPES).indexOf(original.type()));
+        add(form, type, 0);
+        EditText value = subscriptionInput("example.com 或 192.0.2.0/24", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        value.setFilters(new android.text.InputFilter[] {new android.text.InputFilter.LengthFilter(1024)});
+        if (original != null) value.setText(original.value());
+        add(form, value, 8);
+        type.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            public void onNothingSelected(android.widget.AdapterView<?> parent) {}
+            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                value.setHint(position < 2 ? "example.com" : position == 2 ? "192.0.2.0/24 或单个 IPv4" : "2001:db8::/32 或单个 IPv6");
+            }
+        });
+        add(form, label("出口", 12, MUTED, true), 12);
+        android.widget.Spinner target = new android.widget.Spinner(this);
+        target.setAdapter(ui.spinner(
+            screen.targets().stream().map(Controller::outletLabel).toArray(String[]::new)));
+        target.setSelection(original == null ? 0 : Math.max(0, screen.targets().indexOf(original.target())));
+        add(form, target, 4);
+        add(form, label("域名不填写协议、路径或通配符。IP 规则不额外触发域名解析，单个 IP 可省略前缀长度。", 12, MUTED, false), 10);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(form);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(original == null ? "添加分流规则" : "编辑分流规则")
+            .setView(scroll).setNegativeButton("取消", (view, which) -> showPersonalRules(screen)).setPositiveButton("保存", null).show();
+        trackManagement(dialog);
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+            try {
+                PersonalRules.Rule rule = PersonalRules.create(PersonalRules.TYPES[type.getSelectedItemPosition()],
+                    value.getText().toString(), screen.targets().get(target.getSelectedItemPosition()));
+                List<PersonalRules.Rule> changed = new ArrayList<>(screen.state().rules());
+                if (index < 0) changed.add(rule); else changed.set(index, rule);
+                if (changed.size() > 2000) throw new IOException("自定义规则最多 2000 条。");
+                Set<String> unique = new LinkedHashSet<>();
+                for (PersonalRules.Rule item : changed) if (!unique.add(item.type() + "," + item.value())) throw new IOException("有重复的自定义规则。");
+                dialog.dismiss();
+                savePersonalRules(screen, changed);
+            } catch (IOException error) { value.setError(error.getMessage()); }
+        });
+    }
+
+    private void savePersonalRules(RulesScreen screen, List<PersonalRules.Rule> rules) {
+        execute("自定义规则已保存。", true, () -> {
+            if (screen.generation() != RoutingStore.generation()) throw new IOException("配置已变化，请重新打开自定义分流。");
+            RoutingStore store = new RoutingStore(this);
+            RoutingStore.State latest = store.load();
+            store.apply(latest.withRules(rules));
+            return readPersonalRules();
+        });
     }
 
     private void showAppConnections(AppRouting.Entry app) {
@@ -2479,6 +2694,7 @@ public final class MainActivity extends Activity {
                         if (result instanceof DiagnosticReport report) showDiagnosticReport(report.text());
                         if (result instanceof Controller.Mode mode) showModes(mode);
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
+                        if (result instanceof RulesScreen screen) showPersonalRules(screen);
                         if (result instanceof AppRouting.Screen screen) {
                             checkNetworkAfterStatus(screen.status(), summary, checkConnection);
                             status = screen.status();
@@ -2562,7 +2778,8 @@ public final class MainActivity extends Activity {
         String current = active != null ? "当前订阅 · " + active.name()
             : installed && status.profile ? "本地配置已就绪" : "尚未启用订阅";
         profileSummary.setText(installed && status.profile ? current : "尚未导入配置");
-        if (subscriptions != null) subscriptionSummary.setText(current);
+        if (subscriptions != null) subscriptionSummary.setText(current + (active == null ? "" : "\n"
+            + SubscriptionUsage.load(appPreferences(), active.address()).summary()));
         if (busy) refreshButton.setText("处理中…");
         else refreshButton.setText(installed ? "刷新状态" : "检测环境");
         toggle.setText(status == null ? "检测环境" : !installed ? "前往安装模块" : isActive() ? "停止 TUN" : "启动 TUN");
@@ -2583,6 +2800,8 @@ public final class MainActivity extends Activity {
         setProxyButtonText(modeButton, "代理模式", proxySummary == null ? unavailable : proxySummary.mode().label + "模式");
         setProxyButtonText(groupsButton, "代理组与节点", proxySummary == null ? unavailable : proxySummary.node());
         routingButton.setEnabled(!busy && enabled && status.profile);
+        personalRulesButton.setEnabled(!busy && enabled && status.profile);
+        connectionsButton.setEnabled(!busy && hasProxyControl(status));
         proxyHint.setText(installed && !status.control ? "请升级 MinClash Root 模块以使用代理控制。"
             : installed && status.state.equals("running") ? "全局模式使用 GLOBAL 组。"
             : "TUN 启动后可切换模式和节点。");
@@ -2605,6 +2824,7 @@ public final class MainActivity extends Activity {
         installButton.setText(pending ? "等待重启" : moduleUpdate ? "更新模块"
             : installed ? "重新安装模块" : "安装内置模块");
         installButton.setEnabled(!busy && !pending && bundledModule.valid());
+        if (installButton.isActivated() != (!installed || moduleUpdate)) styleButton(installButton, !installed || moduleUpdate);
         exportButton.setEnabled(!busy && bundledModule.valid());
         boolean backupIdle = !busy && !background.backup.running() && background.backup.outcome() == null
             && background.pendingExport == null;
@@ -2774,13 +2994,18 @@ public final class MainActivity extends Activity {
         button.setPadding(dp(12), dp(12), dp(12), dp(12));
         button.setStateListAnimator(null);
         button.setGravity(Gravity.CENTER);
+        styleButton(button, primary);
+        return button;
+    }
+
+    private void styleButton(Button button, boolean primary) {
+        button.setActivated(primary);
         StateListDrawable states = new StateListDrawable();
         states.addState(new int[] {-android.R.attr.state_enabled}, shape(0xff202c36, 14, false));
         states.addState(new int[] {}, shape(primary ? MINT : 0xff202e3a, 14, !primary));
         button.setBackground(new RippleDrawable(ColorStateList.valueOf(primary ? 0x22000000 : 0x2279e7c9), states, null));
         button.setTextColor(new ColorStateList(new int[][] {{-android.R.attr.state_enabled}, {}},
             new int[] {0xff708390, primary ? Color.rgb(8, 39, 34) : TEXT}));
-        return button;
     }
 
     private GradientDrawable shape(int color, int radius, boolean border) {

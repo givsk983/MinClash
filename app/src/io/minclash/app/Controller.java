@@ -44,6 +44,11 @@ final class Controller {
 
     static JSONObject connections() throws Exception { return new JSONObject(probe("/connections")); }
 
+    static void closeConnection(String id) throws Exception {
+        if (!ConnectionSnapshot.validId(id)) throw new IOException("连接标识无效，请刷新列表。");
+        request("DELETE", "/connections/" + Uri.encode(id), "", false, true);
+    }
+
     static boolean identifiesAllProcesses() throws Exception {
         return new JSONObject(probe("/configs")).optString("find-process-mode").equalsIgnoreCase("always");
     }
@@ -211,6 +216,10 @@ final class Controller {
     }
 
     private static String request(String method, String path, String body, boolean probe) throws Exception {
+        return request(method, path, body, probe, false);
+    }
+
+    private static String request(String method, String path, String body, boolean probe, boolean missingOkay) throws Exception {
         String request = method + " " + path + " HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n"
             + "Content-Type: application/json\r\nContent-Length: " + body.getBytes(StandardCharsets.UTF_8).length
             + "\r\n\r\n" + body;
@@ -218,15 +227,7 @@ final class Controller {
         // Read-only probes can outlive a core restart and must not hold the module's action lock.
         String reply = probe ? Module.runRoot("exec /data/adb/modules/minclash/bin/socket-request /data/adb/minclash/control.sock",
             Module.Command.API, payload, 10) : Module.run(Module.Command.API, payload);
-        int headerEnd = reply.indexOf("\r\n\r\n");
-        int lineEnd = reply.indexOf("\r\n");
-        if (headerEnd < 0 || lineEnd < 0) throw new IOException("无法读取 Mihomo 控制响应。");
-        String status = reply.substring(0, lineEnd);
-        if (!status.startsWith("HTTP/1.0 200 ") && !status.startsWith("HTTP/1.0 204 ")
-            && !status.startsWith("HTTP/1.1 200 ") && !status.startsWith("HTTP/1.1 204 ")) {
-            throw new IOException("Mihomo 拒绝了操作，请重新打开代理组后重试。");
-        }
-        return reply.substring(headerEnd + 4);
+        return ControlResponse.body(reply, missingOkay);
     }
 
     private Controller() {}

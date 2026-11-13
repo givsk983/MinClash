@@ -22,6 +22,11 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
         removed.removeAll(candidate.nodes());
         List<String> conflicts = new ArrayList<>();
         if (current != null) {
+            for (PersonalRules.Rule rule : current.rules()) {
+                if (!rule.target().equals("DIRECT") && !rule.target().equals("REJECT") && !candidate.groups().containsKey(rule.target())) {
+                    conflicts.add("自定义 " + rule.value() + " → " + rule.target());
+                }
+            }
             for (Map.Entry<String, String> rule : current.applications().entrySet()) {
                 if (!rule.getValue().equals("DIRECT") && !candidate.groups().containsKey(rule.getValue())) {
                     conflicts.add(rule.getKey() + " → " + rule.getValue());
@@ -45,8 +50,8 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
         StringBuilder summary = new StringBuilder("比较订阅 YAML 中声明的节点。动态提供者的成员以加载后的实际列表为准。");
         append(summary, "新增节点", added);
         append(summary, "移除节点", removed);
-        append(summary, "失效的应用分流", conflicts);
-        if (!conflicts.isEmpty()) summary.append("\n请先在应用分流中调整这些出口，再重新预览。");
+        append(summary, "失效的应用分流／自定义规则", conflicts);
+        if (!conflicts.isEmpty()) summary.append("\n请先调整这些个人分流的出口，再重新预览。");
         if (selections == null) summary.append("\n\n当前节点选择暂不可读取。");
         else append(summary, "预计无法沿用的节点选择", lost);
         return new SubscriptionPreview(entry, source, generation, adding, summary.toString(), !conflicts.isEmpty());

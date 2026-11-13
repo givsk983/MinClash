@@ -120,7 +120,7 @@ final class BackupArchive {
             String text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(payload)).toString();
             checkDepth(text);
             JSONObject object = new JSONObject(text);
-            if (!(object.get("version") instanceof Integer version) || version != 1) throw new IOException("备份数据版本不受支持。");
+            if (!(object.get("version") instanceof Integer version) || version != 1 && version != 2) throw new IOException("备份数据版本不受支持。");
             String source = string(object.get("source"), Profile.MAX_BYTES);
             byte[] normalized = Profile.normalize(source.getBytes(StandardCharsets.UTF_8));
             JSONObject applications = object.getJSONObject("applications");
@@ -130,7 +130,8 @@ final class BackupArchive {
                 String name = keys.next();
                 rules.put(name, string(applications.get(name), 4096));
             }
-            Profile.withAppRules(normalized, rules);
+            List<PersonalRules.Rule> personal = PersonalRules.parse(version == 1 ? null : object.getJSONArray("personalRules"));
+            Profile.withPersonalRules(normalized, rules, personal);
             List<SubscriptionCatalog.Entry> subscriptions = new ArrayList<>();
             Set<String> addresses = new HashSet<>();
             JSONArray entries = object.getJSONArray("subscriptions");
@@ -146,7 +147,7 @@ final class BackupArchive {
             String active = string(object.get("active"), 8192);
             if (!active.isEmpty() && !addresses.contains(active)) throw new IOException();
             Map<String, Object> settings = preferences(object.getJSONObject("preferences"));
-            return new Data(new RoutingStore.State(normalized, rules, active), Collections.unmodifiableList(subscriptions),
+            return new Data(new RoutingStore.State(normalized, rules, active, personal), Collections.unmodifiableList(subscriptions),
                 Collections.unmodifiableMap(settings), object.getLong("createdAt"), string(object.get("appVersion"), 64));
         } catch (Exception invalid) {
             throw new IOException("备份内容无效、版本不兼容或配置无法使用，未修改现有数据。", invalid);
@@ -163,7 +164,8 @@ final class BackupArchive {
         for (SubscriptionCatalog.Entry entry : data.subscriptions()) {
             subscriptions.put(new JSONObject().put("name", entry.name()).put("address", entry.address()));
         }
-        return new JSONObject().put("version", 1).put("createdAt", data.createdAt()).put("appVersion", data.appVersion())
+        return new JSONObject().put("version", 2).put("personalRules", PersonalRules.json(data.state().rules()))
+            .put("createdAt", data.createdAt()).put("appVersion", data.appVersion())
             .put("source", new String(data.state().source(), StandardCharsets.UTF_8))
             .put("applications", new JSONObject(data.state().applications())).put("active", data.state().subscription())
             .put("subscriptions", subscriptions).put("preferences", settings);

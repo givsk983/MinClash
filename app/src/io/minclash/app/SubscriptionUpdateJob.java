@@ -81,20 +81,21 @@ public final class SubscriptionUpdateJob extends JobService {
     private void download(JobParameters params, SubscriptionCatalog.Entry current, int generation) {
         if (active != params || !preferences().getBoolean(ENABLED, false)) { finish(params, null); return; }
         try {
-            byte[] source = Subscription.fetch(current.address());
-            RoutingStore.WORKER.execute(() -> apply(params, current, generation, source));
+            Subscription.Download downloaded = Subscription.download(current.address());
+            RoutingStore.WORKER.execute(() -> apply(params, current, generation, downloaded));
         } catch (Exception error) {
             finish(params, "更新失败，请在配置页手动重试");
         }
     }
 
-    private void apply(JobParameters params, SubscriptionCatalog.Entry current, int generation, byte[] source) {
+    private void apply(JobParameters params, SubscriptionCatalog.Entry current, int generation, Subscription.Download downloaded) {
         SharedPreferences preferences = preferences();
         String outcome = null;
         try {
             if (active != params || !preferences.getBoolean(ENABLED, false)) return;
             RoutingStore routing = new RoutingStore(this);
             SubscriptionCatalog.Entry latest = new SubscriptionCatalog(preferences, routing).load().active();
+            if (latest != null && latest.address().equals(current.address())) downloaded.usage().cache(preferences, current.address());
             if (generation != RoutingStore.generation() || latest == null || !latest.address().equals(current.address())) {
                 outcome = "跳过，下载期间配置或当前订阅已变化";
                 return;
@@ -104,7 +105,7 @@ public final class SubscriptionUpdateJob extends JobService {
                 outcome = "跳过，模块或配置未就绪";
                 return;
             }
-            routing.importProfile(source, current.address());
+            routing.importProfile(downloaded.source(), current.address());
             outcome = "更新成功";
         } catch (RoutingStore.SelectionRestoreFailure warning) {
             outcome = "已更新，请检查节点选择";

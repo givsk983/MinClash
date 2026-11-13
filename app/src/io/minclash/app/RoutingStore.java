@@ -34,13 +34,20 @@ final class RoutingStore {
         }
     }
 
-    record State(byte[] source, Map<String, String> applications, String subscription) {
+    record State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules) {
+        State(byte[] source, Map<String, String> applications, String subscription) {
+            this(source, applications, subscription, Collections.emptyList());
+        }
         State(byte[] source, Map<String, String> applications) { this(source, applications, null); }
 
         State {
             source = source.clone();
             applications = Collections.unmodifiableMap(new TreeMap<>(applications));
+            rules = Collections.unmodifiableList(new java.util.ArrayList<>(rules));
         }
+        State withSource(byte[] source, String subscription) { return new State(source, applications, subscription, rules); }
+        State withApplications(Map<String, String> applications) { return new State(source, applications, subscription, rules); }
+        State withRules(List<PersonalRules.Rule> rules) { return new State(source, applications, subscription, rules); }
     }
 
     private final AtomicFile file;
@@ -61,7 +68,7 @@ final class RoutingStore {
 
     void importProfile(byte[] source, String subscription) throws Exception {
         State saved = read();
-        apply(new State(source, saved == null ? Collections.emptyMap() : saved.applications(), subscription));
+        apply(saved == null ? new State(source, Collections.emptyMap(), subscription) : saved.withSource(source, subscription));
     }
 
     boolean repairDns() throws Exception {
@@ -80,6 +87,11 @@ final class RoutingStore {
     private State read() throws Exception {
         JSONObject object = readObject();
         if (object == null) return null;
+        return decodeState(object);
+    }
+
+    static State decodeState(JSONObject object) throws Exception {
+        if (object.getInt("version") != 1 && object.getInt("version") != 2) throw new IOException("应用分流设置版本不受支持。");
         JSONObject rules = object.getJSONObject("applications");
         Map<String, String> applications = new TreeMap<>();
         for (Iterator<String> keys = rules.keys(); keys.hasNext();) {
@@ -87,7 +99,7 @@ final class RoutingStore {
             applications.put(name, rules.getString(name));
         }
         return new State(Profile.normalize(object.getString("source").getBytes(StandardCharsets.UTF_8)), applications,
-            object.optString("subscription", null));
+            object.optString("subscription", null), PersonalRules.parse(object.getInt("version") == 1 ? null : object.getJSONArray("personalRules")));
     }
 
     private JSONObject readObject() throws Exception {
@@ -103,17 +115,23 @@ final class RoutingStore {
                 bytes.write(buffer, 0, count);
             }
             JSONObject object = new JSONObject(bytes.toString(StandardCharsets.UTF_8.name()));
-            if (object.getInt("version") != 1) throw new IOException("应用分流设置版本不受支持。");
+            if (object.getInt("version") != 1 && object.getInt("version") != 2) throw new IOException("应用分流设置版本不受支持。");
             return object;
         }
     }
 
-    private void save(State state) throws Exception {
+    static JSONObject encodeState(State state) throws Exception {
         JSONObject object = new JSONObject();
-        object.put("version", 1);
+        object.put("version", 2);
+        object.put("personalRules", PersonalRules.json(state.rules()));
         object.put("source", new String(state.source(), StandardCharsets.UTF_8));
         object.put("applications", new JSONObject(state.applications()));
         object.put("subscription", state.subscription());
+        return object;
+    }
+
+    private void save(State state) throws Exception {
+        JSONObject object = encodeState(state);
         byte[] bytes = object.toString().getBytes(StandardCharsets.UTF_8);
         FileOutputStream output = null;
         try {
@@ -155,7 +173,7 @@ final class RoutingStore {
     }
 
     void apply(State state) throws Exception {
-        apply(Profile.withAppRules(state.source(), state.applications()), state);
+        apply(Profile.withPersonalRules(state.source(), state.applications(), state.rules()), state);
     }
 
     private void apply(byte[] merged, State state) throws Exception {
