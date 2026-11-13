@@ -73,6 +73,8 @@ public final class MainActivity extends Activity {
     private static final int APP_LIST_SETTINGS = 4;
     private static final int REQUEST_NOTIFICATIONS = 5;
     private static final int UPDATE_INSTALL_PERMISSION = 6;
+    private static final int EXPORT_BACKUP = 7;
+    private static final int IMPORT_BACKUP = 8;
     static final String NOTIFICATION_CONTROL = "notification_control";
     private static final String ROOT_INVENTORY = "root_app_inventory";
     private static final int BG = 0xff0d131a;
@@ -109,6 +111,8 @@ public final class MainActivity extends Activity {
     private AppUpdate.Release pendingUpdate;
     private BackgroundWork background;
     private AlertDialog backgroundDialog;
+    private AlertDialog policyDialog;
+    private AlertDialog backupPasswordDialog;
     private boolean resumed;
     private TextView subscriptionSummary;
     private SubscriptionCatalog subscriptionCatalog;
@@ -140,6 +144,8 @@ public final class MainActivity extends Activity {
     private Button overlayPermissionButton;
     private Button foregroundAppButton;
     private Button launcherIconButton;
+    private Button backupExportButton;
+    private Button backupImportButton;
     private ImageView aboutLogo;
     private Button installButton;
     private Button exportButton;
@@ -170,6 +176,7 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         Object retained = getLastNonConfigurationInstance();
         background = retained instanceof BackgroundWork work ? work : new BackgroundWork();
+        busy = background.backupRestoring;
         routingIcons = new AppIconLoader(this);
         subscriptionCatalog = new SubscriptionCatalog(appPreferences(), new RoutingStore(this));
         LinearLayout root = column();
@@ -352,6 +359,19 @@ public final class MainActivity extends Activity {
         launcherIconButton = button("", false);
         launcherIconButton.setOnClickListener(view -> showLauncherIcons());
         add(appearance, launcherIconButton, 10);
+
+        LinearLayout backups = card(preferences, 14);
+        add(backups, label("备份与恢复", 17, TEXT, true), 0);
+        add(backups, label("备份配置、订阅、应用分流、分类、节点收藏及偏好。支持密码加密，恢复前可预览。", 13, MUTED, false), 8);
+        backupExportButton = button("导出备份", false);
+        backupExportButton.setOnClickListener(view -> showBackupExport());
+        backupImportButton = button("从备份恢复", false);
+        backupImportButton.setOnClickListener(view -> {
+            Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE);
+            startActivityForResult(picker, IMPORT_BACKUP);
+        });
+        buttonRow(backups, backupExportButton, backupImportButton, 14);
+        add(backups, label("恢复会替换备份范围内的数据，请先停止 TUN。系统授权、通知、图标、开机与热点设置保留本机选择。", 12, MUTED, false), 10);
 
         LinearLayout moduleCard = card(preferences, 14);
         add(moduleCard, label("内置模块", 17, TEXT, true), 0);
@@ -639,6 +659,9 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        if (policyDialog != null) policyDialog.dismiss();
+        if (backupPasswordDialog != null) backupPasswordDialog.dismiss();
+        if (backgroundDialog != null) backgroundDialog.dismiss();
         background.stopObserving();
         main.removeCallbacks(poll);
         main.removeCallbacks(pollLatency);
@@ -943,14 +966,25 @@ public final class MainActivity extends Activity {
 
     private void deliverBackgroundResults() {
         if (!resumed || isDestroyed()) return;
+        if (background.backupRestoring && !background.backup.running() && background.backup.outcome() != null) {
+            background.backupRestoring = false;
+            busy = false;
+            invalidateAppRouting();
+            worker.execute(this::refreshSubscriptionCatalog);
+            autoUpdateSwitch.setChecked(appPreferences().getBoolean(SubscriptionUpdateJob.ENABLED, false));
+        }
         render();
         if (busy || backgroundDialog != null) return;
-        if (showBackgroundError(background.updateDownload) || showBackgroundError(background.preview)
+        if (showBackgroundError(background.backup) || showBackgroundError(background.updateDownload) || showBackgroundError(background.preview)
             || showBackgroundError(background.updateCheck)) {
             render();
             return;
         }
         if (background.updateDownload.outcome() != null) background.updateDownload.clearResult();
+        if (background.backup.outcome() != null) {
+            showBackupResult(background.backup.outcome().value());
+            return;
+        }
         if (background.preview.outcome() != null) {
             if (status == null) return;
             showSubscriptionPreview(background.preview.outcome().value());
@@ -1214,6 +1248,39 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == EXPORT_BACKUP) {
+            byte[] bytes = background.pendingExport;
+            background.pendingExport = null;
+            if (result != RESULT_OK || data == null || data.getData() == null) { render(); return; }
+            if (bytes == null) { showMessage("备份准备状态已丢失，请重新导出。"); return; }
+            Uri uri = data.getData();
+            Context context = getApplicationContext();
+            background.backup.start(BackgroundWork.DOWNLOADS, () -> {
+                try (OutputStream output = context.getContentResolver().openOutputStream(uri, "wt")) {
+                    if (output == null) throw new IOException("无法写入所选位置。");
+                    output.write(bytes);
+                }
+                return new BackgroundWork.BackupDone(false, null, "");
+            });
+            render();
+            return;
+        }
+        if (request == IMPORT_BACKUP) {
+            if (result != RESULT_OK || data == null || data.getData() == null) return;
+            Uri uri = data.getData();
+            Context context = getApplicationContext();
+            background.backup.start(BackgroundWork.DOWNLOADS, () -> {
+                byte[] bytes;
+                try (InputStream input = context.getContentResolver().openInputStream(uri)) {
+                    if (input == null) throw new IOException("无法读取所选备份。");
+                    bytes = BackupArchive.read(input);
+                }
+                return BackupArchive.encrypted(bytes) ? new BackgroundWork.BackupLocked(bytes, false)
+                    : decodeBackup(context, bytes, new char[0]);
+            });
+            render();
+            return;
+        }
         if (request == UPDATE_INSTALL_PERMISSION) {
             AppUpdate.Release release = pendingUpdate;
             pendingUpdate = null;
@@ -1248,6 +1315,185 @@ public final class MainActivity extends Activity {
             }
             return Module.status();
         });
+    }
+
+    private EditText backupPassword(String hint) {
+        EditText input = subscriptionInput(hint, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        input.setSaveEnabled(false);
+        input.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
+        input.setFilters(new android.text.InputFilter[] {new android.text.InputFilter.LengthFilter(256)});
+        return input;
+    }
+
+    private void showBackupExport() {
+        if (busy || background.backup.running() || background.backup.outcome() != null) return;
+        LinearLayout form = column();
+        form.setPadding(dp(20), dp(6), dp(20), dp(6));
+        add(form, label("包含订阅链接与节点凭据。建议设置密码；密码不会保存，遗忘后无法解密。", 13, MUTED, false), 0);
+        Switch encrypted = new Switch(this);
+        encrypted.setText("使用密码加密");
+        encrypted.setTextColor(TEXT);
+        encrypted.setChecked(true);
+        add(form, encrypted, 10);
+        EditText password = backupPassword("密码（至少 8 个字符）");
+        EditText confirmation = backupPassword("再次输入密码");
+        add(form, password, 8);
+        add(form, confirmation, 8);
+        TextView plainHint = label("未加密备份会直接包含订阅链接与节点凭据，请妥善保管。", 12, AMBER, false);
+        plainHint.setVisibility(View.GONE);
+        add(form, plainHint, 8);
+        encrypted.setOnCheckedChangeListener((view, checked) -> {
+            password.setVisibility(checked ? View.VISIBLE : View.GONE);
+            confirmation.setVisibility(checked ? View.VISIBLE : View.GONE);
+            plainHint.setVisibility(checked ? View.GONE : View.VISIBLE);
+        });
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(form);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("导出备份").setView(scroll)
+            .setNegativeButton("取消", null).setPositiveButton("选择保存位置", null).show();
+        backupPasswordDialog = dialog;
+        dialog.setOnDismissListener(view -> {
+            password.getText().clear();
+            confirmation.getText().clear();
+            backupPasswordDialog = null;
+        });
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+            if (encrypted.isChecked() && password.length() < 8) { password.setError("请设置至少 8 个字符的密码。"); return; }
+            if (encrypted.isChecked() && !password.getText().toString().equals(confirmation.getText().toString())) {
+                confirmation.setError("两次密码不一致。"); return;
+            }
+            char[] secret = new char[encrypted.isChecked() ? password.length() : 0];
+            password.getText().getChars(0, secret.length, secret, 0);
+            password.getText().clear();
+            confirmation.getText().clear();
+            dialog.dismiss();
+            Context context = getApplicationContext();
+            String version = appVersion();
+            if (!background.backup.start(BackgroundWork.DOWNLOADS, () -> {
+                try {
+                    BackupArchive.Data snapshot = worker.submit(() -> new BackupStore(context).capture(version)).get();
+                    byte[] bytes = BackupArchive.encode(snapshot, secret);
+                    // Exercise the same validation path before offering the file for export.
+                    BackupArchive.decode(bytes, secret);
+                    return new BackgroundWork.BackupExport(bytes);
+                } finally { java.util.Arrays.fill(secret, '\0'); }
+            })) java.util.Arrays.fill(secret, '\0');
+            showMessage("正在准备备份…");
+            render();
+        });
+    }
+
+    private static Object decodeBackup(Context context, byte[] bytes, char[] password) throws Exception {
+        try {
+            BackupArchive.Data data = BackupArchive.decode(bytes, password);
+            String stamp = worker.submit(() -> new BackupStore(context).stamp()).get();
+            return new BackgroundWork.BackupPreview(data, stamp);
+        } catch (BackupArchive.PasswordFailure incorrect) {
+            return new BackgroundWork.BackupLocked(bytes, true);
+        } finally { java.util.Arrays.fill(password, '\0'); }
+    }
+
+    private void showBackupResult(Object result) {
+        if (result instanceof BackgroundWork.BackupExport export) {
+            background.backup.clearResult();
+            background.pendingExport = export.bytes();
+            Intent picker = new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("application/octet-stream")
+                .addCategory(Intent.CATEGORY_OPENABLE).putExtra(Intent.EXTRA_TITLE,
+                    "MinClash-" + new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new java.util.Date()) + ".mcbak");
+            try { startActivityForResult(picker, EXPORT_BACKUP); }
+            catch (android.content.ActivityNotFoundException error) {
+                background.pendingExport = null;
+                showMessage("系统没有提供文件保存入口。");
+            }
+        } else if (result instanceof BackgroundWork.BackupLocked locked) {
+            LinearLayout form = column();
+            form.setPadding(dp(20), dp(6), dp(20), dp(6));
+            add(form, label(locked.incorrect() ? "密码不正确，或文件已损坏。可重新输入密码。" : "此备份已加密，请输入导出时设置的密码。", 13, MUTED, false), 0);
+            EditText password = backupPassword("备份密码");
+            add(form, password, 10);
+            AlertDialog dialog = new AlertDialog.Builder(this).setTitle("解密备份").setView(form)
+                .setNegativeButton("取消", (view, which) -> dismissBackgroundResult(background.backup))
+                .setOnCancelListener(view -> dismissBackgroundResult(background.backup))
+                .setPositiveButton("解密并预览", null).show();
+            backgroundDialog = dialog;
+            dialog.setOnDismissListener(view -> password.getText().clear());
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                if (password.length() == 0) { password.setError("请输入备份密码。"); return; }
+                char[] secret = new char[password.length()];
+                password.getText().getChars(0, secret.length, secret, 0);
+                password.getText().clear();
+                background.backup.clearResult();
+                backgroundDialog = null;
+                dialog.dismiss();
+                Context context = getApplicationContext();
+                if (!background.backup.start(BackgroundWork.DOWNLOADS, () -> decodeBackup(context, locked.bytes(), secret))) {
+                    java.util.Arrays.fill(secret, '\0');
+                }
+                render();
+            });
+        } else if (result instanceof BackgroundWork.BackupPreview preview) {
+            BackupArchive.Data data = preview.data();
+            int favorites = 0;
+            int categories = 0;
+            for (Object value : data.preferences().values()) if (value instanceof Set<?> set) favorites += set.size();
+            try { categories = new org.json.JSONArray((String) data.preferences().getOrDefault("routing_categories", "[]")).length(); }
+            catch (org.json.JSONException invalid) { /* Already validated by BackupArchive. */ }
+            String summary = "备份版本  " + data.appVersion() + "\n备份时间  "
+                + java.text.DateFormat.getDateTimeInstance().format(new java.util.Date(data.createdAt()))
+                + "\n订阅  " + data.subscriptions().size() + " 个\n应用分流  " + data.state().applications().size()
+                + " 项\n自定义分类  " + categories + " 个\n节点收藏  " + favorites + " 项\n配置  " + data.state().source().length / 1024 + " KiB"
+                + "\n\n将替换当前配置、全部订阅、应用分流、分类、收藏和订阅自动更新／节点列表偏好。"
+                + "\n\n请先停止 TUN。恢复后不会自动启动 TUN；通知、图标、系统授权、开机与热点设置保留本机选择。";
+            AlertDialog dialog = textDialog("恢复备份 · 内容预览", summary)
+                .setNegativeButton("取消", (view, which) -> dismissBackgroundResult(background.backup))
+                .setOnCancelListener(view -> dismissBackgroundResult(background.backup))
+                .setNeutralButton("停止 TUN", null)
+                .setPositiveButton("替换并恢复", null).show();
+            backgroundDialog = dialog;
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
+                if (busy || status == null || !status.active()) return;
+                execute("TUN 已停止，可确认恢复备份。", () -> {
+                    Module.run(Module.Command.STOP, null);
+                    return Module.status();
+                });
+            });
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                if (busy) return;
+                if (status == null || !status.installed() || !status.enabled || !status.state.equals("stopped")) {
+                    showMessage("请先安装并启用模块、停止 TUN，再恢复备份。");
+                    return;
+                }
+                background.backup.clearResult();
+                backgroundDialog = null;
+                dialog.dismiss();
+                background.backupRestoring = true;
+                busy = true;
+                Context context = getApplicationContext();
+                background.backup.start(worker, () -> {
+                    new BackupStore(context).restore(data, preview.stamp());
+                    SharedPreferences prefs = context.getSharedPreferences("MainActivity", MODE_PRIVATE);
+                    String warning = "";
+                    boolean scheduled;
+                    try { scheduled = SubscriptionUpdateJob.schedule(context, prefs.getBoolean(SubscriptionUpdateJob.ENABLED, false)); }
+                    catch (RuntimeException unavailable) { scheduled = false; }
+                    if (!scheduled) {
+                        prefs.edit().putBoolean(SubscriptionUpdateJob.ENABLED, false).apply();
+                        warning = "自动订阅更新未能安排，请重新开启。";
+                    }
+                    Module.Status restored = null;
+                    try { restored = Module.status(); }
+                    catch (Exception unavailable) { warning += "请重新检测环境以刷新状态。"; }
+                    return new BackgroundWork.BackupDone(true, restored, warning);
+                });
+                render();
+            });
+        } else if (result instanceof BackgroundWork.BackupDone done) {
+            background.backup.clearResult();
+            if (done.status() != null) { status = done.status(); proxySummary = null; }
+            showMessage((done.restored() ? "备份已恢复，TUN 保持停止。" : "备份已导出。") + done.warning());
+            render();
+            schedulePoll();
+        }
     }
 
     private void updateLauncherIcon() {
@@ -1308,7 +1554,8 @@ public final class MainActivity extends Activity {
                 ProxyGroupSection.of(group.name()).label));
         }
         showPolicyList("代理组与节点", groups.size() + " 个代理组 · 点击查看可选节点", "搜索代理组或当前出口", items,
-            (dialog, index) -> { dialog.dismiss(); showNodes(ordered.get(index), groups, null); }, null, null, index -> ordered.get(index).name());
+            (dialog, index) -> { dialog.dismiss(); showNodes(ordered.get(index), groups, null); }, null, null,
+            index -> ordered.get(index).name(), false);
     }
 
     private String groupRoute(Controller.Group group, List<Controller.Group> groups) {
@@ -1321,13 +1568,14 @@ public final class MainActivity extends Activity {
         List<PolicyItem> items = new ArrayList<>();
         for (int i = 0; i < group.options().size(); i++) {
             String option = group.options().get(i);
-            String detail = option.equals("DIRECT") ? "直接连接，不经过代理" : "代理节点";
+            String detail = option.equals("DIRECT") ? "直接连接，不经过代理"
+                : option.equals("REJECT") || option.equals("REJECT-DROP") ? "拒绝连接" : "代理节点";
             for (Controller.Group candidate : groups) if (candidate.name().equals(option)) {
                 detail = "代理组 · " + groupRoute(candidate, groups);
                 break;
             }
             boolean selected = option.equals(group.current());
-            items.add(new PolicyItem(option.equals("DIRECT") ? "直连" : option, detail,
+            items.add(new PolicyItem(Controller.outletLabel(option), detail,
                 selected ? "当前" : "", selected, false, i, ""));
         }
         showPolicyList(group.name() + " · 选择出口", group.options().size() + " 个选项 · 点击切换", "搜索节点或代理组", items,
@@ -1335,18 +1583,22 @@ public final class MainActivity extends Activity {
                 dialog.dismiss();
                 String option = group.options().get(index);
                 if (!option.equals(group.current())) selectNode(group.name(), option);
-            }, group.automatic() ? () -> selectNode(group.name(), null) : null, browseGroups, group.options()::get);
+            }, group.automatic() ? () -> selectNode(group.name(), null) : null, browseGroups, group.options()::get, true);
     }
 
     private record PolicyItem(String title, String detail, String badge, boolean selected, boolean navigates,
                               int index, String section) {}
 
     private void showPolicyList(String title, String subtitle, String hint, List<PolicyItem> items,
-                                BiConsumer<AlertDialog, Integer> onPick, Runnable reset, Runnable browseGroups, java.util.function.IntFunction<String> testName) {
+                                BiConsumer<AlertDialog, Integer> onPick, Runnable reset, Runnable browseGroups,
+                                java.util.function.IntFunction<String> testName, boolean nodePicker) {
+        if (policyDialog != null) policyDialog.dismiss();
         LinearLayout header = column();
         header.setPadding(dp(20), dp(20), dp(20), dp(8));
         add(header, label(title, 20, TEXT, true), 0);
         add(header, label(subtitle, 12, MUTED, false), 8);
+        PolicyAdapter adapter = new PolicyAdapter(items, testName, nodePicker);
+        if (nodePicker) adapter.addControls(header);
         EditText search = new EditText(this);
         search.setSingleLine(true);
         search.setTextColor(TEXT);
@@ -1356,13 +1608,12 @@ public final class MainActivity extends Activity {
         search.setPadding(dp(14), dp(12), dp(14), dp(12));
         search.setBackground(shape(BG, 12, true));
         add(header, search, 14);
-        PolicyAdapter adapter = new PolicyAdapter(testName);
-        adapter.filter(items, "");
+        adapter.filter("");
         search.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence text, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence text, int start, int before, int count) {
                 String query = text.toString().trim().toLowerCase(Locale.ROOT);
-                adapter.filter(items, query);
+                adapter.filter(query);
             }
             @Override public void afterTextChanged(Editable text) {}
         });
@@ -1371,52 +1622,137 @@ public final class MainActivity extends Activity {
         if (reset != null) builder.setNeutralButton("恢复自动", (dialog, which) -> reset.run());
         if (browseGroups != null) builder.setPositiveButton("所有代理组", (dialog, which) -> browseGroups.run());
         AlertDialog dialog = builder.show();
+        policyDialog = dialog;
+        dialog.setOnDismissListener(dismissed -> {
+            adapter.close();
+            if (policyDialog == dialog) policyDialog = null;
+        });
         dialog.getListView().setDivider(null);
         dialog.getListView().setPadding(dp(10), dp(4), dp(10), dp(6));
         dialog.getListView().setClipToPadding(false);
         dialog.getListView().setOnItemClickListener((parent, view, index, id) -> {
+            if (adapter.configGeneration != RoutingStore.generation()) { adapter.refreshItems(); return; }
             PolicyItem item = adapter.getItem(index);
-            if (item != null && item.index() >= 0) onPick.accept(dialog, item.index());
+            if (item != null && item.index() >= 0 && !busy) onPick.accept(dialog, item.index());
         });
         enableSearchKeyboard(dialog);
     }
 
-    private record PolicyRow(LinearLayout card, TextView title, TextView detail, TextView badge, TextView arrow) {}
+    private record PolicyRow(LinearLayout card, TextView title, TextView detail, TextView favorite, TextView badge, TextView arrow) {}
 
     private final class PolicyAdapter extends BaseAdapter {
         private final List<PolicyItem> entries = new ArrayList<>();
-
+        private final List<PolicyItem> source;
+        private final List<String> names = new ArrayList<>();
         private final java.util.function.IntFunction<String> testName;
-        private final Map<Integer, String> delays = new java.util.HashMap<>();
-        private boolean testing;
+        private final boolean nodePicker;
+        private final String favoritesKey;
+        private final Set<String> favorites;
+        private final NodeLatencyBatch tests;
+        private NodeLatencyBatch.Snapshot measurement;
+        private String query = "";
+        private boolean sortByDelay;
+        private boolean hideFailed;
+        private boolean closed;
+        private final int configGeneration = RoutingStore.generation();
+        private Button batchButton;
+        private TextView progress;
+        private final Runnable update = this::refreshItems;
 
-        PolicyAdapter(java.util.function.IntFunction<String> testName) { this.testName = testName; }
-
-        private void measure(int index) {
-            if (testing || busy) return;
-            testing = true;
-            delays.put(index, "…");
-            notifyDataSetChanged();
-            String outlet = testName.apply(index);
-            networkWorker.execute(() -> {
-                int delay;
-                try { delay = Controller.testDelay(outlet, NetworkCheck.GOOGLE); }
-                catch (Exception error) { delay = 0; }
-                String result = delay > 0 ? delay + " ms" : "失败";
-                main.post(() -> {
-                    if (isDestroyed()) return;
-                    testing = false;
-                    delays.put(index, result);
-                    notifyDataSetChanged();
-                });
-            });
+        PolicyAdapter(List<PolicyItem> items, java.util.function.IntFunction<String> testName, boolean nodePicker) {
+            this.source = items;
+            this.testName = testName;
+            this.nodePicker = nodePicker;
+            for (PolicyItem item : items) names.add(testName.apply(item.index()));
+            favoritesKey = NodeList.favoritesKey(subscriptions == null ? "" : subscriptions.activeAddress());
+            favorites = new LinkedHashSet<>(appPreferences().getStringSet(favoritesKey, java.util.Collections.emptySet()));
+            sortByDelay = appPreferences().getBoolean("node_sort_delay", false);
+            hideFailed = appPreferences().getBoolean("node_hide_failed", false);
+            tests = new NodeLatencyBatch(name -> Controller.testDelay(name, NetworkCheck.GOOGLE), () -> main.post(update));
+            measurement = tests.snapshot();
         }
 
+        void addControls(LinearLayout header) {
+            LinearLayout controls = new LinearLayout(MainActivity.this);
+            batchButton = pickerControl("测本组");
+            batchButton.setOnClickListener(view -> {
+                if (measurement.running()) tests.cancel();
+                else if (!busy) tests.start(names);
+            });
+            Button order = pickerControl(sortByDelay ? "延迟排序 ✓" : "延迟排序");
+            order.setOnClickListener(view -> {
+                sortByDelay = !sortByDelay;
+                appPreferences().edit().putBoolean("node_sort_delay", sortByDelay).apply();
+                order.setText(sortByDelay ? "延迟排序 ✓" : "延迟排序");
+                refreshItems();
+            });
+            Button hide = pickerControl(hideFailed ? "隐藏失败 ✓" : "隐藏失败");
+            hide.setOnClickListener(view -> {
+                hideFailed = !hideFailed;
+                appPreferences().edit().putBoolean("node_hide_failed", hideFailed).apply();
+                hide.setText(hideFailed ? "隐藏失败 ✓" : "隐藏失败");
+                refreshItems();
+            });
+            for (Button control : new Button[] {batchButton, order, hide}) {
+                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(44), 1);
+                if (controls.getChildCount() > 0) params.leftMargin = dp(5);
+                controls.addView(control, params);
+            }
+            add(header, controls, 12);
+            progress = label("Google 204 延迟 · 点 ☆ 收藏并置顶", 11, MUTED, false);
+            add(header, progress, 6);
+        }
 
-        void filter(List<PolicyItem> items, String query) {
+        private Button pickerControl(String title) {
+            Button control = button(title, false);
+            control.setTextSize(11);
+            control.setPadding(dp(2), 0, dp(2), 0);
+            control.setMinimumWidth(0);
+            control.setMinWidth(0);
+            control.setSingleLine(true);
+            return control;
+        }
+
+        private void measure(int index) {
+            if (!closed && !busy) tests.startOne(testName.apply(index));
+        }
+
+        void close() {
+            closed = true;
+            tests.close();
+            main.removeCallbacks(update);
+        }
+
+        void filter(String query) {
+            this.query = query;
+            refreshItems();
+        }
+
+        private void refreshItems() {
+            if (closed || isDestroyed()) return;
+            if (configGeneration != RoutingStore.generation()) {
+                if (policyDialog != null) policyDialog.dismiss();
+                showMessage("配置已变化，请重新打开代理组。");
+                return;
+            }
+            measurement = tests.snapshot();
+            if (batchButton != null) {
+                batchButton.setText(measurement.running() ? "停止测速" : "测本组");
+                batchButton.setEnabled(names.stream().anyMatch(NodeList::testable));
+                String count = measurement.total() == 0 ? "" : (measurement.running() ? "测速中 " : "已测 ")
+                    + measurement.completed() + "/" + measurement.total() + " · ";
+                progress.setText(count + "Google 204 延迟 · 收藏置顶");
+            }
             entries.clear();
             String section = "";
-            for (PolicyItem item : items) {
+            List<PolicyItem> ordered = source;
+            if (nodePicker) {
+                ordered = new ArrayList<>();
+                for (int index : NodeList.order(names, favorites, measurement.delays(), sortByDelay, hideFailed)) {
+                    ordered.add(source.get(index));
+                }
+            }
+            for (PolicyItem item : ordered) {
                 if (!(item.title() + " " + item.detail()).toLowerCase(Locale.ROOT).contains(query)) continue;
                 if (!item.section().isEmpty() && !section.equals(item.section())) {
                     section = item.section();
@@ -1438,7 +1774,7 @@ public final class MainActivity extends Activity {
         @Override public View getView(int index, View reusable, ViewGroup parent) {
             PolicyItem item = getItem(index);
             if (item == null) {
-                TextView empty = label("没有匹配的项目", 14, MUTED, false);
+                TextView empty = label(nodePicker && hideFailed ? "没有可显示的项目\n可关闭“隐藏失败”或修改搜索" : "没有匹配的项目", 14, MUTED, false);
                 empty.setPadding(dp(20), dp(32), dp(20), dp(32));
                 empty.setGravity(Gravity.CENTER);
                 return empty;
@@ -1471,25 +1807,46 @@ public final class MainActivity extends Activity {
                 detail.setMaxLines(2);
                 detail.setEllipsize(TextUtils.TruncateAt.END);
                 add(details, detail, 6);
+                TextView favorite = label("", 22, MINT, false);
+                favorite.setGravity(Gravity.CENTER);
+                card.addView(favorite, new LinearLayout.LayoutParams(dp(40), dp(48)));
                 TextView badge = label("", 11, MINT, true);
                 badge.setSingleLine(true);
+                badge.setGravity(Gravity.CENTER);
+                badge.setMinHeight(dp(48));
                 badge.setPadding(dp(9), dp(6), dp(9), dp(6));
                 LinearLayout.LayoutParams badgeParams = new LinearLayout.LayoutParams(-2, -2);
-                badgeParams.leftMargin = dp(10);
+                badgeParams.leftMargin = dp(4);
                 card.addView(badge, badgeParams);
                 TextView arrow = label("", 20, MUTED, false);
                 LinearLayout.LayoutParams arrowParams = new LinearLayout.LayoutParams(-2, -2);
                 arrowParams.leftMargin = dp(9);
                 card.addView(arrow, arrowParams);
                 add(row, card, 0);
-                holder = new PolicyRow(card, name, detail, badge, arrow);
+                holder = new PolicyRow(card, name, detail, favorite, badge, arrow);
                 row.setTag(holder);
             }
             holder.title().setText(item.title());
             holder.detail().setText(item.detail());
-            holder.badge().setText(delays.getOrDefault(item.index(), "测速"));
+            String name = testName.apply(item.index());
+            boolean testable = NodeList.testable(name);
+            boolean measurable = testable || name.equals("DIRECT");
+            boolean favorite = favorites.contains(name);
+            holder.favorite().setVisibility(nodePicker && testable ? View.VISIBLE : View.GONE);
+            holder.favorite().setText(favorite ? "★" : "☆");
+            holder.favorite().setTextColor(favorite ? AMBER : MUTED);
+            holder.favorite().setContentDescription((favorite ? "取消收藏 " : "收藏 ") + item.title());
+            holder.favorite().setOnClickListener(view -> {
+                if (!favorites.add(name)) favorites.remove(name);
+                appPreferences().edit().putStringSet(favoritesKey, new LinkedHashSet<>(favorites)).apply();
+                refreshItems();
+            });
+            Integer delay = measurement.delays().get(name);
+            holder.badge().setText(!measurable ? "—" : measurement.pending().contains(name) ? "…"
+                : delay == null ? "测速" : delay > 0 ? delay + " ms" : "失败");
             holder.badge().setVisibility(View.VISIBLE);
             holder.badge().setContentDescription(item.title() + " · Google 204 延迟测速 · " + holder.badge().getText());
+            holder.badge().setEnabled(measurable && !measurement.running());
             holder.badge().setOnClickListener(view -> measure(item.index()));
             boolean accent = item.selected() || item.badge().equals("直连") || item.badge().equals("自动");
             holder.badge().setTextColor(accent ? MINT : MUTED);
@@ -2249,6 +2606,11 @@ public final class MainActivity extends Activity {
             : installed ? "重新安装模块" : "安装内置模块");
         installButton.setEnabled(!busy && !pending && bundledModule.valid());
         exportButton.setEnabled(!busy && bundledModule.valid());
+        boolean backupIdle = !busy && !background.backup.running() && background.backup.outcome() == null
+            && background.pendingExport == null;
+        backupExportButton.setEnabled(backupIdle);
+        backupImportButton.setEnabled(backupIdle);
+        autoUpdateSwitch.setEnabled(!busy);
         updatingSwitch = true;
         bootSwitch.setChecked(installed && status.boot);
         bootSwitch.setEnabled(!busy && enabled);

@@ -127,6 +127,33 @@ final class RoutingStore {
         }
     }
 
+    byte[] snapshot() throws Exception {
+        try (InputStream input = file.openRead()) { return BackupArchive.read(input); }
+        catch (FileNotFoundException missing) {
+            if (file.getBaseFile().exists()) throw missing;
+            return null;
+        }
+    }
+
+    void restoreSnapshot(byte[] bytes) throws Exception {
+        if (bytes == null) {
+            file.delete();
+            if (snapshot() != null) throw new IOException("无法还原空的应用分流设置。");
+            generation++;
+            return;
+        }
+        FileOutputStream output = null;
+        try {
+            output = file.startWrite();
+            output.write(bytes);
+            file.finishWrite(output);
+            generation++;
+        } catch (Exception error) {
+            if (output != null) file.failWrite(output);
+            throw error;
+        }
+    }
+
     void apply(State state) throws Exception {
         apply(Profile.withAppRules(state.source(), state.applications()), state);
     }
