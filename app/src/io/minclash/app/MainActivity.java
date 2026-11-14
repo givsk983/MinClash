@@ -307,7 +307,7 @@ public final class MainActivity extends Activity {
         personalRulesButton.setOnClickListener(view -> execute("", this::readPersonalRules));
         add(routing, personalRulesButton, 12);
         add(routing, label("按域名、IPv4 或 IPv6 自定义出口。", 12, MUTED, false), 6);
-        add(routing, label("在规则模式下生效。运行中保存会短暂重连。", 12, MUTED, false), 12);
+        add(routing, label("在规则模式下生效。保存后现有连接会按新规则重连。", 12, MUTED, false), 12);
         LinearLayout autoUpdates = card(profiles, 14);
         autoUpdateSwitch = new Switch(this);
         autoUpdateSwitch.setText("每日自动更新订阅");
@@ -2340,7 +2340,7 @@ public final class MainActivity extends Activity {
         info.setPadding(dp(12), dp(6), dp(12), dp(6));
         info.setOnClickListener(view -> new AlertDialog.Builder(this).setTitle("应用分流说明")
             .setMessage("• 个人选择优先于订阅规则，仅在规则模式下生效。\n\n"
-                + "• 选择“跟随订阅规则”可移除个人设置。运行中保存会短暂重连。\n\n"
+                + "• 选择“跟随订阅规则”可移除个人设置。保存后现有连接会按新规则重连。\n\n"
                 + "• “系统”包含系统应用和组件，“Google”按包名归类。自定义分类可包含任意应用，只用于筛选。\n\n"
                 + "• 图标按列表显示需要在后台加载，应用列表会短暂缓存；从系统设置返回后重新读取。\n\n"
                 + (screen.allowRoot() ? "读取方式：普通接口优先，必要时使用你选择的 Root 补充读取应用或图标。" : "读取方式：系统应用查询接口。"))

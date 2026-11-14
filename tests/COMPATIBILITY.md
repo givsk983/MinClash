@@ -162,3 +162,17 @@ Android 9–15、Magisk、其他 ROM 及 IPv6-only／NAT64 网络仍需要额外
 - 发布 APK 与已推送手机的最终 APK 一致，SHA-256 为 `8d03b0e81c542c9d31c728a59c485d337e2f17c20b293b54215f32f264e662d0`。版本仍为 0.2.2（构建 40），内置模块保持 0.0.9（构建 18、修订 8）。
 - 发布前重跑 NotificationChannelCheck、NotificationLifecycleCheck、ModuleStatusCheck、TcpKeepAliveCheck、SubscriptionReminderCheck、BackgroundWorkCheck 均通过。通知跨进程测试首次在 Windows 遇到原子替换文件占用，独立复跑通过；未因此修改 Android 生产逻辑。
 - Release 说明按要求省略关于页的界面调整。附件包括两种 APK 文件名、对应内核完整源码及 SHA256SUMS.txt。
+
+## 0.2.3 分流快速应用验证（2026-11-15）
+
+- App 为 0.2.3（构建 41），发布签名构建与签名指纹核对通过。内嵌模块 ZIP 与 0.2.2 逐字节一致，仍为 0.0.9（构建 18、修订 8），SHA-256 为 `ee2ba5d1df450264170aaae646d7b19fae00b1f049bb7c2e94791c65529bd7f8`；没有改动模块、原生辅助程序或内核。
+- LiveRoutingCheck 覆盖同源应用／个人规则修改、订阅与源变化、旧模块、未就绪状态、外部配置修改的门控；验证模式与临时进程识别保留、运行副本不修改源设置、不能用运行覆盖掩盖非法持久字段、UTF-8 分帧及大小限制。注入重载、就绪检查、连接重建、持久保存、节点恢复与回滚失败，检查恢复顺序与错误提示，配置冲突不会覆盖外部改动。
+- AppRoutingCheck、PersonalRulesCheck、SubscriptionPreviewCheck、BackupArchiveCheck、TcpKeepAliveCheck、ModuleStatusCheck、ConnectionRefreshCheck、BackgroundWorkCheck 共 8 项既有 JVM 回归通过；与新增检查合计 9 项。首次调用 AppRoutingCheck 遗漏输出目录参数，补齐参数后通过，未修改测试或生产逻辑规避失败。
+- `tests/live-profile-check.py` 使用缓存的官方 v1.19.33 Windows 内核、临时合成配置及 127.0.0.1 控制接口，执行 App 实际生成的 Root shell。Windows 测试仅将 Android Unix socket 检查与传输替换成本机夹具，并模拟 BusyBox 分派与操作锁；没有读取手机或用户配置。
+- 集成测试确认新规则实际生效、热加载前后 PID 不变、会话模式保留、持久配置原子替换及 DELETE /connections 可用；覆盖旧校验值、锁拒绝、截断／多余字节、无效 YAML、错误 HTTP 状态、响应丢失、持久替换失败、大体积中文数据分帧与临时文件清理。对不明确结果验证从未替换的原文件完整停止并重新启动可恢复原状态。
+- 上述隔离内核测试关闭 TUN，不代表 Android 路由、真实 BusyBox／socket-request、热点共享及厂商进程管理的真机验证，也不提供真机加速比例或固定延迟承诺。仍需真机确认 TUN 接口复用、热点与 IPv6、实际订阅提供者初始化、后台通知，以及保存期间的连接恢复。此次未安装到手机或发布 Release。
+
+### 0.2.3 发布前核对
+
+- 已在 NX769J 保留数据覆盖安装并启动，手机 Download 副本和已安装 APK 的 SHA-256 均为 `f6b12e4cf8e617385a108d9d9b84fa9bc60528eeb6451f71e65a02260040299e`，与本次发布附件一致。此次只确认安装、启动及文件完整性，尚未进行真机分流保存耗时测试。
+- 发布附件包含带版本号 APK、MinClash.apk、未改动的内核完整源码及 SHA256SUMS.txt；内嵌模块 ZIP 与 0.2.2 逐字节一致。

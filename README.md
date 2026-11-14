@@ -1,4 +1,4 @@
-# MinClash 0.2.2
+# MinClash 0.2.3
 
 MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模块和 Mihomo v1.19.33-minclash.1 Android ARM64 内核。分发 `dist/MinClash.apk` 时一并提供 `dist/mihomo-v1.19.33-minclash.1-source.tar.gz` 对应源码包；安装模块所需文件已经包含在 APK 内。适用于 ARM64、Android 9 及以上，且内核支持 `/dev/tun` 或 `/dev/net/tun` 的 Root 手机。
 
@@ -11,7 +11,7 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 4. 运行后可在「代理控制」切换规则、全局、直连模式，并在「代理组与节点」选择节点。全局模式使用 `GLOBAL` 组，规则模式使用配置中各条规则指定的组。
    代理组使用卡片显示组名及当前出口链路，支持搜索。节点页高亮当前选择，可搜索节点或代理组。点击列表项右侧「测速」可单独测试 Google 204 延迟；点击「测本组」可测试本组全部可测出口，不受搜索或隐藏失败筛选影响，最多同时测试 3 个。测试中可随时停止，关闭列表或旋转屏幕会取消剩余测试，已完成的延迟在本次列表中保留。测速只测延迟，不自动切换节点，也不代表下载速度。
    节点列表支持「延迟排序」和「隐藏失败」，未测试的出口仍会显示。点击 ☆ 收藏，收藏项置顶；启用延迟排序时，收藏与其他出口分别按延迟排列。收藏按订阅独立保存，本地配置共用一组收藏，订阅更新后同名节点沿用收藏。排序和隐藏偏好会记住，直连及拒绝等内置出口不参与批量测速或收藏。
-5. 在「配置 → 管理应用分流」搜索已安装的应用，选择「跟随订阅规则」「直连」或指定代理组。例如，将 Claude 指向 `US` 组后，即使机场规则将 Claude 分到 `OpenAI`，也会优先走 `US` 组当前选择的节点。应用分流只在规则模式生效；运行中保存会短暂重连。
+5. 在「配置 → 管理应用分流」搜索已安装的应用，选择「跟随订阅规则」「直连」或指定代理组。例如，将 Claude 指向 `US` 组后，即使机场规则将 Claude 分到 `OpenAI`，也会优先走 `US` 组当前选择的节点。应用分流只在规则模式生效。0.2.3 对同一订阅源的分流修改优先使用现有内核热加载，避免完整停止守护进程、重建 TUN 和重复校验。保留当前模式与可恢复的节点选择，再断开已有连接，让它们按新规则重连；下载、通话等仍可能短暂受影响。新订阅、源配置变化、旧模块或内核未就绪时仍沿用完整应用流程。
    列表可按应用、已指定、系统、Google 或自定义分类筛选。自定义分类支持搜索应用并编辑成员，应用分流仍按包名保存。
    列表先显示应用名称和包名，真实图标在后台按需加载并缓存；图标不可读时显示提示和检查入口，明确区分权限拒绝与其他读取失败。右上角「权限」显示查询权限、动态授权支持情况和已尝试读取的图标状态；尚未显示的应用图标不会误报为失败。设备支持且尚未授予的动态权限可在此申请；必要时可选择 Root 补充图标。
    进入配置页会后台预读应用分流。60 秒内可直接打开缓存列表，保存时读取最新配置并合并本次修改。权限变化、订阅更新或重新读取会更新缓存。
@@ -84,7 +84,7 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 准备 Python 3.11 或以上、JDK 17 或以上、Go 1.26.11、Android SDK Platform 36、Build Tools 36.0.0 和 NDK 27.0.12077973。通过 `ANDROID_HOME` 指定 SDK 目录，再运行 `python build.py`。Go 不在 PATH 时设置 `MINCLASH_GO`，NDK 安装在其他位置时设置 `ANDROID_NDK_HOME`。脚本校验固定 Mihomo 源码、官方 vendor 依赖和其他下载文件的 SHA-256，应用 `mihomo-patches/` 后测试并构建内核。模块 ZIP 及校验值嵌入 `dist/MinClash.apk`，模块和完整修改源码包也输出到 `dist`；提供安装包时一并提供源码包。详细构建参数见 [内核修改说明](mihomo-patches/README.md)。发布签名构建使用 `python build.py --release`，脚本会校验签名指纹并输出 APK 的 SHA-256。请私下备份现有的 `build/debug.keystore`，也可用 `MINCLASH_KEYSTORE` 指向备份位置。
 
-App 当前版本为 `0.2.2`，构建 `versionCode=40`。内置模块为 `0.0.9`、`versionCode=18`、功能修订号 `revision=8`。本次通知与设置界面更新无需重装模块或重启手机。已安装该模块的用户无需重复安装；旧模块用户如需使用保活功能，需安装内置模块并重启，暂不使用该功能可继续沿用旧模块。App 依据模块功能修订号及必要能力判断更新，不依据 App 版本要求重装。
+App 当前版本为 `0.2.3`，构建 `versionCode=41`。内置模块为 `0.0.9`、`versionCode=18`、功能修订号 `revision=8`。本次分流快速应用更新无需重装模块或重启手机。已安装该模块的用户无需重复安装；旧模块用户如需使用保活功能，需安装内置模块并重启，暂不使用该功能可继续沿用旧模块。App 依据模块功能修订号及必要能力判断更新，不依据 App 版本要求重装。
 
 模块 0.0.9 新增「设置 → 后台连接保活」，默认关闭，旧模块继续使用现有代理能力。用户可开启并选择保守（空闲 180 秒、重试间隔 30 秒）、均衡（120／20 秒）或激进（60／15 秒），连续 3 次无响应后由系统判定连接失效，帮助 Telegram 等应用重连。开启前检查所选参数；不支持就退回原行为，并在设置页提示。正常 TCP 数据会延后探测，正常空闲连接仍保留，订阅重载保留当前会话的策略。
 
@@ -109,3 +109,5 @@ App 当前版本为 `0.2.2`，构建 `versionCode=40`。内置模块为 `0.0.9`�
 `tests/NotificationLifecycleCheck.java` 在 JVM 验证旧通知偏好兼容、独立进程写入后实时读取、未完成／失败写入、短暂重连与持续停止、系统重建后的等待时限。Android 上的进程与最近任务生命周期仍需真机验证。
 
 通知恢复使用 Android 的 [sticky 前台服务](https://developer.android.com/reference/android/app/Service#START_STICKY)及[开机与覆盖安装广播的启动豁免](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start)。BPF 状态检查依据 AOSP [BpfCoordinator 初始化时缓存加速状态的实现](https://android.googlesource.com/platform/packages/modules/Connectivity/+/refs/heads/main/Tethering/src/com/android/networkstack/tethering/BpfCoordinator.java)。
+
+0.2.3 的快速应用使用 Mihomo 已有的 [配置重载 API](https://wiki.metacubex.one/api/)。仅当源配置未变、内核健康且磁盘配置与 App 记录一致时启用；运行副本保留当前模式与临时进程识别，持久配置继续保留订阅原本的设置。配置传输、大小、原文件校验和持久替换由固定 Root 操作在模块操作锁内完成；响应不明确或后续保存失败时，先完整停止旧内核，再恢复原配置和连接。冷启动的提供者初始化和路由检查耗时不属于此次快速路径，不使用缩短安全等待来掩盖异常。

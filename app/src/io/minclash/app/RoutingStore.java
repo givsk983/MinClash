@@ -19,6 +19,7 @@ import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.json.JSONObject;
+import java.util.Objects;
 
 /** Private subscription source and personal policies, independent of the generated core config. */
 final class RoutingStore {
@@ -186,6 +187,30 @@ final class RoutingStore {
         boolean reconnect = before.installed() && !before.state.equals("stopped");
         List<Controller.Group> selections = before.state.equals("running") && before.control
             ? Controller.groups().values() : Collections.emptyList();
+        State saved = state == null ? null : read();
+        if (canReload(before, saved, state, previous)) {
+            JSONObject runtime = Controller.runtimeSettings();
+            byte[] live = Profile.forLiveReload(merged, runtime.getString("mode").toLowerCase(java.util.Locale.ROOT),
+                runtime.optString("find-process-mode").equalsIgnoreCase("always"));
+            byte[] packet = LiveProfile.packet(merged, live, previous);
+            applyLive(new LiveChange() {
+                public void reload() throws Exception { LiveProfile.apply(packet); }
+                public void verify() throws Exception {
+                    if (!Module.status().running()) throw new IOException("TUN 未就绪。");
+                    Controller.mode();
+                }
+                public void reconnect() throws Exception { Controller.reconnectConnections(); }
+                public void commit() throws Exception { save(state); }
+                public void restoreSelections() throws Exception { Controller.restoreSelections(selections); }
+                public void rollback() throws Exception {
+                    Module.run(Module.Command.STOP, null);
+                    Module.run(Module.Command.IMPORT, previous);
+                    restart(before.control);
+                    Controller.restoreSelections(selections);
+                }
+            });
+            return;
+        }
         if (reconnect && before.validate) Module.run(Module.Command.VALIDATE, merged);
         if (reconnect) Module.run(Module.Command.STOP, null);
         boolean imported = false;
@@ -217,6 +242,43 @@ final class RoutingStore {
                 throw new SelectionRestoreFailure(error);
             }
         }
+    }
+
+    static boolean canReload(Module.Status status, State saved, State changed, byte[] installed) throws Exception {
+        return status.running() && status.control && status.validate && status.runtime.reported()
+            && saved != null && changed != null && installed != null
+            && Objects.equals(saved.subscription(), changed.subscription()) && Arrays.equals(saved.source(), changed.source())
+            && Arrays.equals(installed, Profile.withPersonalRules(saved.source(), saved.applications(), saved.rules()));
+    }
+
+    interface LiveChange {
+        void reload() throws Exception;
+        void verify() throws Exception;
+        void reconnect() throws Exception;
+        void commit() throws Exception;
+        void restoreSelections() throws Exception;
+        void rollback() throws Exception;
+    }
+
+    static void applyLive(LiveChange change) throws Exception {
+        Exception selectionError = null;
+        try {
+            change.reload();
+            change.verify();
+            try { change.restoreSelections(); }
+            catch (Exception error) { selectionError = error; }
+            change.reconnect();
+            change.commit();
+        } catch (LiveProfile.UnchangedFailure unchanged) {
+            throw unchanged;
+        } catch (Exception error) {
+            try { change.rollback(); }
+            catch (Exception recovery) {
+                throw new IOException("快速应用失败，恢复也未完成，请检查 TUN 状态与内核日志。", recovery);
+            }
+            throw new IOException("快速应用失败，已恢复原配置和连接。", error);
+        }
+        if (selectionError != null) throw new SelectionRestoreFailure(selectionError);
     }
 
     static void restart(boolean control) throws Exception {

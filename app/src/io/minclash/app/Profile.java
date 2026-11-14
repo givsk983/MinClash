@@ -302,6 +302,35 @@ final class Profile {
         return result;
     }
 
+    // Only the live copy carries session overrides; keep the saved subscription source unchanged.
+    static byte[] forLiveReload(byte[] content, String mode, boolean identifyProcesses) throws IOException {
+        if (!Set.of("rule", "global", "direct").contains(mode)) throw new IOException("无法读取当前代理模式。");
+        MappingNode root = routingRoot(content);
+        // Overriding a session field must not hide an invalid persistent value (for example
+        // removing the last app rule exposes the source's original find-process-mode).
+        validateLiveField(root, "mode", Set.of("rule", "global", "direct"));
+        validateLiveField(root, "find-process-mode", Set.of("strict", "always", "off"));
+        Yaml yaml = new Yaml();
+        root.getValue().removeIf(tuple -> keyOf(tuple).equals("mode")
+            || identifyProcesses && keyOf(tuple).equals("find-process-mode"));
+        root.getValue().add(new NodeTuple(yaml.represent("mode"), yaml.represent(mode)));
+        if (identifyProcesses) root.getValue().add(new NodeTuple(yaml.represent("find-process-mode"), yaml.represent("always")));
+        StringWriter output = new StringWriter();
+        yaml.serialize(root, output);
+        byte[] result = output.toString().getBytes(StandardCharsets.UTF_8);
+        if (result.length > MAX_BYTES) throw new TooLarge();
+        return result;
+    }
+
+    private static void validateLiveField(MappingNode root, String name, Set<String> values) throws IOException {
+        Node node = field(root, name);
+        if (node == null || Tag.NULL.equals(node.getTag())) return;
+        if (!(node instanceof ScalarNode scalar) || !Tag.STR.equals(scalar.getTag())
+            || !values.contains(scalar.getValue().toLowerCase(Locale.ROOT))) {
+            throw new IOException("配置中的 " + name + " 无效，请先修正源配置。");
+        }
+    }
+
     private static MappingNode routingRoot(byte[] content) throws IOException {
         LoaderOptions options = new LoaderOptions();
         options.setAllowDuplicateKeys(false);

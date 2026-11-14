@@ -42,6 +42,10 @@ final class Controller {
 
     static Groups groups() throws Exception { return new Groups(selectable(readGroups())); }
 
+    static JSONObject runtimeSettings() throws Exception { return new JSONObject(request("GET", "/configs", "")); }
+
+    static void reconnectConnections() throws Exception { request("DELETE", "/connections", ""); }
+
     static JSONObject connections() throws Exception { return new JSONObject(probe("/connections")); }
 
     static void closeConnection(String id) throws Exception {
