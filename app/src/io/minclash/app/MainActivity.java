@@ -75,6 +75,7 @@ public final class MainActivity extends Activity {
     private static final int UPDATE_INSTALL_PERMISSION = 6;
     private static final int EXPORT_BACKUP = 7;
     private static final int IMPORT_BACKUP = 8;
+    private static final int REQUEST_SUBSCRIPTION_NOTIFICATIONS = 9;
     static final String NOTIFICATION_CONTROL = "notification_control";
     private static final String ROOT_INVENTORY = "root_app_inventory";
     private static final int BG = 0xff0d131a;
@@ -100,6 +101,10 @@ public final class MainActivity extends Activity {
     private TextView stateText;
     private TextView detailText;
     private TextView messageText;
+    private final Runnable dismissMessage = () -> {
+        messageText.setText("");
+        messageText.setVisibility(View.GONE);
+    };
     private Button toggle;
     private Button importButton;
     private Button subscriptionButton;
@@ -116,6 +121,10 @@ public final class MainActivity extends Activity {
     private AlertDialog managementDialog;
     private boolean resumed;
     private TextView subscriptionSummary;
+    private SubscriptionQuotaIndicator subscriptionIndicator;
+    private View currentConfigCard;
+    private TextView subscriptionSettingsSummary;
+    private boolean subscriptionNotificationSettingsOpened;
     private SubscriptionCatalog subscriptionCatalog;
     private SubscriptionCatalog.Snapshot subscriptions;
     private Button modeButton;
@@ -201,7 +210,7 @@ public final class MainActivity extends Activity {
         FrameLayout content = new FrameLayout(this);
         root.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
         LinearLayout overview = page(content, 0);
-        header(overview, "MinClash", "连接概览");
+        header(overview, "MinClash", "连接概览", true);
 
         LinearLayout dashboard = card(overview, 22);
         LinearLayout statusRow = new LinearLayout(this);
@@ -212,10 +221,14 @@ public final class MainActivity extends Activity {
         statusBadge.setBackground(shape(0xff203a35, 10, false));
         statusRow.addView(statusBadge);
         add(dashboard, statusRow, 0);
-        stateText = label("准备连接", 28, TEXT, true);
-        add(dashboard, stateText, 18);
+        LinearLayout connectionRow = new LinearLayout(this);
+        connectionRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout connectionDescription = column();
+        stateText = label("准备连接", 24, TEXT, true);
+        add(connectionDescription, stateText, 0);
         detailText = label("先检测环境，再导入你的配置。", 13, MUTED, false);
-        add(dashboard, detailText, 6);
+        add(connectionDescription, detailText, 4);
+        connectionRow.addView(connectionDescription, new LinearLayout.LayoutParams(0, -2, 1));
         toggle = button("启动 TUN", true);
         toggle.setOnClickListener(view -> {
             if (status == null) { refresh(); return; }
@@ -226,7 +239,10 @@ public final class MainActivity extends Activity {
                 return Module.status();
             });
         });
-        add(dashboard, toggle, 22);
+        LinearLayout.LayoutParams toggleParams = new LinearLayout.LayoutParams(dp(112), -2);
+        toggleParams.leftMargin = dp(12);
+        connectionRow.addView(toggle, toggleParams);
+        add(dashboard, connectionRow, 12);
         TextView backgroundHint = label("退出 App 后，连接仍会保持", 11, MUTED, false);
         backgroundHint.setGravity(Gravity.CENTER);
         add(dashboard, backgroundHint, 12);
@@ -255,6 +271,7 @@ public final class MainActivity extends Activity {
         add(overview, proxyHint, 10);
 
         LinearLayout current = card(overview, 22);
+        currentConfigCard = current;
         add(current, label("当前配置", 15, TEXT, true), 0);
         profileSummary = label("尚未导入配置", 13, MUTED, false);
         add(current, profileSummary, 6);
@@ -367,6 +384,14 @@ public final class MainActivity extends Activity {
         });
         add(service, foregroundAppButton, 8);
         add(service, label("手机启动后自动连接，需先导入有效配置。", 12, MUTED, false), 6);
+
+        LinearLayout subscriptionSettings = card(preferences, 14);
+        add(subscriptionSettings, label("订阅显示与提醒", 17, TEXT, true), 0);
+        subscriptionSettingsSummary = label("", 13, MUTED, false);
+        add(subscriptionSettings, subscriptionSettingsSummary, 8);
+        Button subscriptionDisplay = button("设置布局与到期通知", false);
+        subscriptionDisplay.setOnClickListener(view -> showSubscriptionSettings());
+        add(subscriptionSettings, subscriptionDisplay, 14);
 
         LinearLayout keepAlive = card(preferences, 14);
         add(keepAlive, label("后台连接保活", 17, TEXT, true), 0);
@@ -505,10 +530,18 @@ public final class MainActivity extends Activity {
         add(software, label("软件信息", 17, TEXT, true), 0);
         add(software, label("代理内核    Mihomo v1.19.33\n运行环境    Android 9+ · ARM64\nRoot 支持   KernelSU / Magisk", 13, MUTED, false), 12);
 
+        subscriptionIndicator = new SubscriptionQuotaIndicator(this,
+            () -> { if (subscriptions != null && subscriptions.active() != null) showUsage(subscriptions.active()); });
+        FrameLayout.LayoutParams indicatorParams = new FrameLayout.LayoutParams(dp(56), dp(64), Gravity.TOP | Gravity.END);
+        indicatorParams.topMargin = dp(24); indicatorParams.setMarginEnd(dp(18));
+        subscriptionIndicator.setVisibility(View.GONE);
+        content.addView(subscriptionIndicator, indicatorParams);
+
         messageText = label("", 12, AMBER, false);
         messageText.setPadding(dp(18), dp(12), dp(18), dp(12));
         messageText.setBackgroundColor(0xff302b22);
         messageText.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        messageText.setOnClickListener(view -> { main.removeCallbacks(dismissMessage); dismissMessage.run(); });
         root.addView(messageText);
         LinearLayout bar = new LinearLayout(this);
         bar.setPadding(dp(16), dp(10), dp(16), dp(10));
@@ -598,6 +631,49 @@ public final class MainActivity extends Activity {
         if (!Settings.canDrawOverlays(this)) showOverlayPermissionHelp(true);
     }
 
+    private void showSubscriptionSettings() {
+        trackManagement(SubscriptionSettingsDialog.show(this, appPreferences(), () -> {
+            render();
+            worker.execute(this::refreshSubscriptionCatalog);
+            showMessage("订阅显示与提醒已保存。");
+        }, this::requestSubscriptionNotifications));
+    }
+
+    private void requestSubscriptionNotifications() {
+        SubscriptionReminders.createChannel(this);
+        boolean missing = Build.VERSION.SDK_INT >= 33
+            && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED;
+        if (missing && (!appPreferences().getBoolean("subscription_notification_permission_requested", false)
+            || shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS))) {
+            appPreferences().edit().putBoolean("subscription_notification_permission_requested", true).apply();
+            requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, REQUEST_SUBSCRIPTION_NOTIFICATIONS);
+            return;
+        }
+        try {
+            subscriptionNotificationSettingsOpened = true;
+            startActivity(new Intent(missing ? Settings.ACTION_APP_NOTIFICATION_SETTINGS : Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()).putExtra(Settings.EXTRA_CHANNEL_ID, SubscriptionReminders.CHANNEL));
+        } catch (android.content.ActivityNotFoundException unavailable) {
+            try { startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName()))); }
+            catch (android.content.ActivityNotFoundException missingScreen) {
+                subscriptionNotificationSettingsOpened = false;
+                showMessage("此设备没有可用的通知设置入口。");
+            }
+        }
+    }
+
+    private void handleSubscriptionReminderIntent() {
+        Intent intent = getIntent();
+        if (!resumed || subscriptions == null || !SubscriptionReminders.ACTION_OPEN.equals(intent.getAction())) return;
+        String key = intent.getStringExtra(SubscriptionReminders.EXTRA_KEY);
+        intent.setAction(null);
+        selectPage(1);
+        SubscriptionCatalog.Entry entry = subscriptions.entries().stream()
+            .filter(item -> SubscriptionReminders.key(item.address()).equals(key)).findFirst().orElse(null);
+        if (entry == null) showMessage("此订阅已被移除。");
+        else showUsage(entry);
+    }
+
     private void showOverlayPermissionHelp(boolean mode) {
         boolean allowed = Settings.canDrawOverlays(this);
         AlertDialog.Builder dialog = new AlertDialog.Builder(this)
@@ -673,6 +749,8 @@ public final class MainActivity extends Activity {
         visible = false;
         main.removeCallbacks(poll);
         main.removeCallbacks(pollLatency);
+        main.removeCallbacks(dismissMessage);
+        dismissMessage.run();
         resetNetworkChecks();
         super.onStop();
     }
@@ -680,6 +758,10 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         resumed = true;
+        if (subscriptionNotificationSettingsOpened) {
+            subscriptionNotificationSettingsOpened = false;
+            worker.execute(this::refreshSubscriptionCatalog);
+        }
         background.observe(main::post, this::deliverBackgroundResults);
         UpdateInstallReceiver.listen(this::onUpdateInstallResult);
         if (appPreferences().getBoolean("connected", false)) main.post(poll);
@@ -691,11 +773,13 @@ public final class MainActivity extends Activity {
             showOverlayPermissionHelp(intent.getBooleanExtra(ProxyNotificationService.EXTRA_MODE_PANEL, true));
         }
         deliverBackgroundResults();
+        handleSubscriptionReminderIntent();
     }
 
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        handleSubscriptionReminderIntent();
     }
 
     @Override protected void onPause() {
@@ -713,6 +797,7 @@ public final class MainActivity extends Activity {
         background.stopObserving();
         main.removeCallbacks(poll);
         main.removeCallbacks(pollLatency);
+        main.removeCallbacks(dismissMessage);
         routingIcons.close();
         networkWorker.shutdownNow();
         super.onDestroy();
@@ -918,10 +1003,12 @@ public final class MainActivity extends Activity {
     private void refreshSubscriptionCatalog() {
         try {
             SubscriptionCatalog.Snapshot loaded = subscriptionCatalog.load();
+            SubscriptionReminders.reconcile(getApplicationContext(), loaded);
             main.post(() -> {
                 if (isDestroyed()) return;
                 subscriptions = loaded;
                 render();
+                handleSubscriptionReminderIntent();
             });
         } catch (Exception error) {
             main.post(() -> {
@@ -1164,27 +1251,18 @@ public final class MainActivity extends Activity {
     private AlertDialog usageDialog(SubscriptionCatalog.Entry entry, SubscriptionUsage usage, Runnable dismiss) {
         AppUi ui = new AppUi(this);
         LinearLayout form = ui.column(); form.setPadding(dp(20), dp(8), dp(20), dp(8));
-        ui.add(form, ui.label(entry.name(), 14, MINT, true), 0);
-        ui.add(form, ui.label(usage.checkedAt() == 0 ? "尚未读取" : usage.used() < 0 ? "用量未提供" : SubscriptionUsage.bytes(usage.used()), 28, TEXT, true), 12);
-        ui.add(form, ui.label("已用流量 / 总额 " + SubscriptionUsage.bytes(usage.total()), 12, MUTED, false), 4);
-        if (usage.used() >= 0 && usage.total() > 0) {
-            android.widget.ProgressBar progress = new android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-            progress.setMax(1000); progress.setProgress((int) Math.min(1000, (double) usage.used() / usage.total() * 1000));
-            progress.setProgressTintList(ColorStateList.valueOf(usage.used() > usage.total() ? AMBER : MINT));
-            ui.add(form, progress, 12);
-        }
-        String expiry = usage.expire() < 0 ? "未提供" : java.text.DateFormat.getDateTimeInstance().format(new java.util.Date(usage.expire() * 1000));
-        boolean expired = usage.expire() > 0 && usage.expire() <= System.currentTimeMillis() / 1000;
-        ui.add(form, ui.label("剩余  " + SubscriptionUsage.bytes(usage.remaining()) + "\n上传  " + SubscriptionUsage.bytes(usage.upload())
+        SubscriptionCard card = new SubscriptionCard(this, null, null, null);
+        card.bind(entry, usage, appPreferences(), System.currentTimeMillis(), false,
+            subscriptions != null && entry.address().equals(subscriptions.activeAddress())); ui.add(form, card, 0);
+        ui.add(form, ui.label("上传  " + SubscriptionUsage.bytes(usage.upload())
             + "\n下载  " + SubscriptionUsage.bytes(usage.download()), 14, TEXT, false), 14);
-        ui.add(form, ui.label("到期时间  " + expiry + (expired ? " · 已到期" : ""), 13, expired ? AMBER : MUTED, false), 14);
-        ui.add(form, ui.label("最近读取  " + (usage.checkedAt() == 0 ? "尚未读取" : java.text.DateFormat.getDateTimeInstance().format(new java.util.Date(usage.checkedAt()))), 11, MUTED, false), 8);
         ui.add(form, ui.label(usage.checkedAt() == 0 ? "点击刷新读取服务商用量，不会切换订阅或应用配置。"
             : "服务商返回的最近一次快照，不是实时流量。缺失字段明确标注；总额 0 不推断是否不限量。", 11, MUTED, false), 12);
         ScrollView scroll = new ScrollView(this); scroll.addView(form);
         return new AlertDialog.Builder(this).setTitle("流量与有效期").setView(scroll)
             .setNegativeButton("关闭", (view, which) -> { if (dismiss != null) dismiss.run(); })
             .setOnCancelListener(view -> { if (dismiss != null) dismiss.run(); })
+            .setNeutralButton("显示与提醒", (view, which) -> { if (dismiss != null) dismiss.run(); showSubscriptionSettings(); })
             .setPositiveButton("刷新用量", (view, which) -> { if (dismiss != null) dismiss.run(); refreshUsage(entry); }).show();
     }
 
@@ -1200,6 +1278,7 @@ public final class MainActivity extends Activity {
                             throw new IOException("此订阅已被移除，未保存用量。");
                         }
                         usage.save(prefs, entry.address());
+                        SubscriptionReminders.reconcile(context, catalog.load());
                         return new BackgroundWork.UsageResult(entry, usage);
                     }).get();
                 });
@@ -2040,6 +2119,13 @@ public final class MainActivity extends Activity {
             else showMessage("开启通知栏控制需要在系统设置中允许 MinClash 通知。");
             return;
         }
+        if (request == REQUEST_SUBSCRIPTION_NOTIFICATIONS) {
+            if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+                worker.execute(this::refreshSubscriptionCatalog);
+            } else showMessage("到期提醒需要通知权限，可在「订阅显示与提醒」中重新开启。");
+            render();
+            return;
+        }
         if (request == REQUEST_APP_LIST) refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false));
     }
 
@@ -2838,6 +2924,11 @@ public final class MainActivity extends Activity {
         setupHint.setText(setup);
         setupHint.setVisibility(setup.isEmpty() ? View.GONE : View.VISIBLE);
         SubscriptionCatalog.Entry active = subscriptions == null ? null : subscriptions.active();
+        updateSubscriptionIndicator();
+        currentConfigCard.setVisibility(active == null ? View.VISIBLE : View.GONE);
+        subscriptionSettingsSummary.setText("详情布局：" + (SubscriptionPreferences.DUAL.equals(SubscriptionPreferences.style(appPreferences())) ? "流量与有效期并列" : "额度优先")
+            + "\n" + (SubscriptionPreferences.enabled(appPreferences()) ? "到期前 " + SubscriptionPreferences.daysLabel(appPreferences()) + " 天及到期时提醒"
+                + (SubscriptionReminders.canShow(this) ? "" : " · 通知权限未开启") : "到期通知已关闭"));
         String current = active != null ? "当前订阅 · " + active.name()
             : installed && status.profile ? "本地配置已就绪" : "尚未启用订阅";
         profileSummary.setText(installed && status.profile ? current : "尚未导入配置");
@@ -2933,8 +3024,24 @@ public final class MainActivity extends Activity {
     }
 
     private void showMessage(String text) {
+        main.removeCallbacks(dismissMessage);
         messageText.setText(text);
         messageText.setVisibility(text == null || text.isEmpty() ? View.GONE : View.VISIBLE);
+        if (text != null && !text.isEmpty()) {
+            int timeout = 5_000;
+            if (Build.VERSION.SDK_INT >= 29) {
+                android.view.accessibility.AccessibilityManager accessibility = getSystemService(android.view.accessibility.AccessibilityManager.class);
+                if (accessibility != null) timeout = accessibility.getRecommendedTimeoutMillis(timeout,
+                    android.view.accessibility.AccessibilityManager.FLAG_CONTENT_TEXT | android.view.accessibility.AccessibilityManager.FLAG_CONTENT_CONTROLS);
+            }
+            main.postDelayed(dismissMessage, timeout);
+        }
+    }
+
+    private void updateSubscriptionIndicator() {
+        SubscriptionCatalog.Entry active = subscriptions == null ? null : subscriptions.active();
+        subscriptionIndicator.setVisibility(selectedPage == 0 && active != null ? View.VISIBLE : View.GONE);
+        if (active != null) subscriptionIndicator.bind(active, SubscriptionUsage.load(appPreferences(), active.address()), System.currentTimeMillis());
     }
 
     private void showLogs(String logs) {
@@ -2990,13 +3097,22 @@ public final class MainActivity extends Activity {
     }
 
     private void header(LinearLayout parent, String title, String description) {
+        header(parent, title, description, false);
+    }
+
+    private void header(LinearLayout parent, String title, String description, boolean quotaCorner) {
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.addView(label(title, 30, TEXT, true), new LinearLayout.LayoutParams(0, -2, 1));
-        TextView version = label("v" + appVersion(), 11, MINT, true);
-        version.setPadding(dp(10), dp(6), dp(10), dp(6));
-        version.setBackground(shape(0xff203a35, 10, false));
-        row.addView(version);
+        if (quotaCorner) {
+            View space = new View(this);
+            row.addView(space, new LinearLayout.LayoutParams(dp(56), dp(40)));
+        } else {
+            TextView version = label("v" + appVersion(), 11, MINT, true);
+            version.setPadding(dp(10), dp(6), dp(10), dp(6));
+            version.setBackground(shape(0xff203a35, 10, false));
+            row.addView(version);
+        }
         add(parent, row, 0);
         add(parent, label(description, 13, MUTED, false), 5);
     }
@@ -3015,6 +3131,7 @@ public final class MainActivity extends Activity {
             navigation[i].setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9),
                 shape(i == selectedPage ? 0xff203a35 : CARD, 12, false), null));
         }
+        updateSubscriptionIndicator();
         scheduleLatency(0);
         warmAppRouting();
     }

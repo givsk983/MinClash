@@ -1,4 +1,4 @@
-# MinClash 0.2.0
+# MinClash 0.2.1
 
 MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模块和 Mihomo v1.19.33-minclash.1 Android ARM64 内核。分发 `dist/MinClash.apk` 时一并提供 `dist/mihomo-v1.19.33-minclash.1-source.tar.gz` 对应源码包；安装模块所需文件已经包含在 APK 内。适用于 ARM64、Android 9 及以上，且内核支持 `/dev/tun` 或 `/dev/net/tun` 的 Root 手机。
 

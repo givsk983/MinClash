@@ -40,6 +40,7 @@ final class BackupArchive {
     static boolean portableKey(String key) {
         return key.equals("node_sort_delay") || key.equals("node_hide_failed")
             || key.equals("auto_subscription_update") || key.equals("routing_categories")
+            || key.equals(SubscriptionPreferences.STYLE) || key.equals(SubscriptionPreferences.SHOW_PERCENT)
             || key.matches("node_favorites_[0-9a-f]{64}");
     }
 
@@ -183,6 +184,8 @@ final class BackupArchive {
                 Set<String> names = new LinkedHashSet<>();
                 for (int i = 0; i < array.length(); i++) names.add(string(array.get(i), 4096));
                 value = Collections.unmodifiableSet(names);
+            } else if (key.equals(SubscriptionPreferences.STYLE)) {
+                if (!SubscriptionPreferences.QUOTA.equals(value) && !SubscriptionPreferences.DUAL.equals(value)) throw new IOException();
             } else if (key.equals("routing_categories")) {
                 String raw = string(value, MAX_BYTES);
                 checkDepth(raw);

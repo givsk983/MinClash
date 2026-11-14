@@ -21,6 +21,13 @@ public final class BackupArchiveCheck {
         byte[] encrypted = BackupArchive.encode(data, password);
         require(BackupArchive.encrypted(encrypted), "encrypted archive recognized");
         roundTrip(data, BackupArchive.decode(encrypted, password));
+        Map<String, Object> displaySettings = new TreeMap<>(data.preferences());
+        displaySettings.put(SubscriptionPreferences.STYLE, SubscriptionPreferences.DUAL);
+        displaySettings.put(SubscriptionPreferences.SHOW_PERCENT, false);
+        BackupArchive.Data displayData = new BackupArchive.Data(data.state(), data.subscriptions(), displaySettings, 1, "0.2.1");
+        roundTrip(displayData, BackupArchive.decode(BackupArchive.encode(displayData, new char[0]), new char[0]));
+        displaySettings.put(SubscriptionPreferences.STYLE, "unknown-style");
+        rejectData(new BackupArchive.Data(data.state(), data.subscriptions(), displaySettings, 1, "0.2.1"), "unknown display style");
         require(!new String(encrypted, StandardCharsets.ISO_8859_1).contains(SECRET), "encrypted archive does not expose subscription token");
         require(!Arrays.equals(encrypted, BackupArchive.encode(data, password)), "fresh salt and nonce for each export");
         try {
@@ -44,7 +51,8 @@ public final class BackupArchiveCheck {
         byte[] future = plain.clone();
         future["MINCLASH-BACKUP\n".length()] = 2;
         reject(() -> BackupArchive.decode(future, password), "future format version");
-        for (String key : List.of("notification_control", "root_app_inventory", "connected", "arbitrary_path")) {
+        for (String key : List.of("notification_control", "root_app_inventory", "connected", "arbitrary_path",
+            SubscriptionPreferences.REMINDERS, SubscriptionPreferences.DAYS, "subscription_reminder_sent_private")) {
             Map<String, Object> settings = new TreeMap<>(data.preferences());
             settings.put(key, true);
             rejectData(new BackupArchive.Data(data.state(), data.subscriptions(), settings, 1, "0.1.7"), "nonportable setting " + key);

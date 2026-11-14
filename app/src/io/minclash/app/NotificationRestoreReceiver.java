@@ -10,6 +10,7 @@ public final class NotificationRestoreReceiver extends BroadcastReceiver {
         if (Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())
             || Intent.ACTION_MY_PACKAGE_REPLACED.equals(intent.getAction())) {
             ProxyNotificationService.restore(context);
+            SubscriptionReminders.request(context);
         }
     }
 }

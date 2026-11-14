@@ -95,7 +95,10 @@ public final class SubscriptionUpdateJob extends JobService {
             if (active != params || !preferences.getBoolean(ENABLED, false)) return;
             RoutingStore routing = new RoutingStore(this);
             SubscriptionCatalog.Entry latest = new SubscriptionCatalog(preferences, routing).load().active();
-            if (latest != null && latest.address().equals(current.address())) downloaded.usage().cache(preferences, current.address());
+            if (latest != null && latest.address().equals(current.address())) {
+                downloaded.usage().cache(preferences, current.address());
+                SubscriptionReminders.reconcile(this, new SubscriptionCatalog(preferences, routing).load());
+            }
             if (generation != RoutingStore.generation() || latest == null || !latest.address().equals(current.address())) {
                 outcome = "跳过，下载期间配置或当前订阅已变化";
                 return;

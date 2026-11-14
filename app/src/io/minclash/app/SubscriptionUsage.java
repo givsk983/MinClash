@@ -36,15 +36,33 @@ record SubscriptionUsage(long upload, long download, long total, long expire, lo
 
     long used() { return upload < 0 || download < 0 || upload > Long.MAX_VALUE - download ? -1 : upload + download; }
     long remaining() { return total <= 0 || used() < 0 ? -1 : Math.max(0, total - used()); }
+    double remainingRatio() { return remaining() < 0 ? -1 : (double) remaining() / total; }
+    String expiryLabel(long now) {
+        if (expire < 0) return "有效期未提供";
+        long left = expire * 1000 - now;
+        if (left <= 0) return "订阅已到期";
+        if (left < 3_600_000) return "不足 1 小时到期";
+        if (left < 86_400_000) return ((left + 3_599_999) / 3_600_000) + " 小时后到期";
+        return ((left + 86_399_999) / 86_400_000) + " 天后到期";
+    }
+    String expiryDate() {
+        return expire < 0 ? "服务商未提供到期时间" : new java.text.SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
+            .format(new java.util.Date(expire * 1000)) + " 到期";
+    }
+    String freshness(long now) {
+        if (checkedAt == 0) return "尚未读取服务商用量";
+        return "服务商快照 · " + new java.text.SimpleDateFormat("MM/dd HH:mm", Locale.getDefault())
+            .format(new java.util.Date(checkedAt)) + (now - checkedAt >= 86_400_000 ? "（较旧）" : "");
+    }
     String summary() {
         if (checkedAt == 0) return "用量和到期时间尚未读取";
-        return (used() < 0 ? "用量未提供" : "已用 " + bytes(used())) + (total < 0 ? " · 总额未提供" : " / " + bytes(total))
-            + (expire < 0 ? " · 到期未提供" : " · 到期 " + java.text.DateFormat.getDateInstance().format(new java.util.Date(expire * 1000)));
+        return (remaining() < 0 ? "剩余未提供" : "剩余 " + bytes(remaining())) + (total < 0 ? " · 总额未提供" : " / " + bytes(total))
+            + " · " + expiryLabel(System.currentTimeMillis());
     }
     String detail(long now) {
         String expiry = expire < 0 ? "服务商未提供" : java.text.DateFormat.getDateTimeInstance().format(new java.util.Date(expire * 1000))
             + (expire <= now / 1000 ? "（已到期）" : "");
-        return summary() + "\n上传  " + bytes(upload) + "\n下载  " + bytes(download)
+        return summary() + "\n已用  " + bytes(used()) + "\n上传  " + bytes(upload) + "\n下载  " + bytes(download)
             + "\n剩余  " + bytes(remaining()) + (total > 0 && used() > total ? "（已超额）" : "")
             + "\n到期时间  " + expiry + "\n最近读取  "
             + (checkedAt == 0 ? "尚未读取" : java.text.DateFormat.getDateTimeInstance().format(new java.util.Date(checkedAt)))
