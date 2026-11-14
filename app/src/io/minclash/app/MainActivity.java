@@ -143,6 +143,10 @@ public final class MainActivity extends Activity {
     private Switch bootSwitch;
     private Switch hotspotSwitch;
     private TextView hotspotSummary;
+    private Switch keepAliveSwitch;
+    private TextView keepAliveSummary;
+    private Button keepAliveLevelButton;
+    private Button keepAliveApplyButton;
     private Button notificationButton;
     private Button backgroundPermissionButton;
     private Button overlayPermissionButton;
@@ -363,6 +367,39 @@ public final class MainActivity extends Activity {
         });
         add(service, foregroundAppButton, 8);
         add(service, label("手机启动后自动连接，需先导入有效配置。", 12, MUTED, false), 6);
+
+        LinearLayout keepAlive = card(preferences, 14);
+        add(keepAlive, label("后台连接保活", 17, TEXT, true), 0);
+        keepAliveSwitch = new Switch(this);
+        keepAliveSwitch.setText("启用连接保活");
+        keepAliveSwitch.setTextColor(TEXT);
+        keepAliveSwitch.setTextSize(16);
+        keepAliveSwitch.setMinHeight(dp(48));
+        keepAliveSwitch.setThumbTintList(bootSwitch.getThumbTintList());
+        keepAliveSwitch.setTrackTintList(bootSwitch.getTrackTintList());
+        keepAliveSwitch.setOnCheckedChangeListener((button, checked) -> {
+            if (!updatingSwitch) saveKeepAlive(checked ? selectedKeepAliveLevel() : TcpKeepAlive.Mode.OFF);
+        });
+        add(keepAlive, keepAliveSwitch, 10);
+        add(keepAlive, label("识别后台 TCP 长连接的失效状态，改善应用返回前台后的连接恢复。", 13, MUTED, false), 6);
+        LinearLayout keepAliveExample = column();
+        keepAliveExample.setPadding(dp(12), dp(12), dp(12), dp(12));
+        keepAliveExample.setBackground(shape(0xff102b28, 12, false));
+        add(keepAliveExample, label("使用示例", 12, MINT, true), 0);
+        add(keepAliveExample, label("例如：Telegram 长时间处于后台后，返回前台仍显示“连接中”，消息刷新延迟。启用保活有助于检测失效连接并触发应用重连，建议先使用均衡档。", 13, TEXT, false), 6);
+        add(keepAlive, keepAliveExample, 12);
+        add(keepAlive, label("默认关闭，连接正常时无需启用。开启可能增加探测流量与功耗，无法保证系统深度休眠期间即时接收消息。", 12, MUTED, false), 10);
+        keepAliveLevelButton = button("保活强度：均衡", false);
+        keepAliveLevelButton.setOnClickListener(view -> showKeepAliveLevels());
+        add(keepAlive, keepAliveLevelButton, 12);
+        keepAliveSummary = label("", 12, MUTED, false);
+        add(keepAlive, keepAliveSummary, 8);
+        keepAliveApplyButton = button("重连 TUN 使设置生效", false);
+        keepAliveApplyButton.setOnClickListener(view -> new AlertDialog.Builder(this).setTitle("重连以应用保活设置")
+            .setMessage("将短暂断开当前连接，并尝试恢复原来的节点选择。下载、通话等可能受到影响。")
+            .setNegativeButton("稍后", null).setPositiveButton("立即重连", (dialog, which) ->
+                execute("保活设置已应用。", true, TcpKeepAlive::reconnect)).show());
+        add(keepAlive, keepAliveApplyButton, 10);
 
         LinearLayout appearance = card(preferences, 14);
         add(appearance, label("外观", 17, TEXT, true), 0);
@@ -1593,6 +1630,32 @@ public final class MainActivity extends Activity {
         LauncherIcon icon = LauncherIcon.current(this);
         launcherIconButton.setText("桌面图标 · " + icon.label);
         aboutLogo.setImageResource(getResources().getIdentifier(icon.drawable, "drawable", getPackageName()));
+    }
+
+    private TcpKeepAlive.Mode selectedKeepAliveLevel() {
+        if (status != null && status.keepAlive.configured() != TcpKeepAlive.Mode.OFF) return status.keepAlive.configured();
+        TcpKeepAlive.Mode saved = TcpKeepAlive.Mode.parse(appPreferences().getString(TcpKeepAlive.LEVEL_PREFERENCE, "balanced"));
+        return saved == TcpKeepAlive.Mode.OFF ? TcpKeepAlive.Mode.BALANCED : saved;
+    }
+
+    private void saveKeepAlive(TcpKeepAlive.Mode mode) {
+        execute("保活设置已保存，下次启动 TUN 生效。", () -> {
+            if (!Module.status().keepAlive.available()) throw new IOException("当前模块不支持此功能，请先更新内置模块。");
+            Module.run(mode.command, null);
+            if (mode != TcpKeepAlive.Mode.OFF) appPreferences().edit().putString(TcpKeepAlive.LEVEL_PREFERENCE, mode.value).apply();
+            return Module.status();
+        });
+    }
+
+    private void showKeepAliveLevels() {
+        boolean enabled = status != null && status.keepAlive.configured() != TcpKeepAlive.Mode.OFF;
+        trackManagement(KeepAliveDialog.show(this, selectedKeepAliveLevel(), enabled, mode -> {
+            if (status != null && status.keepAlive.configured() != TcpKeepAlive.Mode.OFF) saveKeepAlive(mode);
+            else {
+                appPreferences().edit().putString(TcpKeepAlive.LEVEL_PREFERENCE, mode.value).apply();
+                render();
+            }
+        }));
     }
 
     private void showLauncherIcons() {
@@ -2837,6 +2900,14 @@ public final class MainActivity extends Activity {
         hotspotSwitch.setChecked(installed && status.hotspotEnabled);
         hotspotSwitch.setEnabled(!busy && enabled && status.hotspot);
         hotspotSummary.setText(installed ? status.hotspotSummary() : "安装新版内置模块并重启后可用。");
+        boolean keepAliveAvailable = enabled && status.keepAlive.available();
+        keepAliveSwitch.setChecked(installed && status.keepAlive.configured() != TcpKeepAlive.Mode.OFF);
+        keepAliveSwitch.setEnabled(!busy && keepAliveAvailable);
+        keepAliveLevelButton.setText("保活强度：" + selectedKeepAliveLevel().label);
+        keepAliveLevelButton.setEnabled(!busy && keepAliveAvailable);
+        keepAliveSummary.setText(installed ? status.keepAlive.summary(running) : "安装支持此功能的模块并重启后可用，默认关闭。");
+        keepAliveApplyButton.setVisibility(installed && status.keepAlive.needsRestart(running) ? View.VISIBLE : View.GONE);
+        keepAliveApplyButton.setEnabled(!busy && keepAliveAvailable && running);
         updatingSwitch = false;
         boolean notification = notificationEnabled();
         notificationButton.setText(notification ? "关闭通知栏控制" : "开启通知栏控制");

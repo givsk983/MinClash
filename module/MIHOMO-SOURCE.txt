@@ -1,6 +1,16 @@
-MinClash packages the unmodified Android ARM64 Mihomo v1.19.33 release binary.
+MinClash packages Mihomo v1.19.33-minclash.1, modified on 2026-11-14.
+Base commit: 3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8 (upstream v1.19.33).
+Modification: optional TCP keepalive, OFF by default, with three user-selected policies.
+Conservative: idle 180s / interval 30s; balanced: 120s / 20s; aggressive: 60s / 15s.
+All policies use 3 unanswered probes and check kernel support before enabling.
+The supervisor sets MINCLASH_TCP_KEEPALIVE only for an explicitly enabled policy.
+Missing/invalid policy or unsupported kernel retains upstream connection behavior.
 
 Upstream release: https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33
-Source tag: https://github.com/MetaCubeX/mihomo/tree/v1.19.33
-Source archive: https://github.com/MetaCubeX/mihomo/archive/refs/tags/v1.19.33.tar.gz
+Base source: https://github.com/MetaCubeX/mihomo/tree/3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8
+Base archive SHA-256: ecda5f8c8a8a1d60bc088c2640c85d92c8f002c0686234a26bdf671735afe216
+Official vendor archive SHA-256: 7ac4d4da0e6a29ef6ed18d2cf8f4c58d361d049ae364fd841acc883aa3a9e1cc
+Corresponding modified source, tests, dependencies and build instructions:
+  mihomo-v1.19.33-minclash.1-source.tar.gz (provided alongside the APK/module).
+MinClash repository: build_core.py and mihomo-patches/ contain the reproducible build.
 License: GNU General Public License v3, included as LICENSE-mihomo.txt.

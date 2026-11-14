@@ -1,6 +1,5 @@
 import argparse
 from pathlib import Path
-import gzip
 import hashlib
 import os
 import shutil
@@ -8,15 +7,14 @@ import struct
 import subprocess
 import urllib.request
 import zipfile
+from build_core import build_mihomo
 
 
 ROOT = Path(__file__).resolve().parent
 BUILD = ROOT / "build"
 DOWNLOADS = BUILD / "downloads"
 DIST = ROOT / "dist"
-MIHOMO = "v1.19.33"
 SNAKEYAML = "2.5"
-ANDROID_CORE = f"mihomo-android-arm64-v8-{MIHOMO}.gz"
 YAML_JAR = f"snakeyaml-{SNAKEYAML}.jar"
 RELEASE_CERT_SHA256 = "8c7b06c0539fc7cab859a13f82836465de2359d2a4dd45ccac5804c35e5f5ef1"
 
@@ -137,7 +135,7 @@ def build_apk(yaml_jar, apache_license, module_archive, keystore, release):
     apk.replace(DIST / "MinClash.apk")
 
 
-def build_socket_request():
+def ndk_clang():
     ndk_path = os.environ.get("ANDROID_NDK_HOME")
     if not ndk_path:
         sdk_path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
@@ -151,16 +149,18 @@ def build_socket_request():
     clang = next(prebuilt.glob(f"*/bin/{clang_name}"), None)
     if clang is None:
         raise RuntimeError("Install Android NDK 27.0.12077973 or set ANDROID_NDK_HOME.")
+    return clang
+
+
+def build_socket_request():
+    clang = ndk_clang()
     binary = BUILD / "socket-request"
     execute(clang, "--target=aarch64-linux-android28", "-O2", "-Wall", "-Wextra",
             "-Wl,-z,max-page-size=16384", "-s", ROOT / "module-src/socket-request.c", "-o", binary)
     return binary
 
 
-def build_module(archive, license_path):
-    core = BUILD / "mihomo-arm64"
-    with gzip.open(archive) as source, core.open("wb") as target:
-        shutil.copyfileobj(source, target)
+def build_module(core, license_path):
     with core.open("rb") as source:
         elf = source.read(64)
     if elf[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", elf, 18)[0] != 183:
@@ -199,16 +199,15 @@ def main():
         raise RuntimeError("Restore the MinClash signing keystore or set MINCLASH_KEYSTORE before building a release.")
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
     DIST.mkdir(exist_ok=True)
-    archive = download(ANDROID_CORE, f"https://github.com/MetaCubeX/mihomo/releases/download/{MIHOMO}/{ANDROID_CORE}",
-                       "2ddbd3aaa884f52b4568f406876ec81dddeef9f1bb67b90d4004d356e2c6a708")
-    mihomo_license = download("mihomo-LICENSE", f"https://raw.githubusercontent.com/MetaCubeX/mihomo/{MIHOMO}/LICENSE",
-                              "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986")
     yaml_jar = download(YAML_JAR, f"https://repo.maven.apache.org/maven2/org/yaml/snakeyaml/{SNAKEYAML}/{YAML_JAR}",
                         "e6682acf1ace77508ef13649cbf4f8d09d2cf5457bdb61d25ffb6ac0233d78dd")
     apache_license = download("apache-2.0-LICENSE", "https://www.apache.org/licenses/LICENSE-2.0.txt",
                               "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30")
-    module_archive = build_module(archive, mihomo_license)
+    core, mihomo_license, core_source = build_mihomo(download, ndk_clang())
+    module_archive = build_module(core, mihomo_license)
     build_apk(yaml_jar, apache_license, module_archive, keystore, options.release)
+    shutil.copyfile(module_archive, DIST / module_archive.name)
+    shutil.copyfile(core_source, DIST / core_source.name)
     apk = DIST / "MinClash.apk"
     print(f"APK (module included): {apk}\nSHA-256: {sha256(apk)}")
 

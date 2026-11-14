@@ -1,6 +1,6 @@
-# MinClash 0.1.9
+# MinClash 0.2.0
 
-MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模块和 Mihomo v1.19.33 Android ARM64 内核。发布时只需要分发 `dist/MinClash.apk`。适用于 ARM64、Android 9 及以上，且内核支持 `/dev/tun` 或 `/dev/net/tun` 的 Root 手机。
+MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模块和 Mihomo v1.19.33-minclash.1 Android ARM64 内核。分发 `dist/MinClash.apk` 时一并提供 `dist/mihomo-v1.19.33-minclash.1-source.tar.gz` 对应源码包；安装模块所需文件已经包含在 APK 内。适用于 ARM64、Android 9 及以上，且内核支持 `/dev/tun` 或 `/dev/net/tun` 的 Root 手机。
 
 ## 安装和使用
 
@@ -55,7 +55,7 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 若小米／Redmi 手机划掉后台后通知一直消失，在「设置 → 后台运行设置」打开系统自启动管理，允许 MinClash 自启动，并检查应用信息中的省电策略。真机发现未允许自启动时，系统会把划掉任务处理为强行停止整个应用；仅使用独立进程无法避免。允许自启动后通知可在系统清理后恢复，期间可能短暂消失。覆盖升级后若系统重置了自启动选项，需重新允许。
 
-「设置 → 个人热点共享代理」让热点设备沿用当前代理模式、订阅规则和节点，无需在客户端手动设置代理。建议使用内置模块 0.0.8（修订号 7），包含热点 DNS 修复、能力预检和持续恢复。安装后重启手机。开启共享开关后，启动 TUN，再开启系统个人热点；若提示系统网络共享加速仍在运行，需重启手机，让系统加载新的加速设置。共享状态会区分规则就绪、等待客户端流量、已有请求及已检测到回包；这些计数不代替客户端实际联网测试。应用分流按手机包名匹配，只适用于手机本机。关闭共享开关后，热点恢复系统网络共享。
+「设置 → 个人热点共享代理」让热点设备沿用当前代理模式、订阅规则和节点，无需在客户端手动设置代理。模块 0.0.8（修订号 7）及以上包含热点 DNS 修复、能力预检和持续恢复。安装后重启手机。开启共享开关后，启动 TUN，再开启系统个人热点；若提示系统网络共享加速仍在运行，需重启手机，让系统加载新的加速设置。共享状态会区分规则就绪、等待客户端流量、已有请求及已检测到回包；这些计数不代替客户端实际联网测试。应用分流按手机包名匹配，只适用于手机本机。关闭共享开关后，热点恢复系统网络共享。
 
 下拉 Android 快捷设置，在编辑磁贴界面添加「MinClash TUN」。磁贴可启停 TUN，并显示运行、启动或重试状态。
 
@@ -82,9 +82,15 @@ MinClash 是 Android Root TUN 工具，APK 内置完整的 KernelSU / Magisk 模
 
 ## 构建
 
-准备 Python 3.11 或以上、JDK 17 或以上、Android SDK Platform 36、Build Tools 36.0.0 和 NDK 27.0.12077973。通过 `ANDROID_HOME` 指定 SDK 目录，再运行 `python build.py`。如果 NDK 安装在其他位置，可通过 `ANDROID_NDK_HOME` 指定其目录。脚本校验下载文件的 SHA-256，在 `build` 中生成模块 ZIP，再将其和校验值嵌入 `dist/MinClash.apk`。发布时运行 `python build.py --release`，脚本会校验签名指纹并输出 APK 的 SHA-256。请私下备份现有的 `build/debug.keystore`，也可用 `MINCLASH_KEYSTORE` 指向备份位置。
+准备 Python 3.11 或以上、JDK 17 或以上、Go 1.26.11、Android SDK Platform 36、Build Tools 36.0.0 和 NDK 27.0.12077973。通过 `ANDROID_HOME` 指定 SDK 目录，再运行 `python build.py`。Go 不在 PATH 时设置 `MINCLASH_GO`，NDK 安装在其他位置时设置 `ANDROID_NDK_HOME`。脚本校验固定 Mihomo 源码、官方 vendor 依赖和其他下载文件的 SHA-256，应用 `mihomo-patches/` 后测试并构建内核。模块 ZIP 及校验值嵌入 `dist/MinClash.apk`，模块和完整修改源码包也输出到 `dist`；提供安装包时一并提供源码包。详细构建参数见 [内核修改说明](mihomo-patches/README.md)。发布签名构建使用 `python build.py --release`，脚本会校验签名指纹并输出 APK 的 SHA-256。请私下备份现有的 `build/debug.keystore`，也可用 `MINCLASH_KEYSTORE` 指向备份位置。
 
-App 当前展示版本为 `0.1.9`，构建 `versionCode=33`。内置模块为 `0.0.8`、`versionCode=17`、功能修订号 `revision=7`。本轮界面、后台流程和接口兼容优化随 App 升级生效，无需重装模块或重启手机；持续网络恢复、热点预检和通知心跳恢复需要支持这些能力的模块。构建从 `module/module.prop` 生成内置模块元数据，供界面判断和展示。
+App 当前版本为 `0.2.0`，构建 `versionCode=36`，合并 0.1.10 与 0.1.11 的开发更新。内置模块为 `0.0.9`、`versionCode=18`、功能修订号 `revision=8`。已安装该模块的用户无需重复安装；旧模块用户如需使用保活功能，需安装内置模块并重启，暂不使用该功能可继续沿用旧模块。App 依据模块功能修订号及必要能力判断更新，不依据 App 版本要求重装。
+
+模块 0.0.9 新增「设置 → 后台连接保活」，默认关闭，旧模块继续使用现有代理能力。用户可开启并选择保守（空闲 180 秒、重试间隔 30 秒）、均衡（120／20 秒）或激进（60／15 秒），连续 3 次无响应后由系统判定连接失效，帮助 Telegram 等应用重连。开启前检查所选参数；不支持就退回原行为，并在设置页提示。正常 TCP 数据会延后探测，正常空闲连接仍保留，订阅重载保留当前会话的策略。
+
+保存开关或强度不会直接打断现有连接，下次启动 TUN 时生效。运行中若有待应用更改，设置页提供「重连 TUN 使设置生效」，确认后短暂断线并尝试恢复原节点选择。保活开关保存在本机 Root 数据目录，关闭时选定的强度记在 App 本机偏好中，均不进入备份。不新增轮询、唤醒锁或全局 TCP 设置，UDP／QUIC 保持原行为。探测可能增加流量及耗电，Android 深度休眠仍可能暂停 CPU／网络，检测时间不是唤醒时限，也不保证即时后台推送。
+
+0.2.0 的保活设置增加使用示例：Telegram 长时间处于后台后，返回前台仍显示「连接中」、消息刷新延迟时，可尝试启用均衡档，帮助识别失效连接并触发应用重连。强度弹窗使用可滚动的独立卡片，先展示档位取向，再显示空闲阈值和重试间隔；正常连接无需启用，探测参数不代表消息刷新间隔。选择档位不会自动开启功能，取消时不保存。
 
 自定义规则及连接控制沿用 Mihomo 已有的 [规则格式](https://wiki.metacubex.one/config/rules/) 和 [连接 API](https://wiki.metacubex.one/api/)。订阅响应头字段与 [MetaCubeXD 的订阅用量约定](https://github.com/MetaCubeX/metacubexd/blob/main/README.md) 一致。
 

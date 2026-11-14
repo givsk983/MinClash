@@ -13,6 +13,8 @@ final class Module {
         STATUS("status"), START("start"), STOP("stop"), IMPORT("import"), VALIDATE("validate"),
         BOOT_ON("boot-on"), BOOT_OFF("boot-off"), LOGS("logs"), API("api"),
         HOTSPOT_ON("hotspot-on"), HOTSPOT_OFF("hotspot-off"),
+        KEEPALIVE_OFF("keepalive-off"), KEEPALIVE_CONSERVATIVE("keepalive-conservative"),
+        KEEPALIVE_BALANCED("keepalive-balanced"), KEEPALIVE_AGGRESSIVE("keepalive-aggressive"),
         STATUS_NOTIFICATION("status-notification"), NOTIFICATION_ON("notification-on"), NOTIFICATION_OFF("notification-off"),
         MODE_RULE("mode-rule"), MODE_GLOBAL("mode-global"), MODE_DIRECT("mode-direct");
 
@@ -47,10 +49,11 @@ final class Module {
         final boolean hotspotEnabled;
         final String hotspotState;
         final RuntimeStatus runtime;
+        final TcpKeepAlive.Status keepAlive;
 
         Status(String state, boolean profile, boolean boot, boolean enabled, boolean control, boolean validate,
                String version, String pendingVersion, int revision, boolean hotspot, boolean hotspotEnabled, String hotspotState,
-               RuntimeStatus runtime) {
+               RuntimeStatus runtime, TcpKeepAlive.Status keepAlive) {
             this.state = state;
             this.profile = profile;
             this.boot = boot;
@@ -64,6 +67,7 @@ final class Module {
             this.hotspotEnabled = hotspotEnabled;
             this.hotspotState = hotspotState;
             this.runtime = runtime;
+            this.keepAlive = keepAlive;
         }
 
         boolean installed() { return !state.equals("missing"); }
@@ -242,7 +246,7 @@ final class Module {
         }
         return new Status(state, profile, boot, enabled, control, validate, version, pendingVersion, revision,
             hotspot, hotspotEnabled, hotspotState, new RuntimeStatus(health, core, tun4, tun6, controller,
-                notificationRecovery, notificationEnabled, hotspotReason, hotspotSent, hotspotReceived));
+                notificationRecovery, notificationEnabled, hotspotReason, hotspotSent, hotspotReceived), TcpKeepAlive.parse(output));
     }
 
     private static long nonnegativeLong(String value) {

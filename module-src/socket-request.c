@@ -1,4 +1,6 @@
 #include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +24,28 @@ static void write_all(int fd, const char *buffer, size_t size) {
     }
 }
 
+static int keepalive_check(const char *mode) {
+    int idle, interval;
+    if (strcmp(mode, "conservative") == 0) { idle = 180; interval = 30; }
+    else if (strcmp(mode, "balanced") == 0) { idle = 120; interval = 20; }
+    else if (strcmp(mode, "aggressive") == 0) { idle = 60; interval = 15; }
+    else return EXIT_FAILURE;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return EXIT_FAILURE;
+    const int enabled = 1, count = 3;
+    int result = setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) == 0 &&
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) == 0 &&
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval)) == 0 &&
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) == 0;
+    close(fd);
+    return result ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "--keepalive-check") == 0) {
+        if (argc > 3) return EXIT_FAILURE;
+        return keepalive_check(argc == 3 ? argv[2] : "balanced");
+    }
     struct sockaddr_un address = {.sun_family = AF_UNIX};
     if (argc != 2 || strlen(argv[1]) >= sizeof(address.sun_path)) {
         fputs("Expected a Unix socket path.\n", stderr);

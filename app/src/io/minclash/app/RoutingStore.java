@@ -219,7 +219,7 @@ final class RoutingStore {
         }
     }
 
-    private void restart(boolean control) throws Exception {
+    static void restart(boolean control) throws Exception {
         Module.run(Module.Command.START, null);
         long deadline = SystemClock.elapsedRealtime() + 45_000;
         Exception last = null;

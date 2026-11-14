@@ -23,6 +23,7 @@ LAST_RULE=8810
 LIMIT=2097152
 . "$MODDIR/hotspot.sh" || exit 1
 . "$MODDIR/runtime.sh" || exit 1
+. "$MODDIR/keepalive.sh" || exit 1
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
@@ -294,6 +295,7 @@ run_supervisor() {
             printf '%s\n' "$BOOT_ID" > "$DATA/routes-owned" || fail 'Cannot record routing ownership.'
             prepare_tether_dns && prepare_forwarding || fail 'Could not preserve Android tethering routes and DNS.'
             uplink_watch_reset
+            prepare_keepalive || fail 'Cannot save TCP keepalive state.'
             "$CORE" -d "$DATA" -f "$PROFILE" -ext-ctl-unix "$SOCKET" </dev/null >> "$LOG" 2>&1 8>&- &
             child=$!
             if save_pid core "$child"; then
@@ -436,7 +438,8 @@ case "${1:-}" in
         fi
         printf 'state=%s\n' "$state"
         echo health=1
-        if read_pid core >/dev/null; then echo core_running=1; fi
+        core_up=0
+        if read_pid core >/dev/null; then echo core_running=1; core_up=1; fi
         if tun_ready; then echo tun4=1; fi
         if tun6_ready; then echo tun6=1; fi
         if [ -S "$SOCKET" ] && read_pid core >/dev/null; then echo controller_ready=1; fi
@@ -455,6 +458,7 @@ case "${1:-}" in
         echo notification_recovery=1
         if [ -f "$DATA/notification-on" ]; then echo notification_enabled=1; fi
         echo validate=1
+        keepalive_status "$core_up"
         exit ;;
     logs)
         for file in "$DATA/previous.log" "$LOG"; do
@@ -475,6 +479,8 @@ case "${1:-}" in
     boot-on) rm -f "$DATA/boot-off" ;;
     boot-off) : > "$DATA/boot-off" ;;
     hotspot-on|hotspot-off) set_hotspot "${1#hotspot-}" ;;
+    keepalive-off|keepalive-conservative|keepalive-balanced|keepalive-aggressive)
+        set_keepalive "${1#keepalive-}" || fail 'Cannot save TCP keepalive setting.' ;;
     notification-on) : > "$DATA/notification-on"; rm -f "$DATA/notification-attempt" ;;
     notification-off) rm -f "$DATA/notification-on" "$DATA/notification-heartbeat" "$DATA/notification-attempt" ;;
     *) fail 'Usage: control.sh status|start|stop|logs|boot-on|boot-off|hotspot-on|hotspot-off|import|validate|api|mode-rule|mode-global|mode-direct' ;;
