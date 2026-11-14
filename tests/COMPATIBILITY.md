@@ -141,3 +141,24 @@ Android 9–15、Magisk、其他 ROM 及 IPv6-only／NAT64 网络仍需要额外
 - 在 NX769J 上保留数据覆盖安装并启动，Download 留存带版本号的 APK，手机与本地 SHA-256 一致。真机截图确认首页移除大额度卡片，右上角圆环显示剩余 98% 与 30 天，连接状态、延迟和代理控制可完整显示；UI 层次确认圆环是可点击的按钮，并能展开流量与有效期详情。
 - 操作提示增加 5 秒自动清理、新提示重置计时、点按关闭、离开 App 清理及无障碍超时适配。未完成提示定时消失的真机自动化验证；不为该 UI 修复新增镜像实现的单元测试。
 - 本轮未注入临期／低余量真实订阅，也未更改 TUN 状态、模块或手机权限。横屏、大字号、TalkBack 和后台通知送达的长期验证仍需补测。
+
+## 0.2.2 通知与设置优化验证（2026-11-14）
+
+- App 为 0.2.2（构建 40），发布签名构建及签名指纹校验通过。内嵌模块 ZIP 与 0.2.1 逐字节一致，仍为 0.0.9（构建 18、修订 8），SHA-256 为 `ee2ba5d1df450264170aaae646d7b19fae00b1f049bb7c2e94791c65529bd7f8`，模块与内核源码均未改动。
+- NotificationChannelCheck 覆盖新装、未改动的低优先级渠道迁移、用户关闭／降级／调高／手动确认重要程度／更改声音或其他设置后的保留、Android 9 无法可靠识别手动选择时保留旧渠道，以及迁移后稳定使用同一渠道。NotificationLifecycleCheck、ModuleStatusCheck、TcpKeepAliveCheck、SubscriptionReminderCheck、BackgroundWorkCheck 通过。
+- Android 16 的干净隔离模拟器安装中，AndroidNotificationChannelsCheck 通过：Android 持久化后的旧默认渠道能够迁移；新渠道 importance=DEFAULT、sound=null、振动和指示灯关闭、不绕过勿扰、不显示桌面角标；重复初始化不会继续创建渠道，旧渠道保持原值。该 instrumentation 检查只适用于干净的临时模拟器安装，不应用于用户现有 App 数据。
+- 实际 App 模拟器界面检查通过：设置目录七项入口、订阅和图标直接打开、通知独立详情、系统返回、保活详情横屏后恢复、1.5 倍字号及底部导航文字完整显示；设置页不再显示诊断工具，「关于」中可找到环境检测、内核日志、诊断报告与 DNS 修复。截图位于本地 `build/ui-review-022-settings/`。
+- 未在真实手机安装本次 APK 或修改模块。真机离屏渲染被系统终止；完整通知诊断读取和 Root 渲染重试被自动审批拒绝，改用隔离模拟器完成上述验证。不同厂商、多通知混排时的实际排序、长期通知恢复及 TalkBack 仍需真机补测；排序最终由 Android 与厂商系统决定。
+
+### 0.2.2 关于与配置页面整理（版本保持不变）
+
+- 保持 versionName=0.2.2、versionCode=40，发布签名构建通过；内嵌模块与 0.2.1 逐字节一致，没有更新模块或发布 Release。
+- 关于页应用信息改为紧凑横排，频道独立强调卡片位于首屏，保留原 Telegram 链接；诊断工具位于开源项目和软件信息之后。
+- 配置页优先显示当前配置及分流规则，自动更新、本地导入独立展示，已有有效配置时隐藏首次使用指引；原有订阅预览、更新、导入和分流处理沿用原入口。
+- 隔离 Android 16 模拟器确认频道首屏入口、诊断下移、配置分区、管理订阅入口及 1.5 倍字号布局；已人工检查关于与配置截图。一次 UI 层次读取临时失败，重试通过。未将本轮界面修订安装到手机。
+
+### 0.2.2 发布前核对
+
+- 发布 APK 与已推送手机的最终 APK 一致，SHA-256 为 `8d03b0e81c542c9d31c728a59c485d337e2f17c20b293b54215f32f264e662d0`。版本仍为 0.2.2（构建 40），内置模块保持 0.0.9（构建 18、修订 8）。
+- 发布前重跑 NotificationChannelCheck、NotificationLifecycleCheck、ModuleStatusCheck、TcpKeepAliveCheck、SubscriptionReminderCheck、BackgroundWorkCheck 均通过。通知跨进程测试首次在 Windows 遇到原子替换文件占用，独立复跑通过；未因此修改 Android 生产逻辑。
+- Release 说明按要求省略关于页的界面调整。附件包括两种 APK 文件名、对应内核完整源码及 SHA256SUMS.txt。

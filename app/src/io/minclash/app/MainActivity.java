@@ -121,9 +121,9 @@ public final class MainActivity extends Activity {
     private AlertDialog managementDialog;
     private boolean resumed;
     private TextView subscriptionSummary;
+    private View configGuide;
     private SubscriptionQuotaIndicator subscriptionIndicator;
     private View currentConfigCard;
-    private TextView subscriptionSettingsSummary;
     private boolean subscriptionNotificationSettingsOpened;
     private SubscriptionCatalog subscriptionCatalog;
     private SubscriptionCatalog.Snapshot subscriptions;
@@ -160,7 +160,6 @@ public final class MainActivity extends Activity {
     private Button backgroundPermissionButton;
     private Button overlayPermissionButton;
     private Button foregroundAppButton;
-    private Button launcherIconButton;
     private Button backupExportButton;
     private Button backupImportButton;
     private ImageView aboutLogo;
@@ -183,6 +182,9 @@ public final class MainActivity extends Activity {
     private final View[] pages = new View[4];
     private final Button[] navigation = new Button[4];
     private int selectedPage;
+    private SettingsNavigation settingsNavigation;
+    private boolean settingsBackRegistered;
+    private android.window.OnBackInvokedCallback settingsBack;
 
     private SharedPreferences appPreferences() {
         // Keep the original Activity preference file across all launcher aliases.
@@ -280,24 +282,37 @@ public final class MainActivity extends Activity {
         add(current, manage, 14);
 
         LinearLayout profiles = page(content, 1);
-        header(profiles, "配置", "管理订阅与本地文件");
+        header(profiles, "配置", "订阅、分流与本地配置");
         LinearLayout settings = card(profiles, 22);
-        add(settings, label("订阅与配置", 17, TEXT, true), 0);
+        add(settings, label("当前配置", 17, TEXT, true), 0);
         subscriptionSummary = label("正在读取订阅…", 13, MUTED, false);
         add(settings, subscriptionSummary, 8);
         subscriptionButton = button("管理订阅", true);
         subscriptionButton.setOnClickListener(view -> showSubscriptions());
-        add(settings, subscriptionButton, 20);
         updateButton = button("更新当前订阅", false);
         updateButton.setOnClickListener(view -> {
             if (subscriptions != null) activateSubscription(subscriptions.active());
         });
-        add(settings, updateButton, 10);
-        importButton = button("导入 Mihomo YAML", false);
-        importButton.setOnClickListener(view -> pickProfile());
-        add(settings, importButton, 10);
+        buttonRow(settings, subscriptionButton, updateButton, 14);
+        add(settings, label("切换或更新订阅时会先预览变化；运行中应用会短暂重连。", 12, MUTED, false), 10);
+
+        LinearLayout routing = card(profiles, 14);
+        add(routing, label("分流规则", 17, TEXT, true), 0);
+        add(routing, label("应用分流 → 自定义规则 → 订阅规则", 12, MINT, false), 8);
+        routingButton = button("应用分流  ›", false);
+        routingButton.setOnClickListener(view -> openAppRouting());
+        add(routing, routingButton, 14);
+        add(routing, label("按应用指定直连或代理组。", 12, MUTED, false), 6);
+        personalRulesButton = button("域名与 IP 分流  ›", false);
+        personalRulesButton.setOnClickListener(view -> execute("", this::readPersonalRules));
+        add(routing, personalRulesButton, 12);
+        add(routing, label("按域名、IPv4 或 IPv6 自定义出口。", 12, MUTED, false), 6);
+        add(routing, label("在规则模式下生效。运行中保存会短暂重连。", 12, MUTED, false), 12);
+        LinearLayout autoUpdates = card(profiles, 14);
         autoUpdateSwitch = new Switch(this);
-        autoUpdateSwitch.setText("自动更新当前订阅");
+        autoUpdateSwitch.setText("每日自动更新订阅");
+        autoUpdateSwitch.setTextSize(16);
+        autoUpdateSwitch.setMinHeight(dp(48));
         autoUpdateSwitch.setTextColor(TEXT);
         autoUpdateSwitch.setChecked(appPreferences().getBoolean(SubscriptionUpdateJob.ENABLED, false));
         autoUpdateSwitch.setOnCheckedChangeListener((button, enabled) -> {
@@ -310,27 +325,37 @@ public final class MainActivity extends Activity {
             }
             autoUpdateSummary.setText(SubscriptionUpdateJob.summary(this, appPreferences()));
         });
-        add(settings, autoUpdateSwitch, 12);
+        add(autoUpdates, autoUpdateSwitch, 0);
         autoUpdateSummary = label(SubscriptionUpdateJob.summary(this, appPreferences()), 12, MUTED, false);
-        add(settings, autoUpdateSummary, 6);
-        add(settings, label("运行中切换或更新订阅会短暂重连。导入本地文件前请先停止 TUN。", 12, MUTED, false), 14);
-        LinearLayout routing = card(profiles, 14);
-        add(routing, label("应用分流", 17, TEXT, true), 0);
-        add(routing, label("给应用指定直连或代理组。你的设置优先于机场规则，更新订阅后继续保留。", 13, MUTED, false), 8);
-        routingButton = button("管理应用分流", false);
-        routingButton.setOnClickListener(view -> openAppRouting());
-        add(routing, routingButton, 16);
-        personalRulesButton = button("自定义域名／IP 分流", false);
-        personalRulesButton.setOnClickListener(view -> execute("", this::readPersonalRules));
-        add(routing, personalRulesButton, 10);
-        add(routing, label("在规则模式下生效。运行中保存会短暂重连。", 12, MUTED, false), 12);
+        add(autoUpdates, autoUpdateSummary, 6);
+
+        LinearLayout localProfile = card(profiles, 14);
+        add(localProfile, label("本地配置", 17, TEXT, true), 0);
+        importButton = button("导入 YAML 文件  ›", false);
+        importButton.setOnClickListener(view -> pickProfile());
+        add(localProfile, importButton, 12);
+        add(localProfile, label("从手机文件中导入 Mihomo 配置，导入前请先停止 TUN。", 12, MUTED, false), 8);
+
+
         LinearLayout instructions = card(profiles, 14);
+        configGuide = instructions;
         add(instructions, label("开始使用", 15, TEXT, true), 0);
         add(instructions, label("01   在设置页安装内置模块并重启\n02   导入订阅链接或本地配置\n03   回到概览，启动 TUN", 13, MUTED, false), 12);
 
         LinearLayout preferences = page(content, 2);
-        header(preferences, "设置", "服务与应用管理");
-        LinearLayout service = card(preferences, 22);
+        preferences.setPadding(dp(20), dp(20), dp(20), dp(20));
+        settingsNavigation = new SettingsNavigation(this, preferences, (ScrollView) pages[2], this::updateSettingsBack);
+        LinearLayout commonSettings = settingsNavigation.group("常用");
+        LinearLayout notificationPage = settingsNavigation.page(commonSettings, "notification", "通知栏控制", "连接、网速与快捷切换");
+        settingsNavigation.action(commonSettings, "subscription", "订阅显示与提醒", "额度布局与到期通知", this::showSubscriptionSettings);
+        settingsNavigation.action(commonSettings, "appearance", "外观", "桌面图标", this::showLauncherIcons);
+        LinearLayout connectionSettings = settingsNavigation.group("连接");
+        LinearLayout servicePage = settingsNavigation.page(connectionSettings, "connection", "连接与启动", "开机自启与热点共享");
+        LinearLayout keepAlivePage = settingsNavigation.page(connectionSettings, "keepalive", "后台连接保活", "改善后台长连接恢复");
+        LinearLayout managementSettings = settingsNavigation.group("管理");
+        LinearLayout backupPage = settingsNavigation.page(managementSettings, "backup", "备份与恢复", "配置、订阅与分流规则");
+        LinearLayout modulePage = settingsNavigation.page(managementSettings, "module", "内置模块", "安装与模块兼容状态");
+        LinearLayout service = card(servicePage, 0);
 
         bootSwitch = new Switch(this);
         bootSwitch.setText("开机自动启动");
@@ -350,6 +375,8 @@ public final class MainActivity extends Activity {
             });
         });
         add(service, bootSwitch, 0);
+        add(service, label("手机启动后自动连接，需先导入有效配置。", 12, MUTED, false), 6);
+        LinearLayout hotspot = card(servicePage, 14);
         hotspotSwitch = new Switch(this);
         hotspotSwitch.setText("个人热点共享代理");
         hotspotSwitch.setTextColor(TEXT);
@@ -364,36 +391,38 @@ public final class MainActivity extends Activity {
                 return Module.status();
             });
         });
-        add(service, hotspotSwitch, 10);
+        add(hotspot, hotspotSwitch, 0);
         hotspotSummary = label("", 12, MUTED, false);
-        add(service, hotspotSummary, 6);
+        add(hotspot, hotspotSummary, 6);
+        LinearLayout notificationControls = card(notificationPage, 0);
         notificationButton = button("开启通知栏控制", false);
         notificationButton.setOnClickListener(view -> toggleNotificationControl());
-        add(service, notificationButton, 14);
-        add(service, label("通知显示连接和网速，点模式或节点名可切换。若划掉后台后通知消失，请检查后台运行设置。", 12, MUTED, false), 6);
+        add(notificationControls, notificationButton, 0);
+        add(notificationControls, label("显示连接与网速，点模式或节点名即可切换。", 13, MUTED, false), 10);
+        LinearLayout notificationPosition = card(notificationPage, 14);
+        add(notificationPosition, label("通知显示位置", 17, TEXT, true), 0);
+        add(notificationPosition, label("默认采用常规优先级、静音常驻，减少被归到底部的情况。网速刷新保持原时间，不反复抢位；最终顺序由系统决定。", 13, MUTED, false), 8);
+        Button notificationSettings = button("系统通知设置", false);
+        notificationSettings.setOnClickListener(view -> openControlNotificationSettings());
+        add(notificationPosition, notificationSettings, 12);
+        add(notificationPosition, label("已在系统手动调整过的通知设置会保留，可在这里检查重要程度与显示方式。", 12, MUTED, false), 8);
+        LinearLayout notificationPermissions = card(notificationPage, 14);
+        add(notificationPermissions, label("快捷控制与后台权限", 17, TEXT, true), 0);
         backgroundPermissionButton = button("后台运行设置", false);
         backgroundPermissionButton.setOnClickListener(view -> showBackgroundRunHelp());
-        add(service, backgroundPermissionButton, 8);
+        add(notificationPermissions, backgroundPermissionButton, 12);
         overlayPermissionButton = button("允许悬浮窗", false);
         overlayPermissionButton.setOnClickListener(view -> showOverlayPermissionHelp(true));
-        add(service, overlayPermissionButton, 8);
+        add(notificationPermissions, overlayPermissionButton, 8);
         foregroundAppButton = button("授权显示当前应用", false);
         foregroundAppButton.setOnClickListener(view -> {
             try { startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)); }
             catch (android.content.ActivityNotFoundException error) { showMessage("此设备没有使用情况访问的设置入口。"); }
         });
-        add(service, foregroundAppButton, 8);
-        add(service, label("手机启动后自动连接，需先导入有效配置。", 12, MUTED, false), 6);
+        add(notificationPermissions, foregroundAppButton, 8);
+        add(notificationPermissions, label("悬浮窗用于直接切换模式与节点；使用情况访问用于显示当前应用。划掉后台后通知消失时，请检查自启动与省电策略。", 12, MUTED, false), 10);
 
-        LinearLayout subscriptionSettings = card(preferences, 14);
-        add(subscriptionSettings, label("订阅显示与提醒", 17, TEXT, true), 0);
-        subscriptionSettingsSummary = label("", 13, MUTED, false);
-        add(subscriptionSettings, subscriptionSettingsSummary, 8);
-        Button subscriptionDisplay = button("设置布局与到期通知", false);
-        subscriptionDisplay.setOnClickListener(view -> showSubscriptionSettings());
-        add(subscriptionSettings, subscriptionDisplay, 14);
-
-        LinearLayout keepAlive = card(preferences, 14);
+        LinearLayout keepAlive = card(keepAlivePage, 0);
         add(keepAlive, label("后台连接保活", 17, TEXT, true), 0);
         keepAliveSwitch = new Switch(this);
         keepAliveSwitch.setText("启用连接保活");
@@ -426,13 +455,7 @@ public final class MainActivity extends Activity {
                 execute("保活设置已应用。", true, TcpKeepAlive::reconnect)).show());
         add(keepAlive, keepAliveApplyButton, 10);
 
-        LinearLayout appearance = card(preferences, 14);
-        add(appearance, label("外观", 17, TEXT, true), 0);
-        launcherIconButton = button("", false);
-        launcherIconButton.setOnClickListener(view -> showLauncherIcons());
-        add(appearance, launcherIconButton, 10);
-
-        LinearLayout backups = card(preferences, 14);
+        LinearLayout backups = card(backupPage, 0);
         add(backups, label("备份与恢复", 17, TEXT, true), 0);
         add(backups, label("备份配置、订阅、应用分流、自定义分流、分类、节点收藏及偏好。支持密码加密，恢复前可预览。", 13, MUTED, false), 8);
         backupExportButton = button("导出备份", false);
@@ -445,7 +468,7 @@ public final class MainActivity extends Activity {
         buttonRow(backups, backupExportButton, backupImportButton, 14);
         add(backups, label("恢复会替换备份范围内的数据，请先停止 TUN。系统授权、通知、图标、开机与热点设置保留本机选择。", 12, MUTED, false), 10);
 
-        LinearLayout moduleCard = card(preferences, 14);
+        LinearLayout moduleCard = card(modulePage, 0);
         add(moduleCard, label("内置模块", 17, TEXT, true), 0);
         moduleSummary = label("", 13, MUTED, false);
         add(moduleCard, moduleSummary, 8);
@@ -456,37 +479,33 @@ public final class MainActivity extends Activity {
         exportButton.setOnClickListener(view -> exportModule());
         add(moduleCard, exportButton, 10);
 
-        LinearLayout tools = card(preferences, 14);
-        add(tools, label("诊断", 17, TEXT, true), 0);
-        refreshButton = button("检测环境", false);
-        refreshButton.setOnClickListener(view -> refresh());
-        logsButton = button("内核日志", false);
-        logsButton.setOnClickListener(view -> execute("", () -> Module.run(Module.Command.LOGS, null)));
-        buttonRow(tools, refreshButton, logsButton, 14);
-        TextView about = label("MinClash " + appVersion() + "  ·  Mihomo v1.19.33\nKernelSU / Magisk · ARM64", 11, MUTED, false);
-        about.setGravity(Gravity.CENTER);
-        add(preferences, about, 24);
-
         LinearLayout information = page(content, 3);
         header(information, "关于", "软件信息与项目动态");
         LinearLayout identity = card(information, 22);
-        identity.setGravity(Gravity.CENTER_HORIZONTAL);
+        LinearLayout identityRow = new LinearLayout(this);
+        identityRow.setGravity(Gravity.CENTER_VERTICAL);
         aboutLogo = new ImageView(this);
         aboutLogo.setBackground(shape(CARD, 16, false));
         aboutLogo.setClipToOutline(true);
         aboutLogo.setContentDescription("MinClash 图标");
-        identity.addView(aboutLogo, new LinearLayout.LayoutParams(dp(60), dp(60)));
+        identityRow.addView(aboutLogo, new LinearLayout.LayoutParams(dp(52), dp(52)));
         updateLauncherIcon();
-        TextView applicationName = label("MinClash", 24, TEXT, true);
-        applicationName.setGravity(Gravity.CENTER);
-        add(identity, applicationName, 16);
-        TextView applicationVersion = label("版本 " + appVersion(), 12, MINT, true);
-        applicationVersion.setGravity(Gravity.CENTER);
-        add(identity, applicationVersion, 6);
-        TextView description = label("轻量的 Android Root TUN 工具\n管理订阅、代理模式与节点连接", 13, MUTED, false);
-        description.setGravity(Gravity.CENTER);
-        add(identity, description, 14);
-        checkAppUpdateButton = button("检查更新", false);
+        LinearLayout identityText = column();
+        add(identityText, label("MinClash", 23, TEXT, true), 0);
+        add(identityText, label("版本 " + appVersion() + " · Android Root TUN", 12, MUTED, false), 5);
+        LinearLayout.LayoutParams identityTextParams = new LinearLayout.LayoutParams(0, -2, 1);
+        identityTextParams.leftMargin = dp(14);
+        identityRow.addView(identityText, identityTextParams);
+        add(identity, identityRow, 0);
+        LinearLayout appUpdates = card(information, 14);
+        GradientDrawable updateBackground = new GradientDrawable();
+        updateBackground.setColor(0xff182c3a);
+        updateBackground.setCornerRadius(dp(20));
+        updateBackground.setStroke(dp(1), 0xff3b7088);
+        appUpdates.setBackground(updateBackground);
+        add(appUpdates, label("应用更新", 18, TEXT, true), 0);
+        add(appUpdates, label("检查新版本，在 App 内下载并安装。", 12, MUTED, false), 7);
+        checkAppUpdateButton = button("检查更新", true);
         checkAppUpdateButton.setOnClickListener(view -> {
             if (UpdateInstallReceiver.installing) return;
             String version = appVersion();
@@ -495,12 +514,41 @@ public final class MainActivity extends Activity {
                 render();
             }
         });
-        add(identity, checkAppUpdateButton, 14);
+        add(appUpdates, checkAppUpdateButton, 12);
+
+        LinearLayout channelCard = card(information, 14);
+        GradientDrawable channelBackground = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+            new int[] {0xff183c36, 0xff152b30});
+        channelBackground.setCornerRadius(dp(20));
+        channelBackground.setStroke(dp(1), 0xff4f9c88);
+        channelCard.setBackground(channelBackground);
+        add(channelCard, label("项目频道", 12, MINT, true), 0);
+        add(channelCard, label("Telegram · @mbazhuan", 21, TEXT, true), 10);
+        add(channelCard, label("关注版本发布与项目动态", 13, MUTED, false), 7);
+        Button channel = button("打开 Telegram 频道  ↗", true);
+        channel.setOnClickListener(view -> openLink("https://t.me/mbazhuan"));
+        add(channelCard, channel, 16);
+
+        LinearLayout links = card(information, 14);
+        add(links, label("开源项目", 17, TEXT, true), 0);
+        add(links, label("givsk983 / MinClash · 源码与问题反馈", 12, MUTED, false), 8);
+        Button repository = button("GitHub 仓库  ↗", false);
+        repository.setOnClickListener(view -> openLink("https://github.com/givsk983/MinClash"));
+        add(links, repository, 12);
+
+        LinearLayout software = card(information, 14);
+        add(software, label("软件信息", 17, TEXT, true), 0);
+        add(software, label("代理内核    Mihomo v1.19.33\n运行环境    Android 9+ · ARM64\nRoot 支持   KernelSU / Magisk", 13, MUTED, false), 12);
 
         LinearLayout diagnostics = card(information, 14);
-        add(diagnostics, label("诊断与反馈", 17, TEXT, true), 0);
+        add(diagnostics, label("诊断工具", 17, TEXT, true), 0);
         add(diagnostics, label("检查 TUN 路由、代理出口与 HTTPS。分享版只包含必要的版本、探测结果和固定故障码。",
             13, MUTED, false), 8);
+        refreshButton = button("检测环境", false);
+        refreshButton.setOnClickListener(view -> refresh());
+        logsButton = button("内核日志", false);
+        logsButton.setOnClickListener(view -> execute("", () -> Module.run(Module.Command.LOGS, null)));
+        buttonRow(diagnostics, refreshButton, logsButton, 14);
         diagnosticsButton = button("生成诊断报告", false);
         diagnosticsButton.setOnClickListener(view -> runDiagnostics(null));
         add(diagnostics, diagnosticsButton, 14);
@@ -514,21 +562,6 @@ public final class MainActivity extends Activity {
                     return Module.status();
                 })).show());
         add(diagnostics, repairDnsButton, 10);
-
-        LinearLayout links = card(information, 14);
-        add(links, label("项目与社区", 17, TEXT, true), 0);
-        Button repository = button("GitHub 仓库  ↗", false);
-        repository.setOnClickListener(view -> openLink("https://github.com/givsk983/MinClash"));
-        add(links, repository, 16);
-        add(links, label("givsk983 / MinClash\n查看源码、版本发布与问题反馈", 12, MUTED, false), 8);
-        Button channel = button("Telegram 频道  ↗", false);
-        channel.setOnClickListener(view -> openLink("https://t.me/mbazhuan"));
-        add(links, channel, 18);
-        add(links, label("@mbazhuan · 关注项目动态", 12, MUTED, false), 8);
-
-        LinearLayout software = card(information, 14);
-        add(software, label("软件信息", 17, TEXT, true), 0);
-        add(software, label("代理内核    Mihomo v1.19.33\n运行环境    Android 9+ · ARM64\nRoot 支持   KernelSU / Magisk", 13, MUTED, false), 12);
 
         subscriptionIndicator = new SubscriptionQuotaIndicator(this,
             () -> { if (subscriptions != null && subscriptions.active() != null) showUsage(subscriptions.active()); });
@@ -550,9 +583,15 @@ public final class MainActivity extends Activity {
         for (int i = 0; i < navigation.length; i++) {
             final int index = i;
             Button item = button(titles[i], false);
-            item.setOnClickListener(view -> selectPage(index));
+            item.setMinHeight(dp(46));
+            item.setMinimumHeight(dp(46));
+            item.setPadding(dp(8), dp(8), dp(8), dp(8));
+            item.setOnClickListener(view -> {
+                if (index == 2 && selectedPage == 2) settingsNavigation.back();
+                selectPage(index);
+            });
             navigation[i] = item;
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(46), 1);
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1);
             if (i > 0) params.leftMargin = dp(8);
             bar.addView(item, params);
         }
@@ -565,6 +604,7 @@ public final class MainActivity extends Activity {
             autoUpdateSwitch.setChecked(false);
             showMessage("Android 无法安排订阅自动更新，请重新开启。");
         }
+        if (savedInstanceState != null) settingsNavigation.restore(savedInstanceState);
         selectPage(savedInstanceState == null ? 0 : savedInstanceState.getInt("page", 0));
         render();
         worker.execute(this::refreshSubscriptionCatalog);
@@ -573,6 +613,7 @@ public final class MainActivity extends Activity {
     @Override protected void onSaveInstanceState(Bundle state) {
         state.putInt("page", selectedPage);
         state.putSerializable("pendingUpdate", pendingUpdate);
+        settingsNavigation.save(state);
         super.onSaveInstanceState(state);
     }
 
@@ -629,6 +670,17 @@ public final class MainActivity extends Activity {
         }
         render();
         if (!Settings.canDrawOverlays(this)) showOverlayPermissionHelp(true);
+    }
+
+    private void openControlNotificationSettings() {
+        String channel = ProxyNotificationChannels.ensure(this);
+        try {
+            startActivity(new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()).putExtra(Settings.EXTRA_CHANNEL_ID, channel));
+        } catch (android.content.ActivityNotFoundException error) {
+            try { startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName()))); }
+            catch (android.content.ActivityNotFoundException missing) { showMessage("此设备没有可用的通知设置入口。"); }
+        }
     }
 
     private void showSubscriptionSettings() {
@@ -790,6 +842,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        if (Build.VERSION.SDK_INT >= 33 && settingsBackRegistered) getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(settingsBack);
         if (managementDialog != null) managementDialog.dismiss();
         if (policyDialog != null) policyDialog.dismiss();
         if (backupPasswordDialog != null) backupPasswordDialog.dismiss();
@@ -1707,8 +1760,8 @@ public final class MainActivity extends Activity {
 
     private void updateLauncherIcon() {
         LauncherIcon icon = LauncherIcon.current(this);
-        launcherIconButton.setText("桌面图标 · " + icon.label);
         aboutLogo.setImageResource(getResources().getIdentifier(icon.drawable, "drawable", getPackageName()));
+        settingsNavigation.summary("appearance", "桌面图标 · " + icon.label);
     }
 
     private TcpKeepAlive.Mode selectedKeepAliveLevel() {
@@ -2926,9 +2979,7 @@ public final class MainActivity extends Activity {
         SubscriptionCatalog.Entry active = subscriptions == null ? null : subscriptions.active();
         updateSubscriptionIndicator();
         currentConfigCard.setVisibility(active == null ? View.VISIBLE : View.GONE);
-        subscriptionSettingsSummary.setText("详情布局：" + (SubscriptionPreferences.DUAL.equals(SubscriptionPreferences.style(appPreferences())) ? "流量与有效期并列" : "额度优先")
-            + "\n" + (SubscriptionPreferences.enabled(appPreferences()) ? "到期前 " + SubscriptionPreferences.daysLabel(appPreferences()) + " 天及到期时提醒"
-                + (SubscriptionReminders.canShow(this) ? "" : " · 通知权限未开启") : "到期通知已关闭"));
+        configGuide.setVisibility(installed && status.profile ? View.GONE : View.VISIBLE);
         String current = active != null ? "当前订阅 · " + active.name()
             : installed && status.profile ? "本地配置已就绪" : "尚未启用订阅";
         profileSummary.setText(installed && status.profile ? current : "尚未导入配置");
@@ -3002,11 +3053,20 @@ public final class MainActivity extends Activity {
         updatingSwitch = false;
         boolean notification = notificationEnabled();
         notificationButton.setText(notification ? "关闭通知栏控制" : "开启通知栏控制");
-        backgroundPermissionButton.setVisibility(notification ? View.VISIBLE : View.GONE);
-        overlayPermissionButton.setVisibility(notification ? View.VISIBLE : View.GONE);
         overlayPermissionButton.setText(notification && Settings.canDrawOverlays(this) ? "检查悬浮窗权限" : "允许悬浮窗");
-        foregroundAppButton.setVisibility(notification ? View.VISIBLE : View.GONE);
         foregroundAppButton.setText(notification && ForegroundApp.allowed(this) ? "当前应用显示权限" : "授权显示当前应用");
+        settingsNavigation.summary("notification", notification ? ProxyNotificationService.canShow(this)
+            ? "已开启 · 连接、网速与快捷切换" : "已开启 · 系统通知权限未允许" : "未开启 · 连接、网速与快捷切换");
+        settingsNavigation.summary("subscription", (SubscriptionPreferences.DUAL.equals(SubscriptionPreferences.style(appPreferences())) ? "流量与有效期并列" : "额度优先")
+            + " · " + (SubscriptionPreferences.enabled(appPreferences()) ? SubscriptionReminders.canShow(this) ? "到期提醒已开启" : "到期提醒待授权" : "到期提醒已关闭"));
+        settingsNavigation.summary("connection", installed ? "开机自启" + (status.boot ? "开" : "关") + " · 热点共享" + (status.hotspotEnabled ? "开" : "关") : "开机自启与热点共享 · 模块未就绪");
+        settingsNavigation.summary("keepalive", !keepAliveAvailable ? "当前模块暂不可用"
+            : running && status.keepAlive.support() == TcpKeepAlive.Support.UNSUPPORTED ? "设备不支持 · 沿用默认行为"
+            : status.keepAlive.needsRestart(running) ? "有更改待应用 · 下次启动生效"
+            : status.keepAlive.configured() == TcpKeepAlive.Mode.OFF ? "已关闭 · 按需启用"
+            : running ? "已开启 · " + status.keepAlive.configured().label : "已选择" + status.keepAlive.configured().label + " · 下次启动生效");
+        settingsNavigation.summary("module", pending ? "已提交安装 · 等待重启" : moduleUpdate ? "有功能更新 · 可按需安装"
+            : installed ? "当前 " + status.version + " · 可继续使用" : "首次使用请安装内置模块");
         if (visible && !busy && status != null) ProxyNotificationService.sync(this, notification && enabled && isActive());
         NotificationRecovery.sync(this, status);
         messageText.setVisibility(messageText.length() == 0 ? View.GONE : View.VISIBLE);
@@ -3132,8 +3192,26 @@ public final class MainActivity extends Activity {
                 shape(i == selectedPage ? 0xff203a35 : CARD, 12, false), null));
         }
         updateSubscriptionIndicator();
+        updateSettingsBack();
         scheduleLatency(0);
         warmAppRouting();
+    }
+
+    private void updateSettingsBack() {
+        if (Build.VERSION.SDK_INT < 33) return;
+        boolean handle = selectedPage == 2 && settingsNavigation != null && settingsNavigation.inDetail();
+        if (handle == settingsBackRegistered) return;
+        if (handle) {
+            if (settingsBack == null) settingsBack = () -> settingsNavigation.back();
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, settingsBack);
+        }
+        else getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(settingsBack);
+        settingsBackRegistered = handle;
+    }
+
+    @Override public void onBackPressed() {
+        if (selectedPage == 2 && settingsNavigation.back()) return;
+        super.onBackPressed();
     }
 
     private void buttonRow(LinearLayout parent, Button first, Button second, int top) {

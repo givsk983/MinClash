@@ -32,7 +32,6 @@ public final class ProxyNotificationService extends Service {
     static final String ACTION_OVERLAY_HELP = "io.minclash.app.OVERLAY_HELP";
     static final String EXTRA_MODE_PANEL = "mode_panel";
     private static final String ACTION_REFRESH = "io.minclash.app.REFRESH_PROXY_STATUS";
-    private static final String CHANNEL = "proxy_status";
     private static final int NOTIFICATION_ID = 1;
     private static final long SAMPLE_INTERVAL = 3000;
     private static final long CONNECTION_INTERVAL = 9000;
@@ -73,6 +72,7 @@ public final class ProxyNotificationService extends Service {
     private final RefreshGate refreshGate = new RefreshGate();
     private final NotificationLifetime lifetime = new NotificationLifetime();
     private NotificationManager manager;
+    private String channelId;
     private ForegroundApp foregroundApp;
     private Sample current;
     private ProxyQuickControls panel;
@@ -93,7 +93,7 @@ public final class ProxyNotificationService extends Service {
 
     static boolean canShow(Context context) {
         NotificationManager manager = context.getSystemService(NotificationManager.class);
-        NotificationChannel channel = manager.getNotificationChannel(CHANNEL);
+        NotificationChannel channel = manager.getNotificationChannel(ProxyNotificationChannels.selected(context));
         return manager.areNotificationsEnabled() && (channel == null || channel.getImportance() != NotificationManager.IMPORTANCE_NONE);
     }
 
@@ -175,7 +175,7 @@ public final class ProxyNotificationService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         manager = getSystemService(NotificationManager.class);
-        manager.createNotificationChannel(new NotificationChannel(CHANNEL, "代理状态与快捷控制", NotificationManager.IMPORTANCE_LOW));
+        channelId = ProxyNotificationChannels.ensure(this);
         foregroundApp = new ForegroundApp(this);
         networkObserver = new NetworkObserver(this, this::requestRefresh);
         IntentFilter screen = new IntentFilter(Intent.ACTION_SCREEN_ON);
@@ -339,14 +339,14 @@ public final class ProxyNotificationService extends Service {
         PendingIntent nodePicker = openPicker(false);
         String app = overlayFailed ? "浮窗受限 · 点此检查" : current.app();
         RemoteViews controls = card.view(app, connection.mode(), connection.node(), current.speed(), modePicker, nodePicker);
-        Notification.Builder builder = new Notification.Builder(this, CHANNEL)
+        Notification.Builder builder = new Notification.Builder(this, channelId)
             .setSmallIcon(R.drawable.ic_notification).setContentTitle("MinClash")
             .setContentText(connection.mode() + " · " + connection.node())
             .setCustomContentView(controls)
             .setCustomBigContentView(new RemoteViews(controls))
             .setContentIntent(modePicker).setWhen(notificationSince).setShowWhen(false).setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_SERVICE).setVisibility(Notification.VISIBILITY_PRIVATE)
-            .setPublicVersion(new Notification.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_notification)
+            .setPublicVersion(new Notification.Builder(this, channelId).setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle("MinClash").setContentText("代理状态").setWhen(notificationSince).setShowWhen(false).build())
             .setOngoing(true);
         if (Build.VERSION.SDK_INT >= 31) builder.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE);
