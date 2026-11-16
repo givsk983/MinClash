@@ -352,6 +352,9 @@ public final class MainActivity extends Activity {
         LinearLayout connectionSettings = settingsNavigation.group("连接");
         LinearLayout servicePage = settingsNavigation.page(connectionSettings, "connection", "连接与启动", "开机自启与热点共享");
         LinearLayout keepAlivePage = settingsNavigation.page(connectionSettings, "keepalive", "后台连接保活", "改善后台长连接恢复");
+        LinearLayout backgroundGuidePage = settingsNavigation.page(connectionSettings, "background-guide", "后台连接恢复指南", "返回后连接中、消息刷新慢");
+        new BackgroundConnectionGuide(this, backgroundGuidePage, this::showMessage,
+            () -> settingsNavigation.show("keepalive"), () -> { selectPage(3); runDiagnostics(null); });
         LinearLayout managementSettings = settingsNavigation.group("管理");
         LinearLayout backupPage = settingsNavigation.page(managementSettings, "backup", "备份与恢复", "配置、订阅与分流规则");
         LinearLayout modulePage = settingsNavigation.page(managementSettings, "module", "内置模块", "安装与模块兼容状态");
@@ -440,8 +443,11 @@ public final class MainActivity extends Activity {
         keepAliveExample.setPadding(dp(12), dp(12), dp(12), dp(12));
         keepAliveExample.setBackground(shape(0xff102b28, 12, false));
         add(keepAliveExample, label("使用示例", 12, MINT, true), 0);
-        add(keepAliveExample, label("例如：Telegram 长时间处于后台后，返回前台仍显示“连接中”，消息刷新延迟。启用保活有助于检测失效连接并触发应用重连，建议先使用均衡档。", 13, TEXT, false), 6);
+        add(keepAliveExample, label("例如：Telegram 在后台停留后，返回时长时间“连接中”、消息刷新延迟。请先检查 Telegram 自身的自启动与后台省电限制；仍有失效连接时，再尝试均衡保活。", 13, TEXT, false), 6);
         add(keepAlive, keepAliveExample, 12);
+        Button backgroundGuideButton = button("查看后台连接恢复指南", false);
+        backgroundGuideButton.setOnClickListener(view -> settingsNavigation.show("background-guide"));
+        add(keepAlive, backgroundGuideButton, 10);
         add(keepAlive, label("默认关闭，连接正常时无需启用。开启可能增加探测流量与功耗，无法保证系统深度休眠期间即时接收消息。", 12, MUTED, false), 10);
         keepAliveLevelButton = button("保活强度：均衡", false);
         keepAliveLevelButton.setOnClickListener(view -> showKeepAliveLevels());
