@@ -298,7 +298,7 @@ public final class MainActivity extends Activity {
 
         LinearLayout routing = card(profiles, 14);
         add(routing, label("分流规则", 17, TEXT, true), 0);
-        add(routing, label("应用分流 → 自定义规则 → 订阅规则", 12, MINT, false), 8);
+        add(routing, label("防泄漏保护 → 应用分流 → 自定义规则 → 订阅规则", 12, MINT, false), 8);
         routingButton = button("应用分流  ›", false);
         routingButton.setOnClickListener(view -> openAppRouting());
         add(routing, routingButton, 14);
@@ -307,7 +307,11 @@ public final class MainActivity extends Activity {
         personalRulesButton.setOnClickListener(view -> execute("", this::readPersonalRules));
         add(routing, personalRulesButton, 12);
         add(routing, label("按域名、IPv4 或 IPv6 自定义出口。", 12, MUTED, false), 6);
-        add(routing, label("在规则模式下生效。保存后现有连接会按新规则重连。", 12, MUTED, false), 12);
+        Button protectionButton = button("应用防泄漏保护  ›", false);
+        protectionButton.setOnClickListener(view -> startActivity(new Intent(this, ProtectionActivity.class)));
+        add(routing, protectionButton, 12);
+        add(routing, label("选定应用强制代理，断线时保持阻断。", 12, MUTED, false), 6);
+        add(routing, label("普通分流在规则模式下生效。防泄漏保护独立于模式；保存分流后现有连接会按新规则重连。", 12, MUTED, false), 12);
         LinearLayout autoUpdates = card(profiles, 14);
         autoUpdateSwitch = new Switch(this);
         autoUpdateSwitch.setText("每日自动更新订阅");
@@ -345,11 +349,14 @@ public final class MainActivity extends Activity {
         LinearLayout preferences = page(content, 2);
         preferences.setPadding(dp(20), dp(20), dp(20), dp(20));
         settingsNavigation = new SettingsNavigation(this, preferences, (ScrollView) pages[2], this::updateSettingsBack);
+        LinearLayout moduleSettings = settingsNavigation.group("模块与更新");
+        LinearLayout modulePage = settingsNavigation.page(moduleSettings, "module", "内置模块", "查看版本、更新与安装");
         LinearLayout commonSettings = settingsNavigation.group("常用");
         LinearLayout notificationPage = settingsNavigation.page(commonSettings, "notification", "通知栏控制", "连接、网速与快捷切换");
         settingsNavigation.action(commonSettings, "subscription", "订阅显示与提醒", "额度布局与到期通知", this::showSubscriptionSettings);
         settingsNavigation.action(commonSettings, "appearance", "外观", "桌面图标", this::showLauncherIcons);
         LinearLayout connectionSettings = settingsNavigation.group("连接");
+        settingsNavigation.action(connectionSettings, "protection", "应用防泄漏保护", "指定应用使用代理，断线时暂停联网", () -> startActivity(new Intent(this, ProtectionActivity.class)));
         LinearLayout servicePage = settingsNavigation.page(connectionSettings, "connection", "连接与启动", "开机自启与热点共享");
         LinearLayout keepAlivePage = settingsNavigation.page(connectionSettings, "keepalive", "后台连接保活", "改善后台长连接恢复");
         LinearLayout backgroundGuidePage = settingsNavigation.page(connectionSettings, "background-guide", "后台连接恢复指南", "返回后连接中、消息刷新慢");
@@ -357,7 +364,6 @@ public final class MainActivity extends Activity {
             () -> settingsNavigation.show("keepalive"), () -> { selectPage(3); runDiagnostics(null); });
         LinearLayout managementSettings = settingsNavigation.group("管理");
         LinearLayout backupPage = settingsNavigation.page(managementSettings, "backup", "备份与恢复", "配置、订阅与分流规则");
-        LinearLayout modulePage = settingsNavigation.page(managementSettings, "module", "内置模块", "安装与模块兼容状态");
         LinearLayout service = card(servicePage, 0);
 
         bootSwitch = new Switch(this);
@@ -2974,6 +2980,8 @@ public final class MainActivity extends Activity {
                 : status == null ? "先检测环境，再导入你的配置。" : "前往设置，安装 App 内置的模块。" );
         }
         boolean running = installed && status.running();
+        if (installed && status.protectionArmed) detailText.setText(detailText.getText()
+            + "\n已配置防泄漏阻断；停止 TUN 不会解除，可在设置中关闭保护。");
         statusBadge.setText(running ? "● TUN 就绪" : busy ? "处理中" : pending ? "待重启" : "未连接");
         statusBadge.setTextColor(running ? MINT : MUTED);
         statusBadge.setBackground(shape(running ? 0xff203a35 : 0xff25313c, 10, false));

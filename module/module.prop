@@ -1,7 +1,7 @@
 id=minclash
 name=MinClash Root TUN
-version=0.0.9
-versionCode=18
-revision=8
+version=0.0.10
+versionCode=19
+revision=9
 author=MinClash
-description=Mihomo v1.19.33-minclash.1 ARM64 with TCP connection recovery and optional hotspot proxy sharing.
+description=Mihomo v1.19.33-minclash.2 ARM64 with optional application leak protection, strict DNS and TCP keepalive.

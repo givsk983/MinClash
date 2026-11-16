@@ -314,7 +314,7 @@ public final class ProxyNotificationService extends Service {
             Module.Status status = Module.notificationStatus();
             NotificationRecovery.sync(this, status);
             if (!status.active()) {
-                return new Connection("TUN 已停止", "暂无节点", false, true);
+                return new Connection("TUN 已停止", status.protectionArmed ? "防泄漏阻断仍保留" : "暂无节点", false, true);
             }
             if (!status.running()) {
                 return new Connection(status.phase().label, "等待连接", false, false);

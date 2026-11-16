@@ -8,6 +8,8 @@ public final class ModuleStatusCheck {
         require(active.installed() && active.state.equals("running") && active.profile && active.boot
             && active.enabled && active.control && active.version.equals("0.0.1"), "active module");
         Module.Status fresh = Module.parseStatus("state=missing\n");
+        require(!active.protection && Module.parseStatus("state=stopped\nrevision=9\nprotection=1\n").protection,
+            "protection requires explicit capability, not app or module version text");
         require(!fresh.installed() && !fresh.enabled && !fresh.control && !fresh.profile, "first installation");
         Module.Status staged = Module.parseStatus("pending=0.0.1\r\nstate=missing\r\n");
         require(!staged.installed() && staged.pendingVersion.equals("0.0.1"), "first install awaiting reboot");

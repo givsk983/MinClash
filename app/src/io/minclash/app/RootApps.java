@@ -44,6 +44,7 @@ public final class RootApps {
             if (iconsOnly && !requested.contains(app.packageName)) continue;
             JSONObject item = new JSONObject();
             item.put("package", app.packageName);
+            item.put("uid", app.uid);
             if (!iconsOnly) {
                 String label = app.packageName;
                 try { label = manager.getApplicationLabel(app).toString(); }

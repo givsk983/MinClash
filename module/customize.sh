@@ -21,4 +21,5 @@ set_perm "$MODPATH/bin/mihomo" 0 0 0755
 set_perm "$MODPATH/bin/socket-request" 0 0 0755
 set_perm "$MODPATH/control.sh" 0 0 0755
 set_perm "$MODPATH/service.sh" 0 0 0755
+set_perm "$MODPATH/post-fs-data.sh" 0 0 0755
 ui_print "Module installed. Reboot, then open MinClash to import a profile."

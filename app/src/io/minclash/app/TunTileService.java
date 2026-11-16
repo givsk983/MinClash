@@ -134,6 +134,7 @@ public final class TunTileService extends TileService {
             return;
         }
         String detail = current.phase().label;
+        if (!active(current) && current.protectionArmed) detail = "已停止 · 防泄漏阻断保留";
         NotificationRecovery.sync(this, current);
         render(active(current) ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE, detail);
     }

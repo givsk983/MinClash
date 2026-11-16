@@ -24,6 +24,7 @@ LIMIT=2097152
 . "$MODDIR/hotspot.sh" || exit 1
 . "$MODDIR/runtime.sh" || exit 1
 . "$MODDIR/keepalive.sh" || exit 1
+. "$MODDIR/protection.sh" || exit 1
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
@@ -175,7 +176,7 @@ check_routes() {
 
 stop_core() {
     local pid count=0
-    pid=$(read_pid core) || { rm -f "$DATA/core.pid" "$SOCKET"; return; }
+    pid=$(read_pid core) || { rm -f "$DATA/core.pid" "$SOCKET" "$DATA/protection-core"; return; }
     kill -TERM "$pid" 2>/dev/null || :
     while [ "$(read_pid core)" = "$pid" ] && [ "$count" -lt 8 ]; do
         sleep 1
@@ -190,7 +191,7 @@ stop_core() {
         sleep 1
         [ "$(read_pid core)" != "$pid" ] || return 1
     fi
-    rm -f "$DATA/core.pid" "$SOCKET"
+    rm -f "$DATA/core.pid" "$SOCKET" "$DATA/protection-core"
 }
 
 api() {
@@ -307,6 +308,9 @@ run_supervisor() {
                         break
                     fi
                     if tun_ready; then
+                        if [ ! -f "$DATA/protection-core" ]; then
+                            protection_command mark || break
+                        fi
                         if ! sync_hotspot; then
                             [ "$(cat "$DATA/hotspot-state" 2>/dev/null)" = error ] ||
                                 log 'Hotspot proxy setup failed. Check tethering and firewall support.'
@@ -360,6 +364,7 @@ start() {
     [ -c /dev/tun ] || [ -c /dev/net/tun ] || fail 'The Android kernel did not expose a TUN device.'
     [ -x "$IP" ] || fail 'The Android ip command is unavailable.'
     read_pid daemon >/dev/null && return 0
+    protection_command hold && protection_command activate || fail '无法建立完整防泄漏保护；TUN 未启动。请检查保护设置。'
     write_state starting || fail 'Cannot write MinClash state.'
     "$BB" nohup "$BB" sh "$MODDIR/control.sh" run "${1:-manual}" </dev/null >> "$LOG" 2>&1 9>&- &
     count=0
@@ -458,6 +463,8 @@ case "${1:-}" in
         echo notification_recovery=1
         if [ -f "$DATA/notification-on" ]; then echo notification_enabled=1; fi
         echo validate=1
+        echo protection=1
+        if [ -f "$DATA/protection-owned" ]; then echo protection_armed=1; fi
         keepalive_status "$core_up"
         exit ;;
     logs)
@@ -465,12 +472,17 @@ case "${1:-}" in
             if [ -f "$file" ]; then tail -c 12000 "$file"; fi
         done
         exit ;;
+    protection-get) protection_command get; exit ;;
 esac
 
 exec 9>"$DATA/action.lock"
 lock_fd 9 || fail 'Another MinClash operation is in progress or flock is unavailable.'
 case "${1:-}" in
-    boot) if [ ! -e "$DATA/boot-off" ] && [ -s "$PROFILE" ]; then start boot; fi ;;
+    protection-early) protection_command hold ;;
+    protection-restore) protection_command hold && protection_command activate ;;
+    protection-set) set_protection set ;;
+    protection-off) set_protection off ;;
+    boot) protection_command hold && protection_command activate || fail '无法恢复防泄漏规则。'; if [ ! -e "$DATA/boot-off" ] && [ -s "$PROFILE" ]; then start boot; fi ;;
     start) start ;;
     stop) stop ;;
     import|validate) check_profile "$1" ;;
@@ -478,7 +490,8 @@ case "${1:-}" in
     mode-rule|mode-global|mode-direct) set_mode "${1#mode-}" ;;
     boot-on) rm -f "$DATA/boot-off" ;;
     boot-off) : > "$DATA/boot-off" ;;
-    hotspot-on|hotspot-off) set_hotspot "${1#hotspot-}" ;;
+    hotspot-on) protection_command check-hotspot && set_hotspot on ;;
+    hotspot-off) set_hotspot off ;;
     keepalive-off|keepalive-conservative|keepalive-balanced|keepalive-aggressive)
         set_keepalive "${1#keepalive-}" || fail 'Cannot save TCP keepalive setting.' ;;
     notification-on) : > "$DATA/notification-on"; rm -f "$DATA/notification-attempt" ;;

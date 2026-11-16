@@ -1,17 +1,18 @@
-"""Build the pinned Mihomo source with MinClash's small TCP keepalive overlay."""
+"""Build pinned Mihomo with opt-in keepalive and application protection hooks."""
 from pathlib import Path
 import hashlib
 import os
 import shutil
 import subprocess
 import tarfile
+from mihomo_patches import apply as apply_core_patches
 
 ROOT = Path(__file__).resolve().parent
 BUILD = ROOT / "build"
 COMMIT = "3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8"
 SOURCE_SHA256 = "ecda5f8c8a8a1d60bc088c2640c85d92c8f002c0686234a26bdf671735afe216"
 VENDOR_SHA256 = "7ac4d4da0e6a29ef6ed18d2cf8f4c58d361d049ae364fd841acc883aa3a9e1cc"
-VERSION = "v1.19.33-minclash.1"
+VERSION = "v1.19.33-minclash.2"
 GO_VERSION = "go1.26.11"
 
 
@@ -51,6 +52,7 @@ def prepare_source(download):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(overlay, target)
     shutil.copyfile(ROOT / "mihomo-patches/README.md", destination / "MINCLASH-BUILD.md")
+    apply_core_patches(destination)
     return destination
 
 
@@ -75,12 +77,13 @@ def build_mihomo(download, clang):
     for key in ("GOOS", "GOARCH", "GOARM", "GOAMD64"):
         host_environment.pop(key, None)
     subprocess.run([go, "test", "-mod=vendor", "./component/keepalive", "-count=1"], cwd=source, env=host_environment, check=True)
+    subprocess.run([go, "test", "-mod=vendor", "./component/protection", "./adapter/outbound", "./config", "./tunnel", "-run", "MinClash|Protection", "-count=1"], cwd=source, env=host_environment, check=True)
     binary = BUILD / "mihomo-arm64"
     environment.update(GOOS="android", GOARCH="arm64", CGO_ENABLED="1",
                        CC=f'"{clang}" --target=aarch64-linux-android28',
                        CGO_LDFLAGS="-Wl,-z,max-page-size=16384")
     flags = (f"-X github.com/metacubex/mihomo/constant.Version={VERSION} "
-             "-X github.com/metacubex/mihomo/constant.BuildTime=2026-11-14T00:00:00Z -w -s -buildid=")
+             "-X github.com/metacubex/mihomo/constant.BuildTime=2026-11-16T00:00:00Z -w -s -buildid=")
     subprocess.run([go, "build", "-mod=vendor", "-tags", "with_gvisor", "-trimpath", "-ldflags", flags,
                     "-o", str(binary), "."], cwd=source, env=environment, check=True)
     # Supply the complete patched core source together with the local artifacts.
