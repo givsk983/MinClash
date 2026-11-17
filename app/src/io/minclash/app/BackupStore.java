@@ -55,6 +55,7 @@ final class BackupStore {
     }
 
     void restore(BackupArchive.Data data, String expectedStamp) throws Exception {
+        routing.checkExperimentalAccess(data.state());
         Module.Status before = Module.status();
         if (!before.installed() || !before.enabled || !before.state.equals("stopped")) {
             throw new IOException("请先安装并启用模块、停止 TUN，再恢复备份。");

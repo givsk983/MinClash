@@ -54,10 +54,15 @@ PROFILE.write_bytes(source)
 (MOD / 'root-env.sh').write_text('''export PATH=/usr/bin:/bin
 BB=bb
 bb() {
+    if [ "$1" = flock ]; then lock_fd; return; fi
     if [ "$1" = mv ] && [ "${TEST_MOVE_FAIL:-0}" = 1 ]; then return 1; fi
     command "$@"
 }
-lock_fd() { [ "${TEST_LOCK_DENIED:-0}" != 1 ]; }
+lock_fd() {
+    [ "${TEST_LOCK_DENIED:-0}" != 1 ] || return 1
+    lock_calls=$((${lock_calls:-0} + 1))
+    [ "$lock_calls" -gt "${TEST_LOCK_BUSY_ATTEMPTS:-0}" ]
+}
 ''', newline='\n')
 
 helper = WORK / 'transport.py'
@@ -83,6 +88,7 @@ sys.stdout.buffer.write(('HTTP/1.1 '+str(reply.status)+' '+reply.reason+'\\r\\nC
 script = (ROOT / 'build/checks-0.2.3/live-script.sh').read_text()
 script = script.replace('/data/adb/modules/minclash', MOD.as_posix()).replace('/data/adb/minclash', DATA.as_posix())
 script = script.replace('[ -S "$DATA/control.sock" ]', '[ -f "$DATA/control.sock" ]')
+script = script.replace('/system/bin/flock', '/nonexistent/android-flock')
 SCRIPT = WORK / 'reload.sh'
 SCRIPT.write_text(script, newline='\n')
 subprocess.run([str(BASH), '-n', str(SCRIPT)], check=True)
@@ -132,7 +138,8 @@ try:
     start()
     pid = process.pid
     began = time.monotonic()
-    result = invoke()
+    # Background API requests briefly hold the same lock. Saving must wait and then reload.
+    result = invoke(TEST_LOCK_BUSY_ATTEMPTS='3')
     elapsed = time.monotonic() - began
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert process.pid == pid and process.poll() is None, 'core restarted'
@@ -146,8 +153,16 @@ try:
     # Return to the known old file and core, emulating the production cold recovery.
     stop(); PROFILE.write_bytes(source); start()
     count = CALLS.read_text().count('reload')
-    failed(invoke(packet(old=b'outdated')), 'MINCLASH_LIVE_UNCHANGED')
-    failed(invoke(TEST_LOCK_DENIED='1'), 'MINCLASH_LIVE_UNCHANGED')
+    failed(invoke(packet(old=b'outdated')), 'MINCLASH_LIVE_UNCHANGED_PROFILE')
+    began = time.monotonic()
+    failed(invoke(TEST_LOCK_DENIED='1'), 'MINCLASH_LIVE_UNCHANGED_BUSY')
+    assert time.monotonic() - began < 8, 'lock retry must be bounded'
+    (DATA / 'state').write_text('starting\n')
+    failed(invoke(), 'MINCLASH_LIVE_UNCHANGED_STATE')
+    (DATA / 'state').write_text('running\n')
+    (MOD / 'disable').touch()
+    failed(invoke(), 'MINCLASH_LIVE_UNCHANGED_MODULE')
+    (MOD / 'disable').unlink()
     failed(invoke(packet()[:-1]), 'MINCLASH_LIVE_UNCHANGED')
     failed(invoke(packet()+b'extra'), 'MINCLASH_LIVE_UNCHANGED')
     failed(invoke(b'2097153\n1\ninvalid\nx'), 'MINCLASH_LIVE_UNCHANGED')

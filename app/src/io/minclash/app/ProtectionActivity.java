@@ -109,7 +109,11 @@ public final class ProtectionActivity extends Activity {
     private void render() {
         int y=scroll.getScrollY(); content.removeAllViews();
         action("‹ 返回",this::onBackPressed);
-        ui.add(content,ui.label("应用防泄漏保护",23,AppUi.TEXT,true),0);
+        ui.add(content,ui.label("应用防泄漏保护 · 开发中",23,AppUi.TEXT,true),0);
+        if (!ExperimentalFeatures.enabled(this)) {
+            note("请先在「设置 → 开发中功能」开启尝鲜，再使用应用防泄漏保护。已有保护设置保持不变。");
+            return;
+        }
         note("为应用指定代理；代理不可用或 TUN 停止时，所选应用会暂停联网，直到代理恢复或你关闭保护。");
         if (!model.error.isEmpty()) ui.add(content,ui.label(model.error,13,AppUi.AMBER,false),10);
         if (model.busy) note("正在读取或应用，请稍候…");
@@ -240,6 +244,10 @@ public final class ProtectionActivity extends Activity {
             .setNegativeButton("取消",null).setPositiveButton(off?"关闭并恢复联网":"应用",(d,w)->apply(off)).show();
     }
     private void apply(boolean off){
+        if (!off && !ExperimentalFeatures.enabled(this)) {
+            message("请先在「设置 → 开发中功能」开启尝鲜。");
+            return;
+        }
         final Model m=model;final byte[] request;final ProtectionPolicy attempted;
         try {
             request=off?null:m.draft.request(m.remote.getString("digest"));

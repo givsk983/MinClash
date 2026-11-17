@@ -193,7 +193,14 @@ final class RoutingStore {
     }
 
     void apply(State state, boolean recreateTun) throws Exception {
+        checkExperimentalAccess(state);
         apply(Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps()), state, recreateTun);
+    }
+
+    void checkExperimentalAccess(State state) throws Exception {
+        State previous = read();
+        ExperimentalFeatures.checkBypass(ExperimentalFeatures.enabled(context),
+            previous == null ? Set.of() : previous.bypassedApps(), state.bypassedApps());
     }
 
     private void apply(byte[] merged, State state) throws Exception {

@@ -13,7 +13,7 @@ import java.util.Map;
 
 /** Compact settings index with one detail page visible at a time. */
 final class SettingsNavigation {
-    private record Page(String title, LinearLayout body, TextView summary) {}
+    private record Page(String title, LinearLayout body, TextView summary, View row, View divider) {}
     private final AppUi ui;
     private final ScrollView scroll;
     private final LinearLayout root;
@@ -61,8 +61,9 @@ final class SettingsNavigation {
     }
 
     private LinearLayout entry(LinearLayout group, String id, String name, String summary, Runnable action) {
+        View divider = null;
         if (group.getChildCount() > 0) {
-            View divider = new View(root.getContext());
+            divider = new View(root.getContext());
             divider.setBackgroundColor(AppUi.BORDER);
             LinearLayout.LayoutParams line = new LinearLayout.LayoutParams(-1, ui.dp(1));
             line.setMargins(ui.dp(16), 0, ui.dp(16), 0);
@@ -98,8 +99,20 @@ final class SettingsNavigation {
             body.setVisibility(View.GONE);
             ui.add(root, body, 18);
         }
-        pages.put(id, new Page(name, body, detail));
+        pages.put(id, new Page(name, body, detail, row, divider));
         return body;
+    }
+
+    void visible(String id, boolean visible) {
+        Page target = pages.get(id);
+        target.row().setVisibility(visible ? View.VISIBLE : View.GONE);
+        boolean previousVisible = false;
+        for (Page page : pages.values()) {
+            if (page.row().getParent() != target.row().getParent()) continue;
+            boolean shown = page.row().getVisibility() == View.VISIBLE;
+            if (page.divider() != null) page.divider().setVisibility(shown && previousVisible ? View.VISIBLE : View.GONE);
+            previousVisible |= shown;
+        }
     }
 
     void summary(String id, String value) {

@@ -34,7 +34,7 @@ final class AppRouting {
     record Choice(String target, boolean bypassed) {
         String label() {
             return bypassed ? "绕过 TUN（游戏直连）" : target.isEmpty() ? "跟随订阅规则"
-                : target.equals("DIRECT") ? "直连（经过 TUN）" : "代理组：" + target;
+                : target.equals("DIRECT") ? "直连" : "代理组：" + target;
         }
     }
 

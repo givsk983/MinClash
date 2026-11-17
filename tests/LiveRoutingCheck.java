@@ -71,6 +71,14 @@ public final class LiveRoutingCheck {
         Fake conflict = new Fake("unchanged");
         try { RoutingStore.applyLive(conflict); throw new AssertionError("conflict accepted"); }
         catch (LiveProfile.UnchangedFailure expected) { require(conflict.steps.equals(List.of("reload")), "CAS conflict leaves external state intact"); }
+        for (String reason : List.of("BUSY", "STATE", "PROFILE", "MODULE", "")) {
+            LiveProfile.UnchangedFailure failure = LiveProfile.preflightFailure("MINCLASH_LIVE_UNCHANGED_" + reason);
+            require(failure != null && !failure.getMessage().contains("刷新"), "preflight failure gives actionable retry guidance");
+        }
+        require(LiveProfile.preflightFailure("MINCLASH_LIVE_UNCHANGED_BUSY").getMessage().contains("无需关闭 TUN"),
+            "contention does not ask user to stop TUN");
+        require(LiveProfile.preflightFailure("MINCLASH_LIVE_UNCERTAIN") == null
+            && LiveProfile.preflightFailure(null) == null, "ambiguous apply still requires rollback");
         Fake selection = new Fake("selections");
         try { RoutingStore.applyLive(selection); throw new AssertionError("selection failure hidden"); }
         catch (RoutingStore.SelectionRestoreFailure expected) { require(selection.steps.contains("commit") && !selection.steps.contains("rollback"), "saved config remains and selection warning is surfaced"); }

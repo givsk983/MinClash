@@ -114,6 +114,8 @@ public final class MainActivity extends Activity {
     private Button checkAppUpdateButton;
     private Button repairDnsButton;
     private Switch autoUpdateSwitch;
+    private Switch experimentalSwitch;
+    private View experimentalRouting;
     private TextView autoUpdateSummary;
     private AppUpdate.Release pendingUpdate;
     private BackgroundWork background;
@@ -327,20 +329,24 @@ public final class MainActivity extends Activity {
 
         LinearLayout routing = card(profiles, 14);
         add(routing, label("分流规则", 17, TEXT, true), 0);
-        add(routing, label("防泄漏保护 → 应用分流 → 自定义规则 → 订阅规则", 12, MINT, false), 8);
+        add(routing, label("应用分流 → 自定义规则 → 订阅规则", 12, MINT, false), 8);
         routingButton = button("应用分流  ›", false);
         routingButton.setOnClickListener(view -> openAppRouting());
         add(routing, routingButton, 14);
-        add(routing, label("按应用指定直连、代理组，或让游戏绕过 TUN。", 12, MUTED, false), 6);
+        add(routing, label("按应用指定直连或代理组。", 12, MUTED, false), 6);
         personalRulesButton = button("域名与 IP 分流  ›", false);
         personalRulesButton.setOnClickListener(view -> execute("", this::readPersonalRules));
         add(routing, personalRulesButton, 12);
         add(routing, label("按域名、IPv4 或 IPv6 自定义出口。", 12, MUTED, false), 6);
-        Button protectionButton = button("应用防泄漏保护  ›", false);
+        LinearLayout experimental = column();
+        experimentalRouting = experimental;
+        add(routing, experimental, 0);
+        Button protectionButton = button("应用防泄漏保护 · 开发中  ›", false);
         protectionButton.setOnClickListener(view -> startActivity(new Intent(this, ProtectionActivity.class)));
-        add(routing, protectionButton, 12);
-        add(routing, label("选定应用强制代理，断线时保持阻断。", 12, MUTED, false), 6);
-        add(routing, label("普通分流在规则模式下生效。绕过 TUN 独立于模式，改变绕过设置会短暂重连；不能与该应用的防泄漏保护或域名查询保护同时使用。", 12, MUTED, false), 12);
+        add(experimental, protectionButton, 12);
+        add(experimental, label("选定应用强制代理，断线时保持阻断，优先于普通分流。", 12, MUTED, false), 6);
+        add(experimental, label("绕过 TUN 独立于模式，改变绕过设置会短暂重连；不能与该应用的防泄漏保护或域名查询保护同时使用。", 12, MUTED, false), 12);
+        add(routing, label("普通分流在规则模式下生效。", 12, MUTED, false), 12);
         LinearLayout autoUpdates = card(profiles, 14);
         autoUpdateSwitch = new Switch(this);
         autoUpdateSwitch.setText("每日自动更新订阅");
@@ -385,13 +391,28 @@ public final class MainActivity extends Activity {
         settingsNavigation.action(commonSettings, "subscription", "订阅显示与提醒", "额度布局与到期通知", this::showSubscriptionSettings);
         settingsNavigation.action(commonSettings, "appearance", "外观", "桌面图标", this::showLauncherIcons);
         LinearLayout connectionSettings = settingsNavigation.group("连接");
-        settingsNavigation.action(connectionSettings, "protection", "应用防泄漏保护", "指定应用使用代理，断线时暂停联网", () -> startActivity(new Intent(this, ProtectionActivity.class)));
+        settingsNavigation.action(connectionSettings, "protection", "应用防泄漏保护 · 开发中", "指定应用使用代理，断线时暂停联网", () -> startActivity(new Intent(this, ProtectionActivity.class)));
         LinearLayout servicePage = settingsNavigation.page(connectionSettings, "connection", "连接与启动", "开机自启与热点共享");
         LinearLayout keepAlivePage = settingsNavigation.page(connectionSettings, "keepalive", "后台连接保活", "改善后台长连接恢复");
         LinearLayout backgroundGuidePage = settingsNavigation.page(connectionSettings, "background-guide", "后台连接恢复指南", "返回后连接中、消息刷新慢");
         new BackgroundConnectionGuide(this, backgroundGuidePage, this::showMessage,
             () -> settingsNavigation.show("keepalive"), () -> { selectPage(3); runDiagnostics(null); });
         LinearLayout managementSettings = settingsNavigation.group("管理");
+        LinearLayout experimentalPage = settingsNavigation.page(managementSettings, "experimental", "开发中功能", "默认关闭 · 开启后尝鲜");
+        experimentalSwitch = new Switch(this);
+        experimentalSwitch.setText("开启开发中功能");
+        experimentalSwitch.setTextSize(16);
+        experimentalSwitch.setTextColor(TEXT);
+        experimentalSwitch.setMinHeight(dp(48));
+        experimentalSwitch.setChecked(ExperimentalFeatures.enabled(this));
+        experimentalSwitch.setOnCheckedChangeListener((button, checked) -> {
+            if (updatingSwitch) return;
+            appPreferences().edit().putBoolean(ExperimentalFeatures.KEY, checked).apply();
+            render();
+        });
+        add(experimentalPage, experimentalSwitch, 0);
+        add(experimentalPage, label("包含「应用防泄漏保护」和「绕过 TUN」。开启后，入口和选项会出现在原来的位置，供你尝鲜。", 13, MUTED, false), 12);
+        add(experimentalPage, label("功能仍在开发中。关闭此开关只隐藏入口，不会自动撤销已生效的保护或绕过设置；需要调整时，请重新开启后到原入口操作。", 13, MUTED, false), 12);
         LinearLayout backupPage = settingsNavigation.page(managementSettings, "backup", "备份与恢复", "配置、订阅与分流规则");
         LinearLayout service = card(servicePage, 0);
 
@@ -2333,6 +2354,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showAppPermissions(AppRouting.Screen screen, AlertDialog listDialog) {
+        if (busy) return;
         boolean requestable = InstalledAppsAccess.needsRequest(this);
         String query = Build.VERSION.SDK_INT < 30 ? "此 Android 版本无需单独申请"
             : checkSelfPermission("android.permission.QUERY_ALL_PACKAGES") == android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -2401,9 +2423,9 @@ public final class MainActivity extends Activity {
         info.setPadding(dp(12), dp(6), dp(12), dp(6));
         info.setOnClickListener(view -> new AlertDialog.Builder(this).setTitle("应用分流说明")
             .setMessage("• 个人选择优先于订阅规则，仅在规则模式下生效。\n\n"
-                + "• “直连”仍经过 TUN；“绕过 TUN”让应用自己的 TCP／UDP 直接使用手机网络，在所有模式下生效。只能选择普通且独立 UID 的应用，同包名的其他 Android 资料也会一并绕过。\n\n"
+                + (ExperimentalFeatures.enabled(this) || !screen.state().bypassedApps().isEmpty() ? "• “直连”仍经过 TUN；“绕过 TUN”让应用自己的 TCP／UDP 直接使用手机网络，在所有模式下生效。只能选择普通且独立 UID 的应用，同包名的其他 Android 资料也会一并绕过。\n\n"
                 + "• 有绕过应用时，DNS 改为返回真实 IP，防止虚拟 IP 导致游戏断网；系统代发的 DNS 仍可能经过 TUN。不能同时启用域名查询保护，也不能绕过已受防泄漏保护的应用。\n\n"
-                + "• 修改绕过设置会短暂重建 TUN，保存后请重新打开游戏；游戏卸载重装后，可在应用分流列表点击“重新应用绕过”，再保存并应用，或重启 TUN。\n\n"
+                + "• 修改绕过设置会短暂重建 TUN，保存后请重新打开游戏；游戏卸载重装后，可在应用分流列表点击“重新应用绕过”，再保存并应用，或重启 TUN。\n\n" : "")
                 + "• 选择“跟随订阅规则”可移除个人设置。保存后现有连接会按新规则重连。\n\n"
                 + "• “系统”包含系统应用和组件，“Google”按包名归类。自定义分类可包含任意应用，只用于筛选。\n\n"
                 + "• 图标按列表显示需要在后台加载，应用列表会短暂缓存；从系统设置返回后重新读取。\n\n"
@@ -2413,10 +2435,14 @@ public final class MainActivity extends Activity {
         add(content, heading, 0);
         TextView count = label("", 12, MUTED, false);
         add(content, count, 8);
-        add(content, label("可连续修改多个应用，最后保存并应用；绕过设置统一短暂重连一次。", 12, MUTED, false), 6);
+        add(content, label("可连续修改多个应用，最后保存并应用。"
+            + (ExperimentalFeatures.enabled(this) ? "绕过设置统一短暂重连一次。" : ""), 12, MUTED, false), 6);
         TextView iconHint = label("图标按需加载 · 点此查看权限与读取状态", 11, MUTED, false);
         iconHint.setOnClickListener(view -> showAppPermissions(screen, listDialog[0]));
         add(content, iconHint, 4);
+        TextView saveHint = label("", 12, AMBER, false);
+        saveHint.setVisibility(View.GONE);
+        add(content, saveHint, 8);
         EditText search = new EditText(this);
         search.setHint("搜索应用名称或包名");
         search.setSingleLine(true);
@@ -2484,10 +2510,21 @@ public final class MainActivity extends Activity {
         dialog.setOnDismissListener(ignored -> routingIcons.stopObserving());
         filter.run();
         dialog.show();
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setVisibility(ExperimentalFeatures.enabled(this) ? View.VISIBLE : View.GONE);
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             if (busy || pending.isEmpty() && !reapply[0]) return;
             Map<String, AppRouting.Choice> edits = new TreeMap<>(pending);
-            execute("应用分流已批量保存。", true, () -> {
+            boolean recreateTun = reapply[0];
+            showMessage("");
+            saveHint.setText("正在保存并应用，请稍候…");
+            saveHint.setTextColor(MUTED);
+            saveHint.setVisibility(View.VISIBLE);
+            for (int which : new int[]{AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_NEUTRAL})
+                dialog.getButton(which).setEnabled(false);
+            permission.setEnabled(false);
+            categoryButton.setEnabled(false);
+            manageCategories.setEnabled(false);
+            execute("", true, () -> {
                 RoutingStore routing = new RoutingStore(this);
                 RoutingStore.State latest = routing.load();
                 Map<String, String> rules = new TreeMap<>(latest.applications());
@@ -2498,9 +2535,28 @@ public final class MainActivity extends Activity {
                     if (choice.bypassed()) bypassed.add(name);
                     else if (!choice.target().isEmpty()) rules.put(name, choice.target());
                 }
-                routing.apply(latest.withApplications(rules).withBypassedApps(bypassed), reapply[0]);
-                runOnUiThread(dialog::dismiss);
-                return routingLoader.load(this, appPreferences().getBoolean(ROOT_INVENTORY, false), Module.status());
+                routing.apply(latest.withApplications(rules).withBypassedApps(bypassed), recreateTun);
+                return null;
+            }, error -> {
+                // A successful commit must not become a failed save because a later list refresh failed.
+                if (error == null || error instanceof RoutingStore.SelectionRestoreFailure) {
+                    dialog.dismiss();
+                    routingSnapshot = null;
+                    if (error == null) showMessage("应用分流已保存。普通分流在规则模式下生效。");
+                    else new AlertDialog.Builder(this).setTitle("分流已保存，请检查节点")
+                        .setMessage(error.getMessage()).setPositiveButton("知道了", null).show();
+                } else {
+                    saveHint.setText((error.getMessage() == null ? "保存失败，请重试。" : error.getMessage())
+                        + "\n你的修改已保留在此窗口，点击「重试保存」即可。");
+                    saveHint.setTextColor(AMBER);
+                    saveHint.announceForAccessibility(saveHint.getText());
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setText("重试保存");
+                    for (int which : new int[]{AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_NEUTRAL})
+                        dialog.getButton(which).setEnabled(true);
+                    permission.setEnabled(true);
+                    categoryButton.setEnabled(true);
+                    manageCategories.setEnabled(true);
+                }
             });
         });
         dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
@@ -2757,9 +2813,9 @@ public final class MainActivity extends Activity {
     }
 
     private void showAppTarget(AppRouting.Screen screen, AppRouting.Entry app, AlertDialog listDialog, java.util.function.Consumer<AppRouting.Choice> stage) {
-        boolean offersBypass = app.bypassed() || app.installed() && !app.system();
+        boolean offersBypass = ExperimentalFeatures.enabled(this) && (app.bypassed() || app.installed() && !app.system());
         List<AppRouting.Choice> choices = AppRouting.choices(screen.targets(), offersBypass);
-        String[] labels = choices.stream().map(AppRouting.Choice::label).toArray(String[]::new);
+        String[] labels = choices.stream().map(choice -> choice.label() + (choice.bypassed() ? " · 开发中" : "")).toArray(String[]::new);
         int[] chosen = {choices.indexOf(new AppRouting.Choice(app.target(), app.bypassed()))};
         new AlertDialog.Builder(this).setTitle(app.label() + " · 出口")
             .setSingleChoiceItems(labels, chosen[0], (dialog, index) -> chosen[0] = index)
@@ -2967,6 +3023,11 @@ public final class MainActivity extends Activity {
     }
 
     private void execute(String success, boolean checkConnection, Operation operation) {
+        execute(success, checkConnection, operation, null);
+    }
+
+    private void execute(String success, boolean checkConnection, Operation operation,
+                         java.util.function.Consumer<Exception> completion) {
         if (busy) return;
         busy = true;
         main.removeCallbacks(poll);
@@ -2981,6 +3042,7 @@ public final class MainActivity extends Activity {
                 main.post(() -> {
                     if (isDestroyed()) return;
                     busy = false;
+                    if (completion != null) completion.accept(null);
                     if (!success.isEmpty()) showMessage(success);
                     if (result instanceof DiagnosticReport) showMessage("");
                     if (result instanceof Module.Status updated) {
@@ -3009,12 +3071,13 @@ public final class MainActivity extends Activity {
                 main.post(() -> {
                     if (isDestroyed()) return;
                     busy = false;
-                    showMessage(error.getMessage() == null ? "操作失败，请重新检测环境。" : error.getMessage());
+                    if (completion != null) completion.accept(error);
+                    else showMessage(error.getMessage() == null ? "操作失败，请重新检测环境。" : error.getMessage());
                     if (checkConnection) scheduleLatency(0);
                     render();
                     schedulePoll();
                     if (visible && error instanceof Subscription.NetworkFailure failure) showSubscriptionNetworkFailure(failure);
-                    if (visible && error instanceof Module.ProfileFailure failure) {
+                    if (completion == null && visible && error instanceof Module.ProfileFailure failure) {
                         new AlertDialog.Builder(this).setTitle("配置校验失败").setMessage(failure.getMessage())
                             .setNegativeButton("关闭", null).setPositiveButton("内核日志", (dialog, which) ->
                                 execute("", () -> Module.run(Module.Command.LOGS, null))).show();
@@ -3046,6 +3109,14 @@ public final class MainActivity extends Activity {
     }
 
     private void render() {
+        boolean experimental = ExperimentalFeatures.enabled(this);
+        experimentalRouting.setVisibility(experimental ? View.VISIBLE : View.GONE);
+        settingsNavigation.visible("protection", experimental);
+        settingsNavigation.summary("experimental", experimental ? "已开启 · 原入口可用" : "默认关闭 · 开启后尝鲜");
+        updatingSwitch = true;
+        experimentalSwitch.setChecked(experimental);
+        experimentalSwitch.setEnabled(!busy);
+        updatingSwitch = false;
         boolean installed = status != null && status.installed();
         boolean pending = status != null && !status.pendingVersion.isEmpty();
         boolean enabled = installed && status.enabled;
