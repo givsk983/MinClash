@@ -2403,7 +2403,7 @@ public final class MainActivity extends Activity {
             .setMessage("• 个人选择优先于订阅规则，仅在规则模式下生效。\n\n"
                 + "• “直连”仍经过 TUN；“绕过 TUN”让应用自己的 TCP／UDP 直接使用手机网络，在所有模式下生效。只能选择普通且独立 UID 的应用，同包名的其他 Android 资料也会一并绕过。\n\n"
                 + "• 有绕过应用时，DNS 改为返回真实 IP，防止虚拟 IP 导致游戏断网；系统代发的 DNS 仍可能经过 TUN。不能同时启用域名查询保护，也不能绕过已受防泄漏保护的应用。\n\n"
-                + "• 修改绕过设置会短暂重建 TUN，保存后请重新打开游戏；游戏卸载重装后，可在出口窗口点击“重新应用绕过”，或重启 TUN。\n\n"
+                + "• 修改绕过设置会短暂重建 TUN，保存后请重新打开游戏；游戏卸载重装后，可在应用分流列表点击“重新应用绕过”，再保存并应用，或重启 TUN。\n\n"
                 + "• 选择“跟随订阅规则”可移除个人设置。保存后现有连接会按新规则重连。\n\n"
                 + "• “系统”包含系统应用和组件，“Google”按包名归类。自定义分类可包含任意应用，只用于筛选。\n\n"
                 + "• 图标按列表显示需要在后台加载，应用列表会短暂缓存；从系统设置返回后重新读取。\n\n"
@@ -2413,6 +2413,7 @@ public final class MainActivity extends Activity {
         add(content, heading, 0);
         TextView count = label("", 12, MUTED, false);
         add(content, count, 8);
+        add(content, label("可连续修改多个应用，最后保存并应用；绕过设置统一短暂重连一次。", 12, MUTED, false), 6);
         TextView iconHint = label("图标按需加载 · 点此查看权限与读取状态", 11, MUTED, false);
         iconHint.setOnClickListener(view -> showAppPermissions(screen, listDialog[0]));
         add(content, iconHint, 4);
@@ -2433,6 +2434,8 @@ public final class MainActivity extends Activity {
         Button manageCategories = button("管理分类", false);
         buttonRow(content, categoryButton, manageCategories, 10);
         List<AppCategories.Category> custom = AppCategories.load(appPreferences());
+        Map<String, AppRouting.Choice> pending = new TreeMap<>();
+        boolean[] reapply = {false};
         RoutingAdapter adapter = new RoutingAdapter(screen.allowRoot());
         Runnable filter = () -> {
             String query = search.getText().toString().trim().toLowerCase(Locale.ROOT);
@@ -2443,12 +2446,14 @@ public final class MainActivity extends Activity {
             routingFilter = category.id();
             categoryButton.setText(category.name() + "  ▾");
             adapter.entries.clear();
-            for (AppRouting.Entry app : screen.applications()) {
+            for (AppRouting.Entry original : screen.applications()) {
+                AppRouting.Choice edit = pending.get(original.packageName());
+                AppRouting.Entry app = edit == null ? original : new AppRouting.Entry(original.label(), original.packageName(), edit.target(), original.installed(), original.system(), original.launchable(), edit.bypassed());
                 if (!category.includes(app)) continue;
                 if (!(app.label() + " " + app.packageName()).toLowerCase(Locale.ROOT).contains(query)) continue;
                 adapter.entries.add(app);
             }
-            count.setText(adapter.entries.size() + " 个应用 · 已指定 " + (screen.state().applications().size() + screen.state().bypassedApps().size()) + " 个");
+            count.setText("待应用 " + pending.size() + " 项 · " + adapter.entries.size() + " 个应用 · 已指定 " + (screen.state().applications().size() + screen.state().bypassedApps().size()) + " 个");
             adapter.notifyDataSetChanged();
         };
         categoryButton.setOnClickListener(view -> {
@@ -2469,7 +2474,8 @@ public final class MainActivity extends Activity {
             @Override public void afterTextChanged(Editable text) {}
         });
         AlertDialog dialog = new AlertDialog.Builder(this).setCustomTitle(content)
-            .setAdapter(adapter, null).setNegativeButton("关闭", null).create();
+            .setAdapter(adapter, null).setNegativeButton("关闭", null).setPositiveButton("保存并应用", null)
+            .setNeutralButton("重新应用绕过", null).create();
         listDialog[0] = dialog;
         routingIcons.observe(() -> {
             iconHint.setText(iconSummary(screen));
@@ -2478,12 +2484,53 @@ public final class MainActivity extends Activity {
         dialog.setOnDismissListener(ignored -> routingIcons.stopObserving());
         filter.run();
         dialog.show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            if (busy || pending.isEmpty() && !reapply[0]) return;
+            Map<String, AppRouting.Choice> edits = new TreeMap<>(pending);
+            execute("应用分流已批量保存。", true, () -> {
+                RoutingStore routing = new RoutingStore(this);
+                RoutingStore.State latest = routing.load();
+                Map<String, String> rules = new TreeMap<>(latest.applications());
+                Set<String> bypassed = new java.util.TreeSet<>(latest.bypassedApps());
+                for (var edit : edits.entrySet()) {
+                    String name = edit.getKey(); AppRouting.Choice choice = edit.getValue();
+                    rules.remove(name); bypassed.remove(name);
+                    if (choice.bypassed()) bypassed.add(name);
+                    else if (!choice.target().isEmpty()) rules.put(name, choice.target());
+                }
+                routing.apply(latest.withApplications(rules).withBypassedApps(bypassed), reapply[0]);
+                runOnUiThread(dialog::dismiss);
+                return routingLoader.load(this, appPreferences().getBoolean(ROOT_INVENTORY, false), Module.status());
+            });
+        });
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
+            if (busy) return;
+            if (pending.isEmpty() && !reapply[0]) dialog.dismiss();
+            else new AlertDialog.Builder(this).setTitle("放弃未应用的分流修改？")
+                .setNegativeButton("继续编辑", null).setPositiveButton("放弃", (d,w) -> dialog.dismiss()).show();
+        });
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
+            if (busy) return;
+            reapply[0] = true;
+            count.setText("已安排重新核对绕过应用，点击保存并应用后统一重连。");
+        });
+        dialog.setCancelable(false);
+        dialog.setOnKeyListener((d, key, event) -> {
+            if (key != android.view.KeyEvent.KEYCODE_BACK) return false;
+            if (event.getAction() == android.view.KeyEvent.ACTION_UP) dialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
+            return true;
+        });
         dialog.getListView().setDivider(null);
         dialog.getListView().setPadding(dp(10), dp(4), dp(10), dp(6));
         dialog.getListView().setClipToPadding(false);
         dialog.getListView().setOnItemClickListener((parent, view, index, id) -> {
+            if (busy) return;
             AppRouting.Entry app = adapter.getItem(index);
-            if (app != null) showAppTarget(screen, app, dialog);
+            if (app != null) showAppTarget(screen, app, dialog, choice -> {
+                AppRouting.Choice original = new AppRouting.Choice(screen.state().applications().getOrDefault(app.packageName(), ""), screen.state().bypassedApps().contains(app.packageName()));
+                if (original.equals(choice)) pending.remove(app.packageName()); else pending.put(app.packageName(), choice);
+                filter.run();
+            });
         });
         enableSearchKeyboard(dialog);
     }
@@ -2709,59 +2756,20 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void showAppTarget(AppRouting.Screen screen, AppRouting.Entry app, AlertDialog listDialog) {
+    private void showAppTarget(AppRouting.Screen screen, AppRouting.Entry app, AlertDialog listDialog, java.util.function.Consumer<AppRouting.Choice> stage) {
         boolean offersBypass = app.bypassed() || app.installed() && !app.system();
         List<AppRouting.Choice> choices = AppRouting.choices(screen.targets(), offersBypass);
         String[] labels = choices.stream().map(AppRouting.Choice::label).toArray(String[]::new);
         int[] chosen = {choices.indexOf(new AppRouting.Choice(app.target(), app.bypassed()))};
         new AlertDialog.Builder(this).setTitle(app.label() + " · 出口")
             .setSingleChoiceItems(labels, chosen[0], (dialog, index) -> chosen[0] = index)
-            .setNeutralButton(app.bypassed() ? "重新应用绕过" : "当前连接", (dialog, which) -> {
-                if (app.bypassed()) confirmAppTarget(app, listDialog, new AppRouting.Choice("", true), true);
-                else showAppConnections(app);
-            })
-            .setNegativeButton("取消", null).setPositiveButton("保存", (dialog, which) -> {
+            .setNeutralButton("当前连接", (dialog, which) -> showAppConnections(app))
+            .setNegativeButton("取消", null).setPositiveButton("暂存", (dialog, which) -> {
                 if (chosen[0] < 0) return;
                 AppRouting.Choice choice = choices.get(chosen[0]);
                 if (choice.bypassed() == app.bypassed() && choice.target().equals(app.target())) return;
-                if (choice.bypassed() != app.bypassed()) confirmAppTarget(app, listDialog, choice, false);
-                else saveAppTarget(app, listDialog, choice, false);
+                stage.accept(choice);
             }).show();
-    }
-
-    private void confirmAppTarget(AppRouting.Entry app, AlertDialog listDialog, AppRouting.Choice choice, boolean recreateTun) {
-        if (busy) return;
-        String title = recreateTun ? "重新应用绕过设置？" : choice.bypassed() ? "让此应用绕过 TUN？" : "恢复 TUN 接管？";
-        String message = recreateTun
-            ? "将重新核对应用安装信息并建立绕过路由，适用于游戏卸载重装后。其他应用的绕过与分流选择会保留。"
-            : choice.bypassed()
-                ? "游戏直接使用手机网络，同包名的其他 Android 资料也会一并绕过。\n\n启用期间 DNS 返回真实 IP；系统代发的 DNS 仍可能经过 TUN。不能与该应用的防泄漏保护或域名查询保护同时使用。"
-                : "该应用将恢复由 TUN 接管，按所选出口处理。";
-        new AlertDialog.Builder(this).setTitle(title)
-            .setMessage(message + "\n\nTUN 运行时会短暂重连，可能中断下载或通话。请先退出游戏，完成后重新打开。")
-            .setNegativeButton("取消", null).setPositiveButton("保存并应用", (confirm, button) ->
-                saveAppTarget(app, listDialog, choice, recreateTun)).show();
-    }
-
-    private void saveAppTarget(AppRouting.Entry app, AlertDialog listDialog, AppRouting.Choice choice, boolean recreateTun) {
-        if (busy) return;
-        listDialog.dismiss();
-        execute(recreateTun ? "已重新应用绕过设置，请重新打开游戏。" : "应用分流已保存。", true, () -> {
-            RoutingStore routing = new RoutingStore(this);
-            RoutingStore.State latest = routing.load();
-            Map<String, String> rules = new TreeMap<>(latest.applications());
-            Set<String> bypassed = new java.util.TreeSet<>(latest.bypassedApps());
-            if (choice.bypassed()) {
-                rules.remove(app.packageName());
-                bypassed.add(app.packageName());
-            } else {
-                bypassed.remove(app.packageName());
-                if (choice.target().isEmpty()) rules.remove(app.packageName());
-                else rules.put(app.packageName(), choice.target());
-            }
-            routing.apply(latest.withApplications(rules).withBypassedApps(bypassed), recreateTun);
-            return routingLoader.load(this, appPreferences().getBoolean(ROOT_INVENTORY, false), Module.status());
-        });
     }
 
     private RulesScreen readPersonalRules() throws Exception {

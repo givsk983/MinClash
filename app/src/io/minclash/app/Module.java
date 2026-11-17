@@ -13,7 +13,7 @@ final class Module {
         STATUS("status"), START("start"), STOP("stop"), IMPORT("import"), VALIDATE("validate"),
         BOOT_ON("boot-on"), BOOT_OFF("boot-off"), LOGS("logs"), API("api"),
         HOTSPOT_ON("hotspot-on"), HOTSPOT_OFF("hotspot-off"),
-        PROTECTION_GET("protection-get"), PROTECTION_SET("protection-set"), PROTECTION_OFF("protection-off"),
+        PROTECTION_POLICY("protection-policy"), PROTECTION_GET("protection-get"), PROTECTION_SET("protection-set"), PROTECTION_OFF("protection-off"),
         KEEPALIVE_OFF("keepalive-off"), KEEPALIVE_CONSERVATIVE("keepalive-conservative"),
         KEEPALIVE_BALANCED("keepalive-balanced"), KEEPALIVE_AGGRESSIVE("keepalive-aggressive"),
         STATUS_NOTIFICATION("status-notification"), NOTIFICATION_ON("notification-on"), NOTIFICATION_OFF("notification-off"),
@@ -355,7 +355,7 @@ final class Module {
         try (InputStream stdout = process.getInputStream()) {
             ByteArrayOutputStream result = new ByteArrayOutputStream();
             byte[] buffer = new byte[4096];
-            int limit = command == Command.API ? 8 * 1024 * 1024 : command == Command.PROTECTION_GET ? 128 * 1024 : 32768;
+            int limit = command == Command.API ? 8 * 1024 * 1024 : (command == Command.PROTECTION_GET || command == Command.PROTECTION_POLICY) ? 128 * 1024 : 32768;
             boolean truncated = false;
             int count;
             while ((count = stdout.read(buffer)) != -1) {

@@ -45,6 +45,18 @@ public final class ProtectionPolicyCheck {
         shared.apps.add(new ProtectionPolicy.App("org.example.third", 10124, "Safe"));
         require(!edits.acceptSnapshot(saved, false) && edits.dirty && edits.draft == shared,
             "later edits survive reconciliation of earlier failed request");
+        ProtectionPolicy batch = new ProtectionPolicy();
+        batch.putApps(java.util.List.of(new ProtectionPolicy.App("org.example.one", 10123, "Safe"),
+            new ProtectionPolicy.App("org.example.two", 10123, "Safe")), java.util.List.of("Safe", "Other"));
+        ProtectionPolicy before = ProtectionPolicy.parse(batch.json());
+        reject(() -> batch.putApps(java.util.List.of(new ProtectionPolicy.App("org.example.one", 10123, "Other"),
+            new ProtectionPolicy.App("org.example.bad", 0, "Other")), java.util.List.of("Other")), "invalid batch");
+        require(batch.sameAs(before), "a failed batch leaves every existing entry unchanged");
+        batch.strictDns = true; batch.dnsProxy = "Safe"; batch.bootstrap = true;
+        batch.putApps(java.util.List.of(new ProtectionPolicy.App("org.example.one", 10123, "Other"),
+            new ProtectionPolicy.App("org.example.two", 10123, "Other")), java.util.List.of("Other"));
+        require(batch.apps.size() == 2 && batch.apps.stream().allMatch(a -> a.target().equals("Other")), "shared UID batch changes atomically");
+        require(batch.strictDns && batch.bootstrap && batch.dnsProxy.equals("Safe"), "batch leaves DNS settings intact");
         System.out.println("PASS: protection defaults, policy round trip, CAS framing, unsafe targets and explicit bootstrap.");
     }
     private interface Check { void run() throws Exception; }

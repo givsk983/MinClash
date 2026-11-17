@@ -473,6 +473,7 @@ case "${1:-}" in
         done
         exit ;;
     protection-get) protection_command get; exit ;;
+    protection-policy) protection_command policy; exit ;;
 esac
 
 exec 9>"$DATA/action.lock"

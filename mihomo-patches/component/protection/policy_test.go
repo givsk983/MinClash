@@ -202,3 +202,50 @@ func TestProtectionOffDoesNotRequireFirewall(t *testing.T) {
 		t.Fatal("default off probed or changed firewall")
 	}
 }
+
+func TestBatchPackageVerification(t *testing.T) {
+	p := Policy{Version: 1, Apps: []App{{"org.example.one", 10123, "Safe"}, {"org.example.two", 10124, "Safe"}, {"org.example.work", 1010123, "Safe"}}}
+	calls := make(map[uint32]int)
+	list := func(user uint32) ([]byte, error) {
+		calls[user]++
+		if user == 0 {
+			return []byte("package:org.example.one uid:10123\npackage:org.example.two uid:10124\n"), nil
+		}
+		return []byte("package:org.example.work uid:1010123\n"), nil
+	}
+	if err := verifyPackages(p, list); err != nil {
+		t.Fatal(err)
+	}
+	if calls[0] != 1 || calls[10] != 1 {
+		t.Fatal(calls)
+	}
+	p.Apps[0].UID++
+	if verifyPackages(p, list) == nil {
+		t.Fatal("accepted changed UID")
+	}
+	if verifyPackages(p, func(uint32) ([]byte, error) { return nil, errors.New("unavailable") }) == nil {
+		t.Fatal("accepted failed inventory")
+	}
+	if verifyPackages(Policy{}, func(uint32) ([]byte, error) { t.Fatal("queried empty policy"); return nil, nil }) != nil {
+		t.Fatal("empty policy")
+	}
+}
+
+func TestProtectionPolicyReadSkipsHealthChecks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "policy.json")
+	p := Policy{Version: 1, Apps: []App{{"org.example.app", 10123, "Safe"}}}
+	if err := writePolicy(path, p); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	f := Firewall{func(string, ...string) (string, error) { t.Fatal("policy read called firewall"); return "", nil }}
+	if err := manage("policy", path, strings.NewReader(""), &out, f, func(Policy) error { t.Fatal("policy read called package manager"); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Policy Policy `json:"policy"`
+	}
+	if json.Unmarshal(out.Bytes(), &result) != nil || result.Policy.Digest() != p.Digest() {
+		t.Fatal(out.String())
+	}
+}

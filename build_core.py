@@ -12,7 +12,7 @@ BUILD = ROOT / "build"
 COMMIT = "3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8"
 SOURCE_SHA256 = "ecda5f8c8a8a1d60bc088c2640c85d92c8f002c0686234a26bdf671735afe216"
 VENDOR_SHA256 = "7ac4d4da0e6a29ef6ed18d2cf8f4c58d361d049ae364fd841acc883aa3a9e1cc"
-VERSION = "v1.19.33-minclash.2"
+VERSION = "v1.19.33-minclash.3"
 GO_VERSION = "go1.26.11"
 
 

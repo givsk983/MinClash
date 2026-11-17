@@ -229,21 +229,31 @@ func (f Firewall) Healthy(p Policy) bool {
 	return true
 }
 func VerifyPackages(p Policy) error {
-	for _, a := range p.Apps {
+	return verifyPackages(p, func(user uint32) ([]byte, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		out, err := exec.CommandContext(ctx, "/system/bin/cmd", "package", "list", "packages", "-U", "--user", strconv.Itoa(int(a.UID/100000)), a.Package).Output()
-		cancel()
-		if err != nil {
-			return errors.New("cannot verify installed applications")
-		}
-		want := fmt.Sprintf("package:%s uid:%d", a.Package, a.UID)
-		found := false
-		for _, line := range strings.Split(string(out), "\n") {
-			if strings.TrimSpace(line) == want {
-				found = true
+		defer cancel()
+		return exec.CommandContext(ctx, "/system/bin/cmd", "package", "list", "packages", "-U", "--user", strconv.Itoa(int(user))).Output()
+	})
+}
+
+// Read each Android user's inventory once, without caching across operations.
+func verifyPackages(p Policy, list func(uint32) ([]byte, error)) error {
+	inventories := make(map[uint32]map[string]bool)
+	for _, a := range p.Apps {
+		user := a.UID / 100000
+		installed, ok := inventories[user]
+		if !ok {
+			out, err := list(user)
+			if err != nil {
+				return errors.New("cannot verify installed applications")
 			}
+			installed = make(map[string]bool)
+			for _, line := range strings.Split(string(out), "\n") {
+				installed[strings.TrimSpace(line)] = true
+			}
+			inventories[user] = installed
 		}
-		if !found {
+		if !installed[fmt.Sprintf("package:%s uid:%d", a.Package, a.UID)] {
 			return fmt.Errorf("application UID changed or application unavailable: %s; reselect it", a.Package)
 		}
 	}
@@ -303,6 +313,10 @@ func manage(command, path string, input io.Reader, output io.Writer, f Firewall,
 		return err
 	}
 	switch command {
+	case "policy":
+		return json.NewEncoder(output).Encode(struct {
+			Policy Policy `json:"policy"`
+		}{p})
 	case "stage":
 		data, err := io.ReadAll(io.LimitReader(input, MaxBytes+1))
 		if err != nil {

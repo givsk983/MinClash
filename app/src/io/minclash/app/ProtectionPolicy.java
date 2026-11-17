@@ -70,14 +70,21 @@ final class ProtectionPolicy {
     }
 
     void putApp(App app, List<String> targets) throws IOException {
+        putApps(List.of(app), targets);
+    }
+
+    /** Commit a batch only after the whole proposed application list is valid. */
+    void putApps(List<App> changes, List<String> targets) throws IOException {
         List<App> next = new ArrayList<>(apps);
-        int existing = -1;
-        for (int i = 0; i < next.size(); i++) if (next.get(i).packageName().equals(app.packageName())) existing = i;
-        if (existing < 0) next.add(app); else next.set(existing, app);
+        for (App app : changes) {
+            validateTarget(app.target(), targets);
+            int existing = -1;
+            for (int i = 0; i < next.size(); i++) if (next.get(i).packageName().equals(app.packageName())) existing = i;
+            if (existing < 0) next.add(app); else next.set(existing, app);
+        }
         ProtectionPolicy proposed = new ProtectionPolicy();
         proposed.apps.addAll(next);
         proposed.validate(null);
-        validateTarget(app.target(), targets);
         apps.clear();
         apps.addAll(next);
     }

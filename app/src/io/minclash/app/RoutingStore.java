@@ -204,7 +204,7 @@ final class RoutingStore {
         Module.Status before = Module.status();
         if (state != null && !state.bypassedApps().isEmpty()) {
             ProtectionPolicy protection = before.protection
-                ? ProtectionPolicy.parse(new JSONObject(Module.run(Module.Command.PROTECTION_GET, null)).getJSONObject("policy"))
+                ? ProtectionPolicy.parse(new JSONObject(Module.run(before.functionalRevision() >= 10 ? Module.Command.PROTECTION_POLICY : Module.Command.PROTECTION_GET, null)).getJSONObject("policy"))
                 : new ProtectionPolicy();
             TunBypass.checkCurrent(context, state.bypassedApps(), protection);
         }
