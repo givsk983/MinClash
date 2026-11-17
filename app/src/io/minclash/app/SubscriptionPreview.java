@@ -48,6 +48,9 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
             }
         }
         StringBuilder summary = new StringBuilder("比较订阅 YAML 中声明的节点。动态提供者的成员以加载后的实际列表为准。");
+        if (current != null && !current.bypassedApps().isEmpty()) {
+            summary.append("\n绕过 TUN 的应用设置将保留；启用期间 DNS 返回真实 IP。");
+        }
         append(summary, "新增节点", added);
         append(summary, "移除节点", removed);
         append(summary, "失效的应用分流／自定义规则", conflicts);

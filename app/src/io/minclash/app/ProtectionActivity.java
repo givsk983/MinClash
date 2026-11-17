@@ -202,12 +202,17 @@ public final class ProtectionActivity extends Activity {
             attempted=off?null:ProtectionPolicy.parse(new JSONObject(new String(request,java.nio.charset.StandardCharsets.UTF_8)).getJSONObject("policy"));
         } catch(Exception e){message(e.getMessage());return;}
         m.busy=true;m.error="";render();
+        final Context context = getApplicationContext();
         RoutingStore.WORKER.execute(()->{
             String failure="";
             boolean persisted = false;
             try{
                 List<Controller.Group> selections=List.of();
                 if(m.status.running())try{selections=Controller.groups().values();}catch(Exception ignored){ }
+                if (!off) {
+                    RoutingStore.State routing = new RoutingStore(context).loadIfAvailable(m.status);
+                    if (routing != null) TunBypass.checkCurrent(context, routing.bypassedApps(), attempted);
+                }
                 Module.run(off?Module.Command.PROTECTION_OFF:Module.Command.PROTECTION_SET,request);
                 persisted = true;
                 if(m.status.running()){

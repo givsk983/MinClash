@@ -30,9 +30,10 @@ public final class RootApps {
         Method query = manager.getClass().getMethod("getInstalledApplicationsAsUser", int.class, int.class);
         List<ApplicationInfo> apps = (List<ApplicationInfo>) query.invoke(manager, 0, user);
         boolean iconsOnly = args.length > 1 && args[1].equals("icons");
+        boolean uidsOnly = args.length > 1 && args[1].equals("uids");
         Set<String> requested = new HashSet<>(Arrays.asList(args).subList(Math.min(2, args.length), args.length));
         Set<String> launchers = new HashSet<>();
-        if (!iconsOnly) {
+        if (!iconsOnly && !uidsOnly) {
             Method launcherQuery = manager.getClass().getMethod("queryIntentActivitiesAsUser", Intent.class, int.class, int.class);
             List<ResolveInfo> activities = (List<ResolveInfo>) launcherQuery.invoke(manager,
                 new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0, user);
@@ -45,14 +46,14 @@ public final class RootApps {
             JSONObject item = new JSONObject();
             item.put("package", app.packageName);
             item.put("uid", app.uid);
-            if (!iconsOnly) {
+            if (!iconsOnly && !uidsOnly) {
                 String label = app.packageName;
                 try { label = manager.getApplicationLabel(app).toString(); }
                 catch (RuntimeException ignored) { /* Keep packages with unavailable resources selectable. */ }
                 item.put("label", label);
                 item.put("system", (app.flags & (ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0);
                 item.put("launchable", launchers.contains(app.packageName));
-            } else try {
+            } else if (iconsOnly) try {
                 String icon = AppIcons.encode(manager.getApplicationIcon(app));
                 if (iconBytes + icon.length() <= 4 * 1024 * 1024) {
                     item.put("icon", icon);

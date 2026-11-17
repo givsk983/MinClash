@@ -32,7 +32,7 @@ final class BackupStore {
         for (Map.Entry<String, ?> entry : preferences.getAll().entrySet()) {
             if (BackupArchive.portableKey(entry.getKey())) settings.put(entry.getKey(), entry.getValue());
         }
-        return new BackupArchive.Data(new RoutingStore.State(state.source(), state.applications(), catalog.activeAddress(), state.rules()),
+        return new BackupArchive.Data(new RoutingStore.State(state.source(), state.applications(), catalog.activeAddress(), state.rules(), state.bypassedApps()),
             catalog.entries(), settings, System.currentTimeMillis(), version);
     }
 

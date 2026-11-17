@@ -15,6 +15,8 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,7 +37,11 @@ final class RoutingStore {
         }
     }
 
-    record State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules) {
+    record State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules,
+                 Set<String> bypassedApps) {
+        State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules) {
+            this(source, applications, subscription, rules, Set.of());
+        }
         State(byte[] source, Map<String, String> applications, String subscription) {
             this(source, applications, subscription, Collections.emptyList());
         }
@@ -45,15 +51,19 @@ final class RoutingStore {
             source = source.clone();
             applications = Collections.unmodifiableMap(new TreeMap<>(applications));
             rules = Collections.unmodifiableList(new java.util.ArrayList<>(rules));
+            bypassedApps = Collections.unmodifiableSet(new TreeSet<>(bypassedApps));
         }
-        State withSource(byte[] source, String subscription) { return new State(source, applications, subscription, rules); }
-        State withApplications(Map<String, String> applications) { return new State(source, applications, subscription, rules); }
-        State withRules(List<PersonalRules.Rule> rules) { return new State(source, applications, subscription, rules); }
+        State withSource(byte[] source, String subscription) { return new State(source, applications, subscription, rules, bypassedApps); }
+        State withApplications(Map<String, String> applications) { return new State(source, applications, subscription, rules, bypassedApps); }
+        State withRules(List<PersonalRules.Rule> rules) { return new State(source, applications, subscription, rules, bypassedApps); }
+        State withBypassedApps(Set<String> packages) { return new State(source, applications, subscription, rules, packages); }
     }
 
     private final AtomicFile file;
+    private final Context context;
 
     RoutingStore(Context context) {
+        this.context = context;
         file = new AtomicFile(new File(context.getFilesDir(), "app-routing.json"));
     }
 
@@ -92,15 +102,18 @@ final class RoutingStore {
     }
 
     static State decodeState(JSONObject object) throws Exception {
-        if (object.getInt("version") != 1 && object.getInt("version") != 2) throw new IOException("应用分流设置版本不受支持。");
+        int version = object.getInt("version");
+        if (version < 1 || version > 3) throw new IOException("应用分流设置版本不受支持。");
         JSONObject rules = object.getJSONObject("applications");
         Map<String, String> applications = new TreeMap<>();
         for (Iterator<String> keys = rules.keys(); keys.hasNext();) {
             String name = keys.next();
             applications.put(name, rules.getString(name));
         }
+        Set<String> bypassed = version < 3 ? Set.of() : TunBypass.parse(object.getJSONArray("bypassedApps"));
+        TunBypass.validate(bypassed, applications);
         return new State(Profile.normalize(object.getString("source").getBytes(StandardCharsets.UTF_8)), applications,
-            object.optString("subscription", null), PersonalRules.parse(object.getInt("version") == 1 ? null : object.getJSONArray("personalRules")));
+            object.optString("subscription", null), PersonalRules.parse(version == 1 ? null : object.getJSONArray("personalRules")), bypassed);
     }
 
     private JSONObject readObject() throws Exception {
@@ -116,14 +129,16 @@ final class RoutingStore {
                 bytes.write(buffer, 0, count);
             }
             JSONObject object = new JSONObject(bytes.toString(StandardCharsets.UTF_8.name()));
-            if (object.getInt("version") != 1 && object.getInt("version") != 2) throw new IOException("应用分流设置版本不受支持。");
+            if (object.getInt("version") < 1 || object.getInt("version") > 3) throw new IOException("应用分流设置版本不受支持。");
             return object;
         }
     }
 
     static JSONObject encodeState(State state) throws Exception {
         JSONObject object = new JSONObject();
-        object.put("version", 2);
+        TunBypass.validate(state.bypassedApps(), state.applications());
+        object.put("version", 3);
+        object.put("bypassedApps", new org.json.JSONArray(state.bypassedApps()));
         object.put("personalRules", PersonalRules.json(state.rules()));
         object.put("source", new String(state.source(), StandardCharsets.UTF_8));
         object.put("applications", new JSONObject(state.applications()));
@@ -174,13 +189,27 @@ final class RoutingStore {
     }
 
     void apply(State state) throws Exception {
-        apply(Profile.withPersonalRules(state.source(), state.applications(), state.rules()), state);
+        apply(state, false);
+    }
+
+    void apply(State state, boolean recreateTun) throws Exception {
+        apply(Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps()), state, recreateTun);
     }
 
     private void apply(byte[] merged, State state) throws Exception {
+        apply(merged, state, false);
+    }
+
+    private void apply(byte[] merged, State state, boolean recreateTun) throws Exception {
         Module.Status before = Module.status();
+        if (state != null && !state.bypassedApps().isEmpty()) {
+            ProtectionPolicy protection = before.protection
+                ? ProtectionPolicy.parse(new JSONObject(Module.run(Module.Command.PROTECTION_GET, null)).getJSONObject("policy"))
+                : new ProtectionPolicy();
+            TunBypass.checkCurrent(context, state.bypassedApps(), protection);
+        }
         byte[] previous = before.profile ? Module.readProfile() : null;
-        if (before.enabled && Arrays.equals(merged, previous)) {
+        if (!recreateTun && before.enabled && Arrays.equals(merged, previous)) {
             if (state != null) save(state);
             return;
         }
@@ -188,7 +217,7 @@ final class RoutingStore {
         List<Controller.Group> selections = before.state.equals("running") && before.control
             ? Controller.groups().values() : Collections.emptyList();
         State saved = state == null ? null : read();
-        if (canReload(before, saved, state, previous)) {
+        if (canReload(before, saved, state, previous, recreateTun)) {
             JSONObject runtime = Controller.runtimeSettings();
             byte[] live = Profile.forLiveReload(merged, runtime.getString("mode").toLowerCase(java.util.Locale.ROOT),
                 runtime.optString("find-process-mode").equalsIgnoreCase("always"));
@@ -245,10 +274,15 @@ final class RoutingStore {
     }
 
     static boolean canReload(Module.Status status, State saved, State changed, byte[] installed) throws Exception {
-        return status.running() && status.control && status.validate && status.runtime.reported()
+        return canReload(status, saved, changed, installed, false);
+    }
+
+    static boolean canReload(Module.Status status, State saved, State changed, byte[] installed, boolean recreateTun) throws Exception {
+        return !recreateTun && status.running() && status.control && status.validate && status.runtime.reported()
             && saved != null && changed != null && installed != null
+            && saved.bypassedApps().equals(changed.bypassedApps())
             && Objects.equals(saved.subscription(), changed.subscription()) && Arrays.equals(saved.source(), changed.source())
-            && Arrays.equals(installed, Profile.withPersonalRules(saved.source(), saved.applications(), saved.rules()));
+            && Arrays.equals(installed, Profile.withPersonalRules(saved.source(), saved.applications(), saved.rules(), saved.bypassedApps()));
     }
 
     interface LiveChange {

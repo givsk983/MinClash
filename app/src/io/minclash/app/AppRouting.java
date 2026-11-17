@@ -20,12 +20,34 @@ import org.json.JSONObject;
 
 final class AppRouting {
     record Entry(String label, String packageName, String target, boolean installed, boolean system,
-                 boolean launchable) {
-        boolean userFacing() { return !system || launchable || !target.isEmpty(); }
+                 boolean launchable, boolean bypassed) {
+        Entry(String label, String packageName, String target, boolean installed, boolean system, boolean launchable) {
+            this(label, packageName, target, installed, system, launchable, false);
+        }
+        boolean assigned() { return bypassed || !target.isEmpty(); }
+        boolean userFacing() { return !system || launchable || assigned(); }
     }
 
     record Screen(RoutingStore.State state, List<Entry> applications, List<String> targets,
                   Module.Status status, boolean rootInventory, boolean systemInventoryEmpty, boolean allowRoot) {}
+
+    record Choice(String target, boolean bypassed) {
+        String label() {
+            return bypassed ? "绕过 TUN（游戏直连）" : target.isEmpty() ? "跟随订阅规则"
+                : target.equals("DIRECT") ? "直连（经过 TUN）" : "代理组：" + target;
+        }
+    }
+
+    static List<Choice> choices(List<String> targets, boolean includeBypass) {
+        List<Choice> result = new ArrayList<>();
+        result.add(new Choice("", false));
+        if (targets.contains("DIRECT")) result.add(new Choice("DIRECT", false));
+        if (includeBypass) result.add(new Choice("", true));
+        for (String target : new java.util.LinkedHashSet<>(targets)) {
+            if (!target.isEmpty() && !target.equals("DIRECT")) result.add(new Choice(target, false));
+        }
+        return List.copyOf(result);
+    }
 
     /** Cache inventory only: every open still reads the current subscription and personal policies. */
     static final class Loader {
@@ -48,15 +70,18 @@ final class AppRouting {
             Map<String, Entry> entries = new TreeMap<>();
             for (Entry app : inventory.entries()) {
                 entries.put(app.packageName(), new Entry(app.label(), app.packageName(),
-                    state.applications().getOrDefault(app.packageName(), ""), true, app.system(), app.launchable()));
+                    state.applications().getOrDefault(app.packageName(), ""), true, app.system(), app.launchable(), state.bypassedApps().contains(app.packageName())));
             }
             for (Map.Entry<String, String> rule : state.applications().entrySet()) {
                 entries.putIfAbsent(rule.getKey(), new Entry(rule.getKey(), rule.getKey(), rule.getValue(), false,
                     false, false));
             }
+            for (String name : state.bypassedApps()) {
+                entries.putIfAbsent(name, new Entry(name, name, "", false, false, false, true));
+            }
             List<Entry> applications = new ArrayList<>(entries.values());
             Collator collator = Collator.getInstance();
-            applications.sort(Comparator.comparing((Entry app) -> app.target().isEmpty())
+            applications.sort(Comparator.comparing((Entry app) -> !app.assigned())
                 .thenComparing(Entry::label, collator).thenComparing(Entry::packageName));
             return new Screen(state, applications, Profile.routingTargets(state.source()),
                 status == null ? Module.status() : status, inventory.root(), inventory.empty(), allowRoot);
@@ -102,11 +127,20 @@ final class AppRouting {
 
     /** Empty packages requests metadata; otherwise only these packages' icons are encoded. */
     static JSONArray rootQuery(Context context, List<String> packages) throws Exception {
+        return rootQuery(context, packages, false);
+    }
+
+    static JSONArray rootUids(Context context) throws Exception {
+        return rootQuery(context, List.of(), true);
+    }
+
+    private static JSONArray rootQuery(Context context, List<String> packages, boolean uidsOnly) throws Exception {
         String apk = context.getApplicationInfo().sourceDir;
         String command = "CLASSPATH='" + apk.replace("'", "'\\''")
             + "' /system/bin/app_process /system/bin io.minclash.app.RootApps "
             + android.os.Process.myUid() / 100000;
-        if (!packages.isEmpty()) {
+        if (uidsOnly) command += " uids";
+        else if (!packages.isEmpty()) {
             command += " icons";
             for (String name : packages) {
                 if (!name.matches("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)*")) throw new IOException("无效的应用包名。");

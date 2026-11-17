@@ -258,10 +258,24 @@ final class Profile {
     }
 
     static byte[] withPersonalRules(byte[] source, Map<String, String> applications, List<PersonalRules.Rule> personal) throws IOException {
+        return withPersonalRules(source, applications, personal, Set.of());
+    }
+
+    static byte[] withPersonalRules(byte[] source, Map<String, String> applications, List<PersonalRules.Rule> personal,
+                                    Set<String> bypassedApps) throws IOException {
+        TunBypass.validate(bypassedApps, applications);
         byte[] base = repairDns(normalize(source));
-        if (applications.isEmpty() && personal.isEmpty()) return base;
+        if (applications.isEmpty() && personal.isEmpty() && bypassedApps.isEmpty()) return base;
         Yaml yaml = new Yaml();
         MappingNode root = routingRoot(base);
+        if (!bypassedApps.isEmpty()) {
+            MappingNode tun = (MappingNode) field(root, "tun");
+            tun.getValue().add(new NodeTuple(yaml.represent("exclude-package"), yaml.represent(new ArrayList<>(new java.util.TreeSet<>(bypassedApps)))));
+            // Android's shared resolver can otherwise give excluded games unreachable Fake-IPs.
+            MappingNode dns = (MappingNode) field(root, "dns");
+            dns.getValue().removeIf(tuple -> keyOf(tuple).equals("enhanced-mode"));
+            dns.getValue().add(new NodeTuple(yaml.represent("enhanced-mode"), yaml.represent("redir-host")));
+        }
         Set<String> targets = new HashSet<>(routingTargets(base));
         List<Node> rules = new ArrayList<>();
         for (Map.Entry<String, String> entry : new TreeMap<>(applications).entrySet()) {

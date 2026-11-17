@@ -22,7 +22,7 @@ final class AppCategories {
         boolean includes(AppRouting.Entry app) {
             return switch (id) {
                 case APPS -> app.userFacing();
-                case ASSIGNED -> !app.target().isEmpty();
+                case ASSIGNED -> app.assigned();
                 case "all" -> true;
                 case "system" -> app.system();
                 case "google" -> isGoogle(app.packageName());

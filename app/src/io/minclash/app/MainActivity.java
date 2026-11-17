@@ -331,7 +331,7 @@ public final class MainActivity extends Activity {
         routingButton = button("应用分流  ›", false);
         routingButton.setOnClickListener(view -> openAppRouting());
         add(routing, routingButton, 14);
-        add(routing, label("按应用指定直连或代理组。", 12, MUTED, false), 6);
+        add(routing, label("按应用指定直连、代理组，或让游戏绕过 TUN。", 12, MUTED, false), 6);
         personalRulesButton = button("域名与 IP 分流  ›", false);
         personalRulesButton.setOnClickListener(view -> execute("", this::readPersonalRules));
         add(routing, personalRulesButton, 12);
@@ -340,7 +340,7 @@ public final class MainActivity extends Activity {
         protectionButton.setOnClickListener(view -> startActivity(new Intent(this, ProtectionActivity.class)));
         add(routing, protectionButton, 12);
         add(routing, label("选定应用强制代理，断线时保持阻断。", 12, MUTED, false), 6);
-        add(routing, label("普通分流在规则模式下生效。防泄漏保护独立于模式；保存分流后现有连接会按新规则重连。", 12, MUTED, false), 12);
+        add(routing, label("普通分流在规则模式下生效。绕过 TUN 独立于模式，改变绕过设置会短暂重连；不能与该应用的防泄漏保护或域名查询保护同时使用。", 12, MUTED, false), 12);
         LinearLayout autoUpdates = card(profiles, 14);
         autoUpdateSwitch = new Switch(this);
         autoUpdateSwitch.setText("每日自动更新订阅");
@@ -1764,8 +1764,8 @@ public final class MainActivity extends Activity {
             String summary = "自定义分流  " + data.state().rules().size() + " 条\n备份版本  " + data.appVersion() + "\n备份时间  "
                 + java.text.DateFormat.getDateTimeInstance().format(new java.util.Date(data.createdAt()))
                 + "\n订阅  " + data.subscriptions().size() + " 个\n应用分流  " + data.state().applications().size()
-                + " 项\n自定义分类  " + categories + " 个\n节点收藏  " + favorites + " 项\n配置  " + data.state().source().length / 1024 + " KiB"
-                + "\n\n将替换当前配置、全部订阅、应用分流、自定义分流、分类、收藏和订阅自动更新／节点列表偏好。"
+                + " 项\n绕过 TUN  " + data.state().bypassedApps().size() + " 个应用\n自定义分类  " + categories + " 个\n节点收藏  " + favorites + " 项\n配置  " + data.state().source().length / 1024 + " KiB"
+                + "\n\n将替换当前配置、全部订阅、应用分流、绕过 TUN、自定义分流、分类、收藏和订阅自动更新／节点列表偏好。"
                 + "\n\n请先停止 TUN。恢复后不会自动启动 TUN；通知、图标、系统授权、开机与热点设置保留本机选择。";
             AlertDialog dialog = textDialog("恢复备份 · 内容预览", summary)
                 .setNegativeButton("取消", (view, which) -> dismissBackgroundResult(background.backup))
@@ -2401,6 +2401,9 @@ public final class MainActivity extends Activity {
         info.setPadding(dp(12), dp(6), dp(12), dp(6));
         info.setOnClickListener(view -> new AlertDialog.Builder(this).setTitle("应用分流说明")
             .setMessage("• 个人选择优先于订阅规则，仅在规则模式下生效。\n\n"
+                + "• “直连”仍经过 TUN；“绕过 TUN”让应用自己的 TCP／UDP 直接使用手机网络，在所有模式下生效。只能选择普通且独立 UID 的应用，同包名的其他 Android 资料也会一并绕过。\n\n"
+                + "• 有绕过应用时，DNS 改为返回真实 IP，防止虚拟 IP 导致游戏断网；系统代发的 DNS 仍可能经过 TUN。不能同时启用域名查询保护，也不能绕过已受防泄漏保护的应用。\n\n"
+                + "• 修改绕过设置会短暂重建 TUN，保存后请重新打开游戏；游戏卸载重装后，可在出口窗口点击“重新应用绕过”，或重启 TUN。\n\n"
                 + "• 选择“跟随订阅规则”可移除个人设置。保存后现有连接会按新规则重连。\n\n"
                 + "• “系统”包含系统应用和组件，“Google”按包名归类。自定义分类可包含任意应用，只用于筛选。\n\n"
                 + "• 图标按列表显示需要在后台加载，应用列表会短暂缓存；从系统设置返回后重新读取。\n\n"
@@ -2445,7 +2448,7 @@ public final class MainActivity extends Activity {
                 if (!(app.label() + " " + app.packageName()).toLowerCase(Locale.ROOT).contains(query)) continue;
                 adapter.entries.add(app);
             }
-            count.setText(adapter.entries.size() + " 个应用 · 已指定 " + screen.state().applications().size() + " 个");
+            count.setText(adapter.entries.size() + " 个应用 · 已指定 " + (screen.state().applications().size() + screen.state().bypassedApps().size()) + " 个");
             adapter.notifyDataSetChanged();
         };
         categoryButton.setOnClickListener(view -> {
@@ -2699,41 +2702,66 @@ public final class MainActivity extends Activity {
             holder.name().setText(name);
             holder.packageName().setText(!app.installed() ? "未在应用列表中找到 · " + app.packageName()
                 : denied ? "图标读取无权限 · " + app.packageName() : app.packageName());
-            holder.policy().setText(app.target().isEmpty() ? "跟随规则" : app.target().equals("DIRECT") ? "直连" : app.target());
-            holder.policy().setTextColor(app.target().isEmpty() ? MUTED : MINT);
-            holder.policy().setBackground(shape(app.target().isEmpty() ? 0xff2a3946 : 0xff25473e, 9, false));
+            holder.policy().setText(app.bypassed() ? "绕过 TUN" : app.target().isEmpty() ? "跟随规则" : app.target().equals("DIRECT") ? "直连" : app.target());
+            holder.policy().setTextColor(app.assigned() ? MINT : MUTED);
+            holder.policy().setBackground(shape(app.assigned() ? 0xff25473e : 0xff2a3946, 9, false));
             return row;
         }
     }
 
     private void showAppTarget(AppRouting.Screen screen, AppRouting.Entry app, AlertDialog listDialog) {
-        List<String> targets = new ArrayList<>();
-        targets.add("");
-        targets.addAll(screen.targets());
-        String[] labels = new String[targets.size()];
-        for (int i = 0; i < labels.length; i++) {
-            String target = targets.get(i);
-            labels[i] = target.isEmpty() ? "跟随订阅规则" : target.equals("DIRECT") ? "直连" : "代理组：" + target;
-        }
-        int[] chosen = {targets.indexOf(app.target())};
+        boolean offersBypass = app.bypassed() || app.installed() && !app.system();
+        List<AppRouting.Choice> choices = AppRouting.choices(screen.targets(), offersBypass);
+        String[] labels = choices.stream().map(AppRouting.Choice::label).toArray(String[]::new);
+        int[] chosen = {choices.indexOf(new AppRouting.Choice(app.target(), app.bypassed()))};
         new AlertDialog.Builder(this).setTitle(app.label() + " · 出口")
             .setSingleChoiceItems(labels, chosen[0], (dialog, index) -> chosen[0] = index)
-            .setNeutralButton("当前连接", (dialog, which) -> showAppConnections(app))
+            .setNeutralButton(app.bypassed() ? "重新应用绕过" : "当前连接", (dialog, which) -> {
+                if (app.bypassed()) confirmAppTarget(app, listDialog, new AppRouting.Choice("", true), true);
+                else showAppConnections(app);
+            })
             .setNegativeButton("取消", null).setPositiveButton("保存", (dialog, which) -> {
                 if (chosen[0] < 0) return;
-                String target = targets.get(chosen[0]);
-                if (target.equals(app.target())) return;
-                listDialog.dismiss();
-                execute("应用分流已保存。", true, () -> {
-                    RoutingStore routing = new RoutingStore(this);
-                    RoutingStore.State latest = routing.load();
-                    Map<String, String> rules = new TreeMap<>(latest.applications());
-                    if (target.isEmpty()) rules.remove(app.packageName());
-                    else rules.put(app.packageName(), target);
-                    routing.apply(latest.withApplications(rules));
-                    return routingLoader.load(this, appPreferences().getBoolean(ROOT_INVENTORY, false), Module.status());
-                });
+                AppRouting.Choice choice = choices.get(chosen[0]);
+                if (choice.bypassed() == app.bypassed() && choice.target().equals(app.target())) return;
+                if (choice.bypassed() != app.bypassed()) confirmAppTarget(app, listDialog, choice, false);
+                else saveAppTarget(app, listDialog, choice, false);
             }).show();
+    }
+
+    private void confirmAppTarget(AppRouting.Entry app, AlertDialog listDialog, AppRouting.Choice choice, boolean recreateTun) {
+        if (busy) return;
+        String title = recreateTun ? "重新应用绕过设置？" : choice.bypassed() ? "让此应用绕过 TUN？" : "恢复 TUN 接管？";
+        String message = recreateTun
+            ? "将重新核对应用安装信息并建立绕过路由，适用于游戏卸载重装后。其他应用的绕过与分流选择会保留。"
+            : choice.bypassed()
+                ? "游戏直接使用手机网络，同包名的其他 Android 资料也会一并绕过。\n\n启用期间 DNS 返回真实 IP；系统代发的 DNS 仍可能经过 TUN。不能与该应用的防泄漏保护或域名查询保护同时使用。"
+                : "该应用将恢复由 TUN 接管，按所选出口处理。";
+        new AlertDialog.Builder(this).setTitle(title)
+            .setMessage(message + "\n\nTUN 运行时会短暂重连，可能中断下载或通话。请先退出游戏，完成后重新打开。")
+            .setNegativeButton("取消", null).setPositiveButton("保存并应用", (confirm, button) ->
+                saveAppTarget(app, listDialog, choice, recreateTun)).show();
+    }
+
+    private void saveAppTarget(AppRouting.Entry app, AlertDialog listDialog, AppRouting.Choice choice, boolean recreateTun) {
+        if (busy) return;
+        listDialog.dismiss();
+        execute(recreateTun ? "已重新应用绕过设置，请重新打开游戏。" : "应用分流已保存。", true, () -> {
+            RoutingStore routing = new RoutingStore(this);
+            RoutingStore.State latest = routing.load();
+            Map<String, String> rules = new TreeMap<>(latest.applications());
+            Set<String> bypassed = new java.util.TreeSet<>(latest.bypassedApps());
+            if (choice.bypassed()) {
+                rules.remove(app.packageName());
+                bypassed.add(app.packageName());
+            } else {
+                bypassed.remove(app.packageName());
+                if (choice.target().isEmpty()) rules.remove(app.packageName());
+                else rules.put(app.packageName(), choice.target());
+            }
+            routing.apply(latest.withApplications(rules).withBypassedApps(bypassed), recreateTun);
+            return routingLoader.load(this, appPreferences().getBoolean(ROOT_INVENTORY, false), Module.status());
+        });
     }
 
     private RulesScreen readPersonalRules() throws Exception {
