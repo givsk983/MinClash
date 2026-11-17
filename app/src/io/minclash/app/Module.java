@@ -166,7 +166,7 @@ final class Module {
 
     static String diagnosticFacts() throws Exception {
         // Raw lines can contain destination addresses and node names. Emit only fixed flags.
-        return runRoot("""
+        return runRoot("MC_DIAG_UID=" + android.os.Process.myUid() + "\n" + """
             export PATH=/system/bin
             IP=/system/bin/ip
             if "$IP" link show dev minclash0 >/dev/null 2>&1; then echo IFACE; fi
@@ -174,6 +174,20 @@ final class Module {
                 if "$IP" "-$family" route show table 20882 2>/dev/null | grep -Eq ' dev minclash0( |$)' &&
                    "$IP" "-$family" rule show 2>/dev/null | grep -Eq ' lookup 20882( |$)'; then
                     echo "ROUTE$family"
+                fi
+                if "$IP" "-$family" route show table all 2>/dev/null | awk '
+                    $1 == "default" {
+                        dev=""; down=0;
+                        for(i=1;i<=NF;i++) { if($i=="dev")dev=$(i+1); if($i=="linkdown")down=1; }
+                        if(dev!="" && dev!="minclash0" && dev!="lo" && dev !~ /^dummy/ && !down)found=1;
+                    }
+                    END { exit !found }
+                '; then echo "UPLINK$family"; fi
+            done
+            for firewall in /system/bin/iptables /system/bin/ip6tables; do
+                if "$firewall" -w 1 -t filter -C zte_fw_data_align_out -m owner --uid-owner "$MC_DIAG_UID" -j REJECT >/dev/null 2>&1; then
+                    echo APP_REJECT_RULE
+                    break
                 fi
             done
             if recent=$(tail -c 12000 /data/adb/minclash/core.log 2>/dev/null); then

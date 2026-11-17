@@ -12,6 +12,7 @@ public final class BackgroundWorkCheck {
             retainedResults();
             isolatedDownload();
             coalescedRefresh();
+            cancelledGenerations();
             System.out.println("PASS: detached/recreated observers, retained results/errors, nonblocking control and coalesced refresh.");
         } finally {
             BackgroundWork.DOWNLOADS.shutdownNow();
@@ -83,6 +84,34 @@ public final class BackgroundWorkCheck {
         require(gate.request(), "follow-up starts after first query completes");
         require(!gate.finish(), "no further query without a new request");
         require(gate.request() && !gate.finish(), "ordinary periodic queries still work");
+    }
+
+    private static void cancelledGenerations() throws Exception {
+        Queue<Runnable> queued = new ArrayDeque<>();
+        RetainedTask<String> task = new RetainedTask<>();
+        int[] calls = {0};
+        task.start(queued::add, () -> { calls[0]++; return "cancelled"; }, () -> true);
+        require(task.cancellable() && task.cancel(), "queued request cancels immediately");
+        task.start(queued::add, () -> "replacement");
+        queued.remove().run(); queued.remove().run();
+        require(calls[0] == 0 && task.outcome().value().equals("replacement"), "cancelled queued work has no effects");
+        task.clearResult();
+        CountDownLatch started = new CountDownLatch(1), release = new CountDownLatch(1), done = new CountDownLatch(1);
+        task.start(command -> new Thread(() -> { command.run(); done.countDown(); }).start(), () -> {
+            started.countDown(); release.await(); return "late old result";
+        }, () -> true);
+        require(started.await(2, TimeUnit.SECONDS) && task.cancel(), "running request can cancel");
+        task.start(Runnable::run, () -> "new result");
+        release.countDown(); require(done.await(2, TimeUnit.SECONDS), "old request drains");
+        require(task.outcome().value().equals("new result"), "late completion cannot replace newer result");
+        task.clearResult();
+        task.start(queued::add, () -> "committed", () -> false);
+        require(!task.cancel() && task.running(), "write phase refuses a cancellation promise");
+        queued.remove().run();
+        require(task.outcome().value().equals("committed"), "write phase publishes normally");
+        task.clearResult();
+        task.start(Runnable::run, () -> { throw new java.util.concurrent.ExecutionException(new DownloadRequest.Expired()); });
+        require(task.outcome().error() instanceof DownloadRequest.Expired, "serialized task failure keeps its public error category");
     }
 
     private static void require(boolean condition, String message) {

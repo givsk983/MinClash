@@ -35,22 +35,32 @@ final class Subscription {
     record Download(byte[] source, SubscriptionUsage usage) {}
 
     static Download download(String address) throws IOException {
-        return response(address, true);
+        try (DownloadRequest request = new DownloadRequest()) { return download(address, request); }
+    }
+
+    static Download download(String address, DownloadRequest request) throws IOException {
+        return request.call(() -> response(address, true, request));
     }
 
     static SubscriptionUsage usage(String address) throws IOException {
-        return response(address, false).usage();
+        try (DownloadRequest request = new DownloadRequest()) { return usage(address, request); }
     }
 
-    private static Download response(String address, boolean includeConfig) throws IOException {
+    static SubscriptionUsage usage(String address, DownloadRequest request) throws IOException {
+        return request.call(() -> response(address, false, request)).usage();
+    }
+
+    private static Download response(String address, boolean includeConfig, DownloadRequest request) throws IOException {
         URL url = parse(null, address);
         Set<String> visited = new HashSet<>();
         for (int redirects = 0; redirects <= 5; redirects++) {
+            request.check();
             if (!visited.add(url.toExternalForm())) throw new IOException("订阅服务器出现循环重定向，请检查服务商链接。");
             HttpURLConnection connection = (HttpURLConnection) url.openConnection();
             try {
-                connection.setConnectTimeout(12000);
-                connection.setReadTimeout(12000);
+                request.attach(connection);
+                connection.setConnectTimeout(request.socketTimeout());
+                connection.setReadTimeout(request.socketTimeout());
                 connection.setInstanceFollowRedirects(false);
                 connection.setRequestProperty("User-Agent", "clash.meta/1.19.33");
                 connection.setRequestProperty("Accept-Encoding", "gzip, identity");
@@ -58,8 +68,10 @@ final class Subscription {
                 try {
                     status = connection.getResponseCode();
                 } catch (IOException error) {
+                    request.check();
                     throw downloadError(error);
                 }
+                request.check();
                 if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
                     URL next;
                     try { next = parse(url, connection.getHeaderField("Location")); }
@@ -83,19 +95,31 @@ final class Subscription {
                 }
                 try (InputStream raw = connection.getInputStream();
                      InputStream input = "gzip".equalsIgnoreCase(encoding) ? new GZIPInputStream(raw) : raw) {
-                    content = Profile.readLimited(input);
+                    content = Profile.readLimited(new java.io.FilterInputStream(input) {
+                        @Override public int read(byte[] bytes, int offset, int length) throws IOException {
+                            request.check();
+                            int count = super.read(bytes, offset, length);
+                            request.check();
+                            return count;
+                        }
+                    });
                 } catch (Profile.TooLarge error) {
                     throw error;
                 } catch (IOException error) {
+                    request.check();
                     throw downloadError(error);
                 }
                 try {
-                    return new Download(Profile.normalize(content), usage);
+                    byte[] source = Profile.normalize(content);
+                    request.check();
+                    return new Download(source, usage);
                 } catch (IOException error) {
+                    if (error instanceof DownloadRequest.Cancelled || error instanceof DownloadRequest.Expired) throw error;
                     throw new IOException("无法导入订阅，请使用机场提供的 Clash / Mihomo YAML 链接。\n"
                         + error.getMessage());
                 }
             } finally {
+                request.detach(connection);
                 connection.disconnect();
             }
         }
@@ -121,7 +145,7 @@ final class Subscription {
         }
         if (error instanceof UnknownHostException) return new NetworkFailure(NetworkFailure.Kind.DNS, "无法解析订阅服务器域名。请检查网络和 DNS。");
         if (error instanceof SocketTimeoutException) return new NetworkFailure(NetworkFailure.Kind.TIMEOUT, "下载订阅超时。请检查当前网络。");
-        if (error instanceof SocketException) return new NetworkFailure(NetworkFailure.Kind.CONNECT, "无法连接订阅服务器或连接已中断。请检查当前网络。");
+        if (error instanceof SocketException) return new NetworkFailure(NetworkFailure.Kind.CONNECT, "无法连接订阅服务器或连接已中断。请检查当前网络，以及系统是否允许 MinClash 使用当前 Wi-Fi／移动数据。");
         return new IOException("无法读取订阅。请检查网络和订阅链接。");
     }
 

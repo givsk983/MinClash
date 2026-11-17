@@ -18,6 +18,7 @@ public final class SubscriptionUpdateJob extends JobService {
     private static final String LAST_OUTCOME = "auto_subscription_outcome";
     private static final int JOB_ID = 102;
     private volatile JobParameters active;
+    private volatile DownloadRequest downloadRequest;
     private final Handler main = new Handler(Looper.getMainLooper());
 
     static boolean schedule(Context context, boolean enabled) {
@@ -45,13 +46,19 @@ public final class SubscriptionUpdateJob extends JobService {
     }
 
     @Override public boolean onStartJob(JobParameters params) {
+        if (downloadRequest != null) downloadRequest.cancel();
+        DownloadRequest request = new DownloadRequest();
+        downloadRequest = request;
         active = params;
-        RoutingStore.WORKER.execute(() -> refresh(params));
+        RoutingStore.WORKER.execute(() -> refresh(params, request));
         return true;
     }
 
     @Override public boolean onStopJob(JobParameters params) {
-        if (active == params) active = null;
+        if (active == params) {
+            active = null;
+            if (downloadRequest != null) downloadRequest.cancel();
+        }
         return preferences().getBoolean(ENABLED, false);
     }
 
@@ -59,40 +66,41 @@ public final class SubscriptionUpdateJob extends JobService {
         return getSharedPreferences("MainActivity", MODE_PRIVATE);
     }
 
-    private void refresh(JobParameters params) {
+    private void refresh(JobParameters params, DownloadRequest request) {
         SharedPreferences preferences = preferences();
         try {
-            if (active != params || !preferences.getBoolean(ENABLED, false)) { finish(params, null); return; }
+            if (active != params || !preferences.getBoolean(ENABLED, false)) { finish(params, null, request); return; }
             RoutingStore routing = new RoutingStore(this);
             SubscriptionCatalog.Entry current = new SubscriptionCatalog(preferences, routing).load().active();
-            if (current == null) { finish(params, null); return; }
+            if (current == null) { finish(params, null, request); return; }
             Module.Status status = Module.status();
             if (!status.enabled || !status.profile || !status.state.equals("running") && !status.state.equals("stopped")) {
-                finish(params, "跳过，模块或配置未就绪");
+                finish(params, "跳过，模块或配置未就绪", request);
                 return;
             }
             int generation = RoutingStore.generation();
-            BackgroundWork.DOWNLOADS.execute(() -> download(params, current, generation));
+            BackgroundWork.DOWNLOADS.execute(() -> download(params, current, generation, request));
         } catch (Exception error) {
-            finish(params, "更新失败，请在配置页手动重试");
+            finish(params, "更新失败，请在配置页手动重试", request);
         }
     }
 
-    private void download(JobParameters params, SubscriptionCatalog.Entry current, int generation) {
-        if (active != params || !preferences().getBoolean(ENABLED, false)) { finish(params, null); return; }
+    private void download(JobParameters params, SubscriptionCatalog.Entry current, int generation, DownloadRequest request) {
+        if (active != params || !preferences().getBoolean(ENABLED, false)) { finish(params, null, request); return; }
         try {
-            Subscription.Download downloaded = Subscription.download(current.address());
-            RoutingStore.WORKER.execute(() -> apply(params, current, generation, downloaded));
+            Subscription.Download downloaded = Subscription.download(current.address(), request);
+            RoutingStore.WORKER.execute(() -> apply(params, current, generation, downloaded, request));
         } catch (Exception error) {
-            finish(params, "更新失败，请在配置页手动重试");
+            finish(params, "更新失败，请在配置页手动重试", request);
         }
     }
 
-    private void apply(JobParameters params, SubscriptionCatalog.Entry current, int generation, Subscription.Download downloaded) {
+    private void apply(JobParameters params, SubscriptionCatalog.Entry current, int generation, Subscription.Download downloaded, DownloadRequest request) {
         SharedPreferences preferences = preferences();
         String outcome = null;
         try {
             if (active != params || !preferences.getBoolean(ENABLED, false)) return;
+            request.seal();
             RoutingStore routing = new RoutingStore(this);
             SubscriptionCatalog.Entry latest = new SubscriptionCatalog(preferences, routing).load().active();
             if (latest != null && latest.address().equals(current.address())) {
@@ -115,11 +123,12 @@ public final class SubscriptionUpdateJob extends JobService {
         } catch (Exception error) {
             outcome = "更新失败，请在配置页手动重试";
         } finally {
-            finish(params, outcome);
+            finish(params, outcome, request);
         }
     }
 
-    private void finish(JobParameters params, String outcome) {
+    private void finish(JobParameters params, String outcome, DownloadRequest request) {
+        request.close();
         main.post(() -> {
             if (active != params) return;
             if (outcome != null) record(preferences(), outcome);

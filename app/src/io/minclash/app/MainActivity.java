@@ -87,7 +87,7 @@ public final class MainActivity extends Activity {
     private static final int AMBER = 0xfff5ca88;
 
     private static final ExecutorService worker = RoutingStore.WORKER;
-    private final ExecutorService networkWorker = Executors.newFixedThreadPool(NetworkCheck.values().length);
+    private final ExecutorService networkWorker = Executors.newFixedThreadPool(NetworkCheck.values().length + 2);
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable poll = this::pollStatus;
     private final Runnable pollLatency = () -> checkNetwork(false);
@@ -108,7 +108,9 @@ public final class MainActivity extends Activity {
     private Button toggle;
     private Button importButton;
     private Button subscriptionButton;
+    private Button addSubscriptionButton;
     private Button updateButton;
+    private Button cancelSubscriptionButton;
     private Button checkAppUpdateButton;
     private Button repairDnsButton;
     private Switch autoUpdateSwitch;
@@ -122,6 +124,7 @@ public final class MainActivity extends Activity {
     private boolean resumed;
     private TextView subscriptionSummary;
     private View configGuide;
+    private View subscriptionGuide;
     private SubscriptionQuotaIndicator subscriptionIndicator;
     private View currentConfigCard;
     private boolean subscriptionNotificationSettingsOpened;
@@ -254,6 +257,21 @@ public final class MainActivity extends Activity {
         setupHint.setBackground(shape(0xff302b22, 14, false));
         setupHint.setOnClickListener(view -> selectPage(2));
         add(overview, setupHint, 12);
+
+        LinearLayout firstSubscription = card(overview, 12);
+        subscriptionGuide = firstSubscription;
+        firstSubscription.setVisibility(View.GONE);
+        add(firstSubscription, label("添加订阅，开始连接", 18, TEXT, true), 0);
+        add(firstSubscription, label("粘贴服务商提供的 Clash / Mihomo 订阅链接，预览并启用后即可启动 TUN。", 13, MUTED, false), 8);
+        addSubscriptionButton = button("添加订阅", true);
+        addSubscriptionButton.setOnClickListener(view -> {
+            selectPage(1);
+            showSubscriptions();
+        });
+        add(firstSubscription, addSubscriptionButton, 14);
+        Button useLocalProfile = button("使用本地 YAML 配置  →", false);
+        useLocalProfile.setOnClickListener(view -> selectPage(1));
+        add(firstSubscription, useLocalProfile, 10);
         addNetworkCheckCard(overview);
         section(overview, "代理控制");
         modeButton = button("代理模式", false);
@@ -294,6 +312,17 @@ public final class MainActivity extends Activity {
             if (subscriptions != null) activateSubscription(subscriptions.active());
         });
         buttonRow(settings, subscriptionButton, updateButton, 14);
+        cancelSubscriptionButton = button("取消订阅请求", false);
+        cancelSubscriptionButton.setOnClickListener(view -> {
+            if (background.preview.cancellable() && background.usage.cancellable()) {
+                new AlertDialog.Builder(this).setTitle("取消哪项请求？")
+                    .setItems(new String[]{"取消订阅配置下载", "取消用量读取"}, (dialog, which) ->
+                        cancelSubscriptionRequest(which == 0 ? background.preview : background.usage))
+                    .setNegativeButton("继续等待", null).show();
+            } else cancelSubscriptionRequest(background.preview.cancellable() ? background.preview : background.usage);
+        });
+        add(settings, cancelSubscriptionButton, 10);
+        add(settings, label("订阅请求总时限 60 秒；下载期间可在此取消。", 12, MUTED, false), 8);
         add(settings, label("切换或更新订阅时会先预览变化；运行中应用会短暂重连。", 12, MUTED, false), 10);
 
         LinearLayout routing = card(profiles, 14);
@@ -728,6 +757,11 @@ public final class MainActivity extends Activity {
 
     private void handleSubscriptionReminderIntent() {
         Intent intent = getIntent();
+        if (resumed && intent.getBooleanExtra("background_connection_guide", false)) {
+            intent.removeExtra("background_connection_guide");
+            selectPage(2);
+            settingsNavigation.show("background-guide");
+        }
         if (!resumed || subscriptions == null || !SubscriptionReminders.ACTION_OPEN.equals(intent.getAction())) return;
         String key = intent.getStringExtra(SubscriptionReminders.EXTRA_KEY);
         intent.setAction(null);
@@ -1255,24 +1289,24 @@ public final class MainActivity extends Activity {
     private void showSubscriptions() {
         if (subscriptions == null || busy) return;
         List<SubscriptionCatalog.Entry> entries = subscriptions.entries();
+        if (entries.isEmpty()) {
+            promptSubscription();
+            return;
+        }
         AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("管理订阅")
             .setNegativeButton("关闭", null).setPositiveButton("添加订阅", (view, which) -> promptSubscription());
-        if (entries.isEmpty()) {
-            dialog.setMessage("还没有保存的订阅。可添加 Clash / Mihomo 订阅链接。");
-        } else {
-            AppUi ui = new AppUi(this);
-            AppUi.Summaries adapter = ui.new Summaries();
-            List<AppUi.Summary> rows = new ArrayList<>();
-            for (int i = 0; i < entries.size(); i++) {
-                SubscriptionCatalog.Entry entry = entries.get(i);
-                rows.add(new AppUi.Summary(entry.name(), SubscriptionUsage.load(appPreferences(), entry.address()).summary(),
-                    entry.address().equals(subscriptions.activeAddress()) ? "当前使用" : "", i));
-            }
-            adapter.set(rows); dialog.setAdapter(adapter, (view, index) -> {
-                AppUi.Summary row = adapter.getItem(index); if (row != null) showSubscriptionActions(entries.get(row.sourceIndex()));
-            });
+        AppUi ui = new AppUi(this);
+        AppUi.Summaries adapter = ui.new Summaries();
+        List<AppUi.Summary> rows = new ArrayList<>();
+        for (int i = 0; i < entries.size(); i++) {
+            SubscriptionCatalog.Entry entry = entries.get(i);
+            rows.add(new AppUi.Summary(entry.name(), SubscriptionUsage.load(appPreferences(), entry.address()).summary(),
+                entry.address().equals(subscriptions.activeAddress()) ? "当前使用" : "", i));
         }
-        AlertDialog shown = dialog.show(); trackManagement(shown); if (!entries.isEmpty()) new AppUi(this).styleList(shown);
+        adapter.set(rows); dialog.setAdapter(adapter, (view, index) -> {
+            AppUi.Summary row = adapter.getItem(index); if (row != null) showSubscriptionActions(entries.get(row.sourceIndex()));
+        });
+        AlertDialog shown = dialog.show(); trackManagement(shown); ui.styleList(shown);
     }
 
     private void trackManagement(AlertDialog dialog) {
@@ -1334,20 +1368,31 @@ public final class MainActivity extends Activity {
     private void refreshUsage(SubscriptionCatalog.Entry entry) {
                 if (background.usage.running() || background.usage.outcome() != null) { showMessage("正在读取另一份订阅用量，请稍后重试。"); return; }
                 Context context = getApplicationContext();
-                background.usage.start(BackgroundWork.DOWNLOADS, () -> {
-                    SubscriptionUsage usage = Subscription.usage(entry.address());
+                DownloadRequest request = new DownloadRequest();
+                boolean started = background.usage.start(BackgroundWork.DOWNLOADS, () -> {
+                    try (request) {
+                    SubscriptionUsage usage = Subscription.usage(entry.address(), request);
                     return worker.submit(() -> {
+                        request.seal();
                         SharedPreferences prefs = context.getSharedPreferences("MainActivity", MODE_PRIVATE);
                         SubscriptionCatalog catalog = new SubscriptionCatalog(prefs, new RoutingStore(context));
                         if (catalog.load().entries().stream().noneMatch(saved -> saved.address().equals(entry.address()))) {
                             throw new IOException("此订阅已被移除，未保存用量。");
                         }
-                        usage.save(prefs, entry.address());
+                        SubscriptionUsage latest = usage.saveLatest(prefs, entry.address());
                         SubscriptionReminders.reconcile(context, catalog.load());
-                        return new BackgroundWork.UsageResult(entry, usage);
+                        return new BackgroundWork.UsageResult(entry, latest);
                     }).get();
-                });
+                    }
+                }, request::cancel);
+                if (!started) request.close();
                 showMessage("正在读取服务商用量，不会切换或应用配置…");
+                render();
+    }
+
+    private void cancelSubscriptionRequest(RetainedTask<?> task) {
+        showMessage(task.cancel() ? "订阅请求已取消。" : "下载已完成，正在整理结果，请稍候。");
+        render();
     }
 
     private EditText subscriptionInput(String hint, int inputType) {
@@ -1443,12 +1488,15 @@ public final class MainActivity extends Activity {
 
     private void previewSubscription(SubscriptionCatalog.Entry entry, boolean adding) {
         Context context = getApplicationContext();
+        DownloadRequest request = new DownloadRequest();
         if (background.preview.start(BackgroundWork.DOWNLOADS, () -> {
-            Subscription.Download downloaded = Subscription.download(entry.address());
+            try (request) {
+            Subscription.Download downloaded = Subscription.download(entry.address(), request);
             byte[] source = downloaded.source();
             // Snapshot and configuration writes share the same queue; downloading does not.
             try {
                 return worker.submit(() -> {
+                    request.seal();
                     if (adding || new SubscriptionCatalog(context.getSharedPreferences("MainActivity", MODE_PRIVATE), new RoutingStore(context))
                         .load().entries().stream().anyMatch(saved -> saved.address().equals(entry.address()))) {
                         downloaded.usage().cache(context.getSharedPreferences("MainActivity", MODE_PRIVATE), entry.address());
@@ -1466,10 +1514,11 @@ public final class MainActivity extends Activity {
                 if (error.getCause() instanceof Exception cause) throw cause;
                 throw error;
             }
-        })) {
+            }
+        }, request::cancel)) {
             showMessage("正在下载订阅并比较配置…");
             render();
-        }
+        } else request.close();
     }
 
     private void showSubscriptionPreview(SubscriptionPreview preview) {
@@ -2991,11 +3040,16 @@ public final class MainActivity extends Activity {
         setupHint.setText(setup);
         setupHint.setVisibility(setup.isEmpty() ? View.GONE : View.VISIBLE);
         SubscriptionCatalog.Entry active = subscriptions == null ? null : subscriptions.active();
+        boolean noSubscriptions = subscriptions != null && subscriptions.entries().isEmpty();
+        boolean needsSubscription = noSubscriptions && (status == null || !status.profile);
         updateSubscriptionIndicator();
-        currentConfigCard.setVisibility(active == null ? View.VISIBLE : View.GONE);
+        subscriptionGuide.setVisibility(needsSubscription ? View.VISIBLE : View.GONE);
+        addSubscriptionButton.setEnabled(!busy && noSubscriptions);
+        currentConfigCard.setVisibility(active == null && !needsSubscription ? View.VISIBLE : View.GONE);
         configGuide.setVisibility(installed && status.profile ? View.GONE : View.VISIBLE);
         String current = active != null ? "当前订阅 · " + active.name()
-            : installed && status.profile ? "本地配置已就绪" : "尚未启用订阅";
+            : installed && status.profile ? "本地配置已就绪"
+            : noSubscriptions ? "还没有订阅，点击下方“添加订阅”开始使用。" : "尚未启用订阅";
         profileSummary.setText(installed && status.profile ? current : "尚未导入配置");
         if (subscriptions != null) subscriptionSummary.setText(current + (active == null ? "" : "\n"
             + SubscriptionUsage.load(appPreferences(), active.address()).summary()));
@@ -3007,10 +3061,15 @@ public final class MainActivity extends Activity {
         boolean canImport = !busy && enabled && !isActive();
         importButton.setEnabled(canImport);
         subscriptionButton.setEnabled(!busy && subscriptions != null);
+        subscriptionButton.setText(noSubscriptions ? "添加订阅" : "管理订阅");
         boolean subscribed = active != null && installed && status.profile;
         updateButton.setVisibility(subscribed ? View.VISIBLE : View.GONE);
         updateButton.setEnabled(canApplySubscription() && subscribed && !background.preview.running()
             && background.preview.outcome() == null);
+        cancelSubscriptionButton.setVisibility(background.preview.cancellable() || background.usage.cancellable() ? View.VISIBLE : View.GONE);
+        cancelSubscriptionButton.setText(background.preview.cancellable() && background.usage.cancellable() ? "取消订阅请求…"
+            : background.preview.cancellable() ? "取消订阅配置下载" : "取消用量读取");
+        cancelSubscriptionButton.setEnabled(!busy);
         boolean hasControl = hasProxyControl(status);
         boolean canControl = !busy && hasControl;
         modeButton.setEnabled(canControl);

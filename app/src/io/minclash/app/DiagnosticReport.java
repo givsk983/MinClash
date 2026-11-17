@@ -14,7 +14,7 @@ import java.util.concurrent.TimeUnit;
 
 record DiagnosticReport(String text) {
     enum Fact {
-        IFACE, ROUTE4, ROUTE6, LOG_SAMPLE,
+        IFACE, ROUTE4, ROUTE6, UPLINK4, UPLINK6, APP_REJECT_RULE, LOG_SAMPLE,
         NODE_DNS, GEODATA, PROVIDER, CORE_TLS, TUN_SETUP, BOOT_UPLINK_WAIT, BOOT_UPLINK_RESTART, CONFIG
     }
 
@@ -33,19 +33,26 @@ record DiagnosticReport(String text) {
                 catch (Exception ignored) { }
             }
         }
-        Map<NetworkCheck, NetworkCheck.Result> network = checkNetwork(networkWorker);
+        NetworkResults checked = checkNetwork(networkWorker);
         if (mode != null) {
             try { outlet = Controller.testPrimaryOutlet(mode); }
             catch (Exception ignored) { }
         }
-        return format(appVersion, appCode, androidApi, status, facts, mode, outlet, network,
-            subscriptionFailure == null ? null : subscriptionFailure.kind);
+        return format(appVersion, appCode, androidApi, status, facts, mode, outlet, checked.network(),
+            subscriptionFailure == null ? null : subscriptionFailure.kind, checked.ipv4(), checked.ipv6());
     }
 
     static DiagnosticReport format(String appVersion, long appCode, int androidApi, Module.Status status,
                                    Set<Fact> facts, Controller.Mode mode, Controller.OutletProbe outlet,
                                    Map<NetworkCheck, NetworkCheck.Result> network, Subscription.NetworkFailure.Kind subscription) {
-        StringBuilder report = new StringBuilder("MinClash 诊断记录 / MC-D2\n")
+        return format(appVersion, appCode, androidApi, status, facts, mode, outlet, network, subscription, null, null);
+    }
+
+    static DiagnosticReport format(String appVersion, long appCode, int androidApi, Module.Status status,
+                                   Set<Fact> facts, Controller.Mode mode, Controller.OutletProbe outlet,
+                                   Map<NetworkCheck, NetworkCheck.Result> network, Subscription.NetworkFailure.Kind subscription,
+                                   IpFamilyCheck.Result ipv4, IpFamilyCheck.Result ipv6) {
+        StringBuilder report = new StringBuilder("MinClash 诊断记录 / MC-D3\n")
             .append("App  ").append(safeVersion(appVersion)).append(" (").append(appCode).append(")\n")
             .append("Android API  ").append(androidApi).append('\n')
             .append("优先排查  ").append(finding(status, facts, mode, outlet, network)).append('\n');
@@ -78,6 +85,30 @@ record DiagnosticReport(String text) {
         }
         if (subscription != null) report.append("订阅下载  SUB_").append(subscription.name()).append('\n');
 
+        report.append("\n[APP] MinClash 自身联网\n")
+            .append(facts == null ? "APP_CHECK_SKIPPED"
+                : facts.contains(Fact.APP_REJECT_RULE) ? "APP_REJECT_RULE_FOUND  检测到系统对本 App 的拒绝联网规则，请在 MinClash 应用信息中核对 Wi-Fi／移动数据联网设置。"
+                : "NO_KNOWN_APP_REJECT_RULE  未发现已知厂商拒绝规则。")
+            .append('\n')
+            .append("Root 内核与 App 使用不同 UID；内核能代理，不代表 App 可以下载订阅或检查更新。\n");
+
+        report.append("\n[FAMILY] 上游路由与固定地址 HTTPS\n")
+            .append("IPv4 上游默认路由  ").append(factResult(facts, Fact.UPLINK4)).append('\n')
+            .append("IPv6 上游默认路由  ").append(factResult(facts, Fact.UPLINK6)).append('\n')
+            .append("IPv4 目标  ").append(familyResult(ipv4)).append('\n')
+            .append("IPv6 目标  ").append(familyResult(ipv6)).append('\n')
+            .append("固定 Cloudflare 双栈目标，验证 TLS 证书；请求经过当前 TUN 与分流。\n")
+            .append("路由存在不等于外网可用；代理也可能通过 IPv4 上游访问 IPv6 目标。单个站点失败不能代表整个地址族不可用。\n");
+        if (ipv4 != null && ipv4.state() == IpFamilyCheck.State.REACHABLE
+            && ipv6 != null && ipv6.state() != IpFamilyCheck.State.REACHABLE) {
+            report.append("IPV6_PATH_UNCONFIRMED  IPv4 目标可达，IPv6 目标未通过；对照 IPv6 上游、代理节点支持情况，换节点或网络后重测。\n");
+        }
+        report.append("\n[BACKGROUND] 应用恢复\n")
+            .append("BACKGROUND_NOT_CHECKED  本报告不判断其他应用是否被冻结或清理。\n")
+            .append("TUN／保护规则就绪、节点测速正常，均不能证明目标应用后台连接或消息送达正常。\n")
+            .append("仅返回应用时恢复慢：先检查目标应用后台与电池限制；持续前台也失败：对照出口、分流和以上 HTTPS 结果。\n")
+            .append("可在设置打开「后台连接恢复指南」；本次检查不更改后台权限、不解除系统冻结。\n");
+
         report.append("\n[CORE] 最近日志信号\n");
         if (facts == null || !facts.contains(Fact.LOG_SAMPLE)) report.append("LOG_UNAVAILABLE\n");
         else {
@@ -90,6 +121,11 @@ record DiagnosticReport(String text) {
             if (!found) report.append("NO_KNOWN_SIGNAL\n");
         }
         return new DiagnosticReport(report.toString().trim());
+    }
+
+    private static String familyResult(IpFamilyCheck.Result result) {
+        return result == null ? "SKIPPED" : result.state().name()
+            + (result.state() == IpFamilyCheck.State.REACHABLE ? " · " + result.latencyMs() + " ms" : "");
     }
 
     static EnumSet<Fact> parseFacts(String output) {
@@ -123,6 +159,9 @@ record DiagnosticReport(String text) {
             return "TUN_ROUTE_MISSING · 检查 TUN 接口与 IPv4 路由";
         }
         if (mode == null) return "CONTROL_UNAVAILABLE · 检查 Mihomo 控制接口";
+        if (facts != null && facts.contains(Fact.APP_REJECT_RULE)) {
+            return "APP_REJECT_RULE_FOUND · 核对系统是否允许 MinClash 使用 Wi-Fi／移动数据";
+        }
         if (mode == Controller.Mode.DIRECT) return "DIRECT_MODE · 当前模式为直连";
         if (outlet != null && outlet.state() == Controller.OutletState.HTTPS_FAILED) {
             if (facts != null && facts.contains(Fact.NODE_DNS)) return "NODE_DNS · 内核日志样本出现解析失败";
@@ -145,17 +184,27 @@ record DiagnosticReport(String text) {
         return result != null && result.state() == NetworkCheck.State.REACHABLE;
     }
 
-    private static Map<NetworkCheck, NetworkCheck.Result> checkNetwork(ExecutorService networkWorker) throws InterruptedException {
+    private record NetworkResults(Map<NetworkCheck, NetworkCheck.Result> network, IpFamilyCheck.Result ipv4, IpFamilyCheck.Result ipv6) {}
+
+    private static NetworkResults checkNetwork(ExecutorService networkWorker) throws InterruptedException {
         NetworkCheck[] targets = NetworkCheck.values();
-        List<Callable<NetworkCheck.Result>> tasks = new ArrayList<>();
+        List<Callable<Object>> tasks = new ArrayList<>();
         for (NetworkCheck target : targets) tasks.add(target::runOnce);
-        List<Future<NetworkCheck.Result>> results = networkWorker.invokeAll(tasks, 15, TimeUnit.SECONDS);
+        tasks.add(() -> IpFamilyCheck.run(false));
+        tasks.add(() -> IpFamilyCheck.run(true));
+        List<Future<Object>> results = networkWorker.invokeAll(tasks, 22, TimeUnit.SECONDS);
         Map<NetworkCheck, NetworkCheck.Result> output = new EnumMap<>(NetworkCheck.class);
         for (int i = 0; i < targets.length; i++) {
             if (results.get(i).isCancelled()) continue;
-            try { output.put(targets[i], results.get(i).get()); }
+            try { output.put(targets[i], (NetworkCheck.Result) results.get(i).get()); }
             catch (ExecutionException ignored) { }
         }
-        return output;
+        IpFamilyCheck.Result[] families = new IpFamilyCheck.Result[2];
+        for (int i = 0; i < 2; i++) {
+            Future<Object> result = results.get(targets.length + i);
+            if (!result.isCancelled()) try { families[i] = (IpFamilyCheck.Result) result.get(); }
+            catch (ExecutionException ignored) { }
+        }
+        return new NetworkResults(output, families[0], families[1]);
     }
 }

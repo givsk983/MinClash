@@ -85,9 +85,18 @@ record SubscriptionUsage(long upload, long download, long total, long expire, lo
         } catch (Exception invalid) { return new SubscriptionUsage(-1, -1, -1, -1, 0); }
     }
     void save(SharedPreferences prefs, String address) throws Exception {
-        JSONObject object = new JSONObject().put("upload", upload).put("download", download).put("total", total)
-            .put("expire", expire).put("checkedAt", checkedAt);
-        if (!prefs.edit().putString(key(address), object.toString()).commit()) throw new java.io.IOException("无法保存订阅用量。");
+        saveLatest(prefs, address);
+    }
+
+    SubscriptionUsage saveLatest(SharedPreferences prefs, String address) throws Exception {
+        synchronized (SubscriptionUsage.class) {
+            SubscriptionUsage latest = load(prefs, address);
+            if (latest.checkedAt() > checkedAt) return latest;
+            JSONObject object = new JSONObject().put("upload", upload).put("download", download).put("total", total)
+                .put("expire", expire).put("checkedAt", checkedAt);
+            if (!prefs.edit().putString(key(address), object.toString()).commit()) throw new java.io.IOException("无法保存订阅用量。");
+            return this;
+        }
     }
 
     boolean cache(SharedPreferences prefs, String address) {

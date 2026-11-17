@@ -30,6 +30,7 @@ final class BackgroundConnectionGuide {
         LinearLayout intro = card(page, "返回后一直“连接中”？", 0);
         text(intro, "适用于 Telegram 等应用在后台停留一阵后，返回时连接等待较久、消息稍后才补齐的情况。应用被冻结、被清理或连接失效，都可能需要重新连接和同步。", 8);
         text(intro, "节点测速正常，也不能证明应用的后台连接和消息送达正常。先按下面的顺序排查。", 8);
+        text(intro, "先区分现象：只有目标应用从后台返回时慢，优先检查它是否被省电策略冻结或清理；一直在前台也失败，检查代理出口与分流；多个应用同时断网，先看 TUN 和诊断结果。保护规则就绪只表示限制已安装，不表示出口已经连通。", 8);
 
         LinearLayout target = card(page, "01  先设置出现问题的应用", 14);
         ui.add(target, ui.label("Telegram 等消息应用需要单独设置", 13, AppUi.MINT, true), 8);
@@ -37,6 +38,7 @@ final class BackgroundConnectionGuide {
         ui.add(target, ui.label("小米 / Redmi · MIUI / 澎湃 OS", 14, AppUi.TEXT, true), 12);
         text(target, "① 开启「自启动」或「后台自启动」。\n② 进入「省电策略」，选择「无限制」。\n③ 检查「应用联网」允许正在使用的网络；需要消息提醒时，允许该应用通知。", 6);
         text(target, "其他品牌：在目标应用的应用信息中，检查后台运行、电池限制、自启动和通知。菜单名称随系统版本变化，以手机实际页面为准。", 10);
+        text(target, "红魔／努比亚等系统也可能冻结后台应用，冻结时应用自身的连接检测与超时处理都可能暂停。请检查目标应用的后台、省电或冻结限制，再通过实际返回与消息送达验证；无需为所有应用放开限制。", 8);
         action(target, "Telegram 应用信息", this::openTelegram, 12);
         action(target, "其他应用设置", this::openApplications, 8);
         if (isXiaomi()) action(target, "小米自启动管理", this::openAutostart, 8);
@@ -58,6 +60,7 @@ final class BackgroundConnectionGuide {
 
         LinearLayout next = card(page, "持续使用时也慢？", 14);
         text(next, "若应用一直在前台仍慢、TUN 状态异常，或所有应用同时断网，还需检查当前网络、应用分流和代理出口。可到「概览 → 连接管理」查看目标应用的规则与出口，或生成诊断报告继续排查。", 8);
+        text(next, "诊断中的上游默认路由、主代理出口及 IPv4／IPv6 固定目标分别检查不同环节。若 IPv4 通过、IPv6 未通过，先检查 IPv6 上游和代理节点是否支持该目标，换节点或网络后重测；单个测试站点失败不能说明整个 IPv6 不可用。", 8);
         action(next, "生成诊断报告", diagnostics, 12);
         ui.add(page, ui.label("按需放宽后台限制：只为需要及时消息的应用设置，并观察待机耗电。允许后台运行或启用保活可能增加耗电；效果取决于设备、系统和应用。", 12, AppUi.MUTED, false), 14);
     }

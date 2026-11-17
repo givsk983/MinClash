@@ -3,11 +3,17 @@ package io.minclash.app;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
+import java.io.IOException;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 /** Local device policy. Deliberately excluded from portable subscription backups. */
 final class ProtectionPolicy {
+    static final int MAX_APPS = 128;
     record App(String packageName, int uid, String target) {}
     final List<App> apps = new ArrayList<>();
     boolean strictDns;
@@ -39,11 +45,57 @@ final class ProtectionPolicy {
         return result;
     }
     byte[] request(String expected) throws Exception {
-        return new JSONObject().put("expected", expected).put("policy", json()).toString().getBytes(StandardCharsets.UTF_8);
+        validate(null);
+        byte[] request = new JSONObject().put("expected", expected).put("policy", json()).toString().getBytes(StandardCharsets.UTF_8);
+        if (request.length > 65536) throw new IOException("保护设置过大，请减少应用数量或出口名称长度。");
+        return request;
+    }
+    void validate(List<String> targets) throws IOException {
+        if (apps.size() > MAX_APPS) throw new IOException("最多保护 " + MAX_APPS + " 个应用，请先移除部分应用。");
+        Set<String> packages = new HashSet<>();
+        Map<Integer, String> uids = new HashMap<>();
+        for (App app : apps) {
+            if (!app.packageName().matches("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+")
+                || app.uid() < 0 || app.uid() % 100000 < 10000 || app.uid() % 100000 >= 20000 || app.uid() / 100000 > 999) {
+                throw new IOException("应用安装信息无效，请移除后重新添加。");
+            }
+            if (!packages.add(app.packageName())) throw new IOException("保护列表包含重复应用，请重新添加。");
+            validateTarget(app.target(), targets);
+            String previous = uids.putIfAbsent(app.uid(), app.target());
+            if (previous != null && !previous.equals(app.target())) {
+                throw new IOException("部分应用共用同一个 UID，必须使用相同代理出口。请统一出口后保存。");
+            }
+        }
+        if (strictDns) validateTarget(dnsProxy, targets);
+    }
+
+    void putApp(App app, List<String> targets) throws IOException {
+        List<App> next = new ArrayList<>(apps);
+        int existing = -1;
+        for (int i = 0; i < next.size(); i++) if (next.get(i).packageName().equals(app.packageName())) existing = i;
+        if (existing < 0) next.add(app); else next.set(existing, app);
+        ProtectionPolicy proposed = new ProtectionPolicy();
+        proposed.apps.addAll(next);
+        proposed.validate(null);
+        validateTarget(app.target(), targets);
+        apps.clear();
+        apps.addAll(next);
+    }
+
+    boolean sameAs(ProtectionPolicy other) {
+        return other != null && apps.equals(other.apps) && strictDns == other.strictDns
+            && dnsProxy.equals(other.dnsProxy) && (strictDns && bootstrap) == (other.strictDns && other.bootstrap);
+    }
+
+    private static void validateTarget(String target, List<String> targets) throws IOException {
+        if (!safeTarget(target)) throw new IOException("请选择有效的代理出口，保护不能使用直连或特殊出口。");
+        if (targets != null && !targets.contains(target)) {
+            throw new IOException("代理出口「" + target + "」已不在当前配置中，请重新选择。");
+        }
     }
     boolean enabled() { return !apps.isEmpty() || strictDns; }
     static boolean safeTarget(String target) {
-        return target != null && !target.isEmpty() && !List.of("DIRECT", "COMPATIBLE", "PASS", "REJECT", "REJECT-DROP", "DNS", "GLOBAL", "MINCLASH-STRICT-DNS")
+        return target != null && !target.isEmpty() && target.getBytes(StandardCharsets.UTF_8).length <= 256 && !List.of("DIRECT", "COMPATIBLE", "PASS", "REJECT", "REJECT-DROP", "DNS", "GLOBAL", "MINCLASH-STRICT-DNS")
             .contains(target.toUpperCase(java.util.Locale.ROOT)) && !target.matches("(?s).*[\\r\\n\\x00#&].*");
     }
 }
