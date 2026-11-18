@@ -16,6 +16,10 @@ import javax.net.ssl.SSLException;
 final class Subscription {
     static final String PROXY_HINT = "如果该订阅需要代理，请先连接可用代理再重试。也可以下载 Clash / Mihomo YAML 后从本地导入。";
 
+    static final class SecureRequired extends IOException {
+        SecureRequired() { super("请使用服务商的 HTTPS 订阅链接，或下载 YAML 后从本地导入。已启用的配置可继续使用。"); }
+    }
+
     static final class NetworkFailure extends IOException {
         enum Kind { DNS, TIMEOUT, CONNECT }
         final Kind kind;
@@ -27,6 +31,10 @@ final class Subscription {
     }
 
     static String host(String address) throws IOException { return parse(null, address).getHost(); }
+
+    static String secureHost(String address) throws IOException {
+        return requireSecure(parse(null, address)).getHost();
+    }
 
     static byte[] fetch(String address) throws IOException {
         return download(address).source();
@@ -51,12 +59,13 @@ final class Subscription {
     }
 
     private static Download response(String address, boolean includeConfig, DownloadRequest request) throws IOException {
-        URL url = parse(null, address);
+        URL url = requireSecure(parse(null, address));
         Set<String> visited = new HashSet<>();
         for (int redirects = 0; redirects <= 5; redirects++) {
             request.check();
             if (!visited.add(url.toExternalForm())) throw new IOException("订阅服务器出现循环重定向，请检查服务商链接。");
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            HttpURLConnection connection = (HttpURLConnection) (url.getProtocol().equals("http")
+                ? url.openConnection(java.net.Proxy.NO_PROXY) : url.openConnection());
             try {
                 request.attach(connection);
                 connection.setConnectTimeout(request.socketTimeout());
@@ -79,7 +88,7 @@ final class Subscription {
                     if (url.getProtocol().equals("https") && next.getProtocol().equals("http")) {
                         throw new IOException("订阅从 HTTPS 重定向到了 HTTP，请使用服务商提供的 HTTPS 链接。");
                     }
-                    url = next;
+                    url = requireSecure(next);
                     continue;
                 }
                 if (status != 200) throw new IOException("订阅服务器返回 HTTP " + status + "，请检查链接是否有效。");
@@ -137,6 +146,11 @@ final class Subscription {
             }
         }
         throw new IOException("请输入有效的 HTTP 或 HTTPS 订阅链接。");
+    }
+
+    private static URL requireSecure(URL url) throws IOException {
+        if (url.getProtocol().equals("https") || url.getHost().equals("127.0.0.1")) return url;
+        throw new SecureRequired();
     }
 
     private static IOException downloadError(IOException error) {

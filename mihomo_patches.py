@@ -8,6 +8,13 @@ def apply(source):
             raise RuntimeError(f"Unexpected upstream hook: {path}: {old[:70]!r}")
         file.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
 
+    replace("hub/route/server.go", 'r.Get("/memory", memory)',
+            'r.Get("/memory", memory)\n\t\tr.Get("/minclash/statistics", minclashStatistics)')
+    replace("tunnel/statistic/manager.go", "memory        uint64", "memory        atomic.Uint64")
+    replace("tunnel/statistic/manager.go", "return m.memory", "return m.memory.Load()")
+    replace("tunnel/statistic/manager.go", "Memory:        m.memory,", "Memory:        m.memory.Load(),")
+    replace("tunnel/statistic/manager.go", "m.memory = stat.RSS", "m.memory.Store(stat.RSS)")
+
     replace("main.go", '"github.com/metacubex/mihomo/component/age"',
             '"github.com/metacubex/mihomo/component/age"\n "github.com/metacubex/mihomo/component/protection"')
     replace("main.go", 'version                       bool', 'protectionCommand string\n version                       bool')

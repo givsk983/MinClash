@@ -1,5 +1,7 @@
 package io.minclash.app;
 
+import static io.minclash.app.AppUi.*;
+
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.Context;
@@ -25,9 +27,6 @@ import java.util.List;
 import java.util.Locale;
 
 final class ProxyQuickControls extends Dialog {
-    private static final int TEXT = 0xffedf4f7;
-    private static final int MUTED = 0xff9baebc;
-    private static final int MINT = 0xff79e7c9;
     private final Button[] modes = new Button[Controller.Mode.values().length];
     private final List<String> options = new ArrayList<>();
     private Controller.Snapshot snapshot;
@@ -44,7 +43,7 @@ final class ProxyQuickControls extends Dialog {
     private AlertDialog groupPicker;
 
     ProxyQuickControls(Context context, boolean modePanel) {
-        super(context, R.style.ProxyQuickControls);
+        super(context, AppUi.quickTheme(context));
         this.modePanel = modePanel;
         getWindow().setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
         setCanceledOnTouchOutside(true);
@@ -281,7 +280,7 @@ final class ProxyQuickControls extends Dialog {
         button.setSingleLine(true);
         button.setEllipsize(TextUtils.TruncateAt.END);
         button.setPadding(dp(8), 0, dp(8), 0);
-        button.setBackgroundResource(R.drawable.proxy_quick_button);
+        button.setBackground(new AppUi(getContext()).shape(AppUi.tone(0xff202e3a, 0xffedf2f5), 12));
         return button;
     }
 

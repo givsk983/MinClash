@@ -38,10 +38,24 @@ public final class DownloadRequestCheck {
             byte[] yaml = "rules: ['MATCH,DIRECT']\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
             try (exchange) { exchange.sendResponseHeaders(200, yaml.length); exchange.getResponseBody().write(yaml); }
         });
+        server.createContext("/insecure-redirect", exchange -> {
+            try (exchange) {
+                exchange.getResponseHeaders().set("Location", "http://example.invalid/private-token");
+                exchange.sendResponseHeaders(302, -1);
+            }
+        });
         server.start();
         String base = "http://127.0.0.1:" + server.getAddress().getPort();
         var worker = Executors.newSingleThreadExecutor();
         try {
+            require(Subscription.secureHost("https://example.invalid/test").equals("example.invalid"), "HTTPS remains allowed");
+            for (String address : new String[]{"http://example.invalid/private-token", base + "/insecure-redirect"}) {
+                try { Subscription.download(address); throw new AssertionError("external cleartext was accepted"); }
+                catch (IOException expected) {
+                    require(expected.getMessage().contains("HTTPS") && !expected.getMessage().contains("private-token"),
+                        "cleartext is rejected before a request, without exposing the URL");
+                }
+            }
             slowHeaders();
             for (String path : new String[]{"/drip", "/redirect"}) {
                 long started = System.nanoTime();

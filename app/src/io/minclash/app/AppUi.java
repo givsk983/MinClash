@@ -1,7 +1,9 @@
 package io.minclash.app;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
@@ -13,10 +15,61 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 final class AppUi {
+    enum ColorMode {
+        DARK("dark", "深色模式"),
+        LIGHT("light", "白色模式"),
+        SYSTEM("system", "跟随系统");
+
+        static final String PREFERENCE = "color_mode";
+        final String value;
+        final String label;
+
+        ColorMode(String value, String label) {
+            this.value = value;
+            this.label = label;
+        }
+
+        static ColorMode current(Context context) {
+            SharedPreferences prefs = context.getSharedPreferences("MainActivity", Context.MODE_PRIVATE);
+            String saved = prefs.getString(PREFERENCE, "");
+            for (ColorMode mode : values()) {
+                if (mode.value.equals(saved)) return mode;
+            }
+            return prefs.getBoolean("light_theme", false) ? LIGHT : DARK;
+        }
+    }
+
     record Summary(String title, String detail, String badge, int sourceIndex) {}
     private record SummaryRow(TextView title, TextView detail, TextView badge) {}
-    static final int BG = 0xff0d131a, CARD = 0xff17212b, BORDER = 0xff293641;
-    static final int TEXT = 0xffedf4f7, MUTED = 0xff9baebc, MINT = 0xff79e7c9, AMBER = 0xfff5ca88;
+    static int BG = 0xff0d131a, CARD = 0xff17212b, BORDER = 0xff293641;
+    static int TEXT = 0xffedf4f7, MUTED = 0xff9baebc, MINT = 0xff79e7c9, AMBER = 0xfff5ca88;
+    static int RED = 0xffff9a9e;
+    private static boolean light;
+    static boolean isLight(Context context) {
+        return switch (ColorMode.current(context)) {
+            case DARK -> false;
+            case LIGHT -> true;
+            case SYSTEM -> (context.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                != Configuration.UI_MODE_NIGHT_YES;
+        };
+    }
+    // UI surfaces and service overlays share the persisted app preference.
+    static void configure(Context context) {
+        light = isLight(context);
+        BG = tone(0xff0d131a, 0xfff6f8fa);
+        CARD = tone(0xff17212b, 0xffffffff);
+        BORDER = tone(0xff293641, 0xffdce3e8);
+        TEXT = tone(0xffedf4f7, 0xff182630);
+        MUTED = tone(0xff9baebc, 0xff566875);
+        MINT = tone(0xff79e7c9, 0xff006b55);
+        AMBER = tone(0xfff5ca88, 0xff895600);
+        RED = tone(0xffff9a9e, 0xffba293d);
+    }
+    static int tone(int dark, int white) { return light ? white : dark; }
+    static int quickTheme(Context context) {
+        configure(context);
+        return light ? R.style.ProxyQuickControlsLight : R.style.ProxyQuickControls;
+    }
     private final Context context;
     AppUi(Context context) { this.context = context; }
     int dp(int value) { return Math.round(value * context.getResources().getDisplayMetrics().density); }
@@ -41,7 +94,7 @@ final class AppUi {
         Button view = new Button(context); view.setText(title); view.setTextSize(13); view.setAllCaps(false);
         view.setMinWidth(0); view.setMinimumWidth(0); view.setMinHeight(dp(48));
         view.setPadding(dp(10), dp(6), dp(10), dp(6)); view.setGravity(Gravity.CENTER);
-        view.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9), shape(0xff202e3a, 12), null));
+        view.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9), shape(AppUi.tone(0xff202e3a, 0xffedf2f5), 12), null));
         view.setTextColor(new ColorStateList(new int[][] {{-android.R.attr.state_enabled}, {}}, new int[] {MUTED, TEXT}));
         view.setStateListAnimator(null); view.setElevation(0); return view;
     }

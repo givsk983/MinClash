@@ -77,12 +77,22 @@ final class RoutingStore {
         return read();
     }
 
+    State withoutBypass(Module.Status status) throws Exception {
+        State saved = read();
+        if (saved != null && !saved.bypassedApps().isEmpty()) return saved.withBypassedApps(Set.of());
+        if (!status.profile) return null;
+        byte[] installed = Module.readProfile();
+        if (!Profile.hasTunBypass(installed)) return null;
+        return saved == null ? new State(Profile.normalize(installed), Map.of()) : saved;
+    }
+
     void importProfile(byte[] source, String subscription) throws Exception {
         State saved = read();
         apply(saved == null ? new State(source, Collections.emptyMap(), subscription) : saved.withSource(source, subscription));
     }
 
     boolean repairDns() throws Exception {
+        BackupStore.requireResolved(context);
         byte[] installed = Module.readProfile();
         byte[] repaired = Profile.repairDns(installed);
         if (installed == repaired) return false;
@@ -147,18 +157,7 @@ final class RoutingStore {
     }
 
     private void save(State state) throws Exception {
-        JSONObject object = encodeState(state);
-        byte[] bytes = object.toString().getBytes(StandardCharsets.UTF_8);
-        FileOutputStream output = null;
-        try {
-            output = file.startWrite();
-            output.write(bytes);
-            file.finishWrite(output);
-            generation++;
-        } catch (Exception error) {
-            if (output != null) file.failWrite(output);
-            throw error;
-        }
+        restoreSnapshot(encodeState(state).toString().getBytes(StandardCharsets.UTF_8));
     }
 
     byte[] snapshot() throws Exception {
@@ -176,16 +175,18 @@ final class RoutingStore {
             generation++;
             return;
         }
-        FileOutputStream output = null;
+        if (bytes.length > BackupArchive.MAX_BYTES) throw new IOException("应用分流设置过大。");
+        FileOutputStream output = file.startWrite();
         try {
-            output = file.startWrite();
             output.write(bytes);
-            file.finishWrite(output);
-            generation++;
+            output.getFD().sync();
         } catch (Exception error) {
-            if (output != null) file.failWrite(output);
+            file.failWrite(output);
             throw error;
         }
+        file.finishWrite(output);
+        if (!Arrays.equals(bytes, snapshot())) throw new IOException("应用分流设置未成功写入。");
+        generation++;
     }
 
     void apply(State state) throws Exception {
@@ -193,14 +194,23 @@ final class RoutingStore {
     }
 
     void apply(State state, boolean recreateTun) throws Exception {
+        BackupStore.requireResolved(context);
+        applyState(state, recreateTun);
+    }
+
+    void applyBackup(State state) throws Exception {
+        checkExperimentalAccess(state);
+        byte[] merged = Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps());
+        apply(merged, state, false, true);
+    }
+
+    private void applyState(State state, boolean recreateTun) throws Exception {
         checkExperimentalAccess(state);
         apply(Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps()), state, recreateTun);
     }
 
     void checkExperimentalAccess(State state) throws Exception {
-        State previous = read();
-        ExperimentalFeatures.checkBypass(ExperimentalFeatures.enabled(context),
-            previous == null ? Set.of() : previous.bypassedApps(), state.bypassedApps());
+        ExperimentalFeatures.checkBypass(ExperimentalFeatures.enabled(context), state.bypassedApps());
     }
 
     private void apply(byte[] merged, State state) throws Exception {
@@ -208,7 +218,12 @@ final class RoutingStore {
     }
 
     private void apply(byte[] merged, State state, boolean recreateTun) throws Exception {
+        apply(merged, state, recreateTun, false);
+    }
+
+    private void apply(byte[] merged, State state, boolean recreateTun, boolean restoringBackup) throws Exception {
         Module.Status before = Module.status();
+        if (restoringBackup && before.phase() != Module.Phase.STOPPED) throw new IOException("请先停止 TUN。");
         if (state != null && !state.bypassedApps().isEmpty()) {
             ProtectionPolicy protection = before.protection
                 ? ProtectionPolicy.parse(new JSONObject(Module.run(before.functionalRevision() >= 10 ? Module.Command.PROTECTION_POLICY : Module.Command.PROTECTION_GET, null)).getJSONObject("policy"))
@@ -235,7 +250,6 @@ final class RoutingStore {
                     if (!Module.status().running()) throw new IOException("TUN 未就绪。");
                     Controller.mode();
                 }
-                public void reconnect() throws Exception { Controller.reconnectConnections(); }
                 public void commit() throws Exception { save(state); }
                 public void restoreSelections() throws Exception { Controller.restoreSelections(selections); }
                 public void rollback() throws Exception {
@@ -295,7 +309,6 @@ final class RoutingStore {
     interface LiveChange {
         void reload() throws Exception;
         void verify() throws Exception;
-        void reconnect() throws Exception;
         void commit() throws Exception;
         void restoreSelections() throws Exception;
         void rollback() throws Exception;
@@ -308,7 +321,6 @@ final class RoutingStore {
             change.verify();
             try { change.restoreSelections(); }
             catch (Exception error) { selectionError = error; }
-            change.reconnect();
             change.commit();
         } catch (LiveProfile.UnchangedFailure unchanged) {
             throw unchanged;
@@ -328,7 +340,7 @@ final class RoutingStore {
         Exception last = null;
         do {
             Module.Status current = Module.status();
-            if (current.state.equals("running")) {
+            if (current.running()) {
                 if (!control) return;
                 try {
                     Controller.mode();

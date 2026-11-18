@@ -73,6 +73,7 @@ public final class BackupArchiveCheck {
             List.of(), data.preferences(), 1, "0.1.7"), "invalid source YAML");
         boundedInput();
         rollback();
+        journal();
         Arrays.fill(password, '\0');
         System.out.println("PASS: encrypted/plain backups, Unicode round trips, randomization, wrong passwords, tampering, bounded input, schema validation and rollback failures.");
     }
@@ -116,6 +117,20 @@ public final class BackupArchiveCheck {
             }
         };
         reject(() -> BackupArchive.read(huge), "overlarge input stream");
+    }
+
+    private static void journal() throws Exception {
+        var bytes = new java.io.ByteArrayOutputStream();
+        byte[] routing = {1, 2, 3};
+        var snapshot = new BackupStore.RestoreSnapshot(routing, null, Map.of("subscriptions", "[]",
+            NodeList.favoritesKey("https://example.invalid/"), Set.of("香港"), SubscriptionUpdateJob.ENABLED, true));
+        snapshot.write(bytes);
+        var read = BackupStore.RestoreSnapshot.read(new ByteArrayInputStream(bytes.toByteArray()));
+        require(Arrays.equals(read.routing(), routing) && read.core() == null && read.settings().equals(snapshot.settings()),
+            "durable rollback preserves missing profiles, raw routing data and preference types");
+        byte[] truncated = Arrays.copyOf(bytes.toByteArray(), bytes.size() - 1);
+        try { BackupStore.RestoreSnapshot.read(new ByteArrayInputStream(truncated)); throw new AssertionError("truncated rollback journal accepted"); }
+        catch (IOException expected) { }
     }
 
     private static void rollback() throws Exception {

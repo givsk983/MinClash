@@ -10,7 +10,7 @@ import java.util.concurrent.TimeUnit;
 
 final class Module {
     enum Command {
-        STATUS("status"), START("start"), STOP("stop"), IMPORT("import"), VALIDATE("validate"),
+        STATUS("status"), START("start"), STOP("stop"), IMPORT("import"), VALIDATE("validate"), CLEAR_PROFILE("clear-profile"),
         BOOT_ON("boot-on"), BOOT_OFF("boot-off"), LOGS("logs"), API("api"),
         HOTSPOT_ON("hotspot-on"), HOTSPOT_OFF("hotspot-off"),
         PROTECTION_POLICY("protection-policy"), PROTECTION_GET("protection-get"), PROTECTION_SET("protection-set"), PROTECTION_OFF("protection-off"),
@@ -32,9 +32,9 @@ final class Module {
         Phase(String label, boolean active) { this.label = label; this.active = active; }
     }
 
-    record RuntimeStatus(boolean reported, boolean core, boolean tun4, boolean tun6, boolean controller,
+    record RuntimeStatus(boolean reported, boolean core, boolean tun4, boolean tun6, boolean tun6Required, boolean controller,
                          boolean notificationRecovery, boolean notificationEnabled, String hotspotReason,
-                         long hotspotSent, long hotspotReceived) {}
+                         long hotspotSent, long hotspotReceived, boolean trafficSummary, boolean protectionDegraded) {}
 
     static final class Status {
         final String state;
@@ -81,7 +81,8 @@ final class Module {
             if (!installed()) return Phase.MISSING;
             if (!enabled) return runtime.core() || !state.equals("stopped") ? Phase.ORPHANED : Phase.DISABLED;
             return switch (state) {
-                case "running" -> runtime.reported() && (!runtime.core() || !runtime.tun4() || !runtime.controller())
+                case "running" -> runtime.reported() && (!runtime.core() || !runtime.tun4() || !runtime.controller()
+                    || runtime.tun6Required() && !runtime.tun6())
                     ? Phase.DEGRADED : Phase.RUNNING;
                 case "waiting_network" -> Phase.WAITING_NETWORK;
                 case "starting" -> Phase.STARTING;
@@ -221,7 +222,8 @@ final class Module {
         boolean hotspot = false;
         boolean hotspotEnabled = false;
         String hotspotState = "off";
-        boolean health = false, core = false, tun4 = false, tun6 = false, controller = false;
+        boolean health = false, core = false, tun4 = false, tun6 = false, tun6Required = false, controller = false;
+        boolean trafficSummary = false, protectionDegraded = false;
         boolean notificationRecovery = false, notificationEnabled = false;
         String hotspotReason = "none";
         long hotspotSent = 0, hotspotReceived = 0;
@@ -234,12 +236,15 @@ final class Module {
             if (line.equals("validate=1")) validate = true;
             if (line.equals("protection=1")) protection = true;
             if (line.equals("protection_armed=1")) protectionArmed = true;
+            if (line.equals("protection_degraded=1")) protectionDegraded = true;
+            if (line.equals("traffic_summary=1")) trafficSummary = true;
             if (line.equals("hotspot=1")) hotspot = true;
             if (line.equals("hotspot_enabled=1")) hotspotEnabled = true;
             if (line.equals("health=1")) health = true;
             if (line.equals("core_running=1")) core = true;
             if (line.equals("tun4=1")) tun4 = true;
             if (line.equals("tun6=1")) tun6 = true;
+            if (line.equals("tun6_required=1")) tun6Required = true;
             if (line.equals("controller_ready=1")) controller = true;
             if (line.equals("notification_recovery=1")) notificationRecovery = true;
             if (line.equals("notification_enabled=1")) notificationEnabled = true;
@@ -268,8 +273,9 @@ final class Module {
             default -> throw new IOException("无法读取 KernelSU / Magisk 模块的状态。");
         }
         return new Status(state, profile, boot, enabled, control, validate, version, pendingVersion, revision,
-            hotspot, hotspotEnabled, hotspotState, new RuntimeStatus(health, core, tun4, tun6, controller,
-                notificationRecovery, notificationEnabled, hotspotReason, hotspotSent, hotspotReceived), TcpKeepAlive.parse(output), protection, protectionArmed);
+            hotspot, hotspotEnabled, hotspotState, new RuntimeStatus(health, core, tun4, tun6, tun6Required, controller,
+                notificationRecovery, notificationEnabled, hotspotReason, hotspotSent, hotspotReceived, trafficSummary, protectionDegraded),
+            TcpKeepAlive.parse(output), protection, protectionArmed && !protectionDegraded);
     }
 
     private static long nonnegativeLong(String value) {

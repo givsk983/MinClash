@@ -50,6 +50,12 @@ public final class ModuleStatusCheck {
             "shared ready phase and notification recovery capability");
         require(Module.parseStatus(facts.replace("tun4=1\n", "")).phase() == Module.Phase.DEGRADED,
             "state file alone cannot claim routes are ready");
+        require(Module.parseStatus(facts.replace("tun6=1\n", "tun6_required=1\n")).phase() == Module.Phase.DEGRADED,
+            "IPv6 upstream requires a working IPv6 TUN route");
+        require(Module.parseStatus(facts.replace("tun6=1\n", "")).running(), "IPv4-only and older modules remain usable");
+        Module.Status degraded = Module.parseStatus(facts + "protection_armed=1\nprotection_degraded=1\ntraffic_summary=1\n");
+        require(!degraded.protectionArmed && degraded.runtime.protectionDegraded() && degraded.runtime.trafficSummary(),
+            "failed protection verification overrides an ownership marker; traffic summary is capability-gated");
         require(Module.parseStatus(facts.replace("controller_ready=1\n", "")).phase() == Module.Phase.DEGRADED,
             "controller readiness is distinguished");
         require(Module.parseStatus(facts.replace("state=running", "state=waiting_network")).phase() == Module.Phase.WAITING_NETWORK,

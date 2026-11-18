@@ -1,5 +1,7 @@
 package io.minclash.app;
 
+import static io.minclash.app.AppUi.*;
+
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -66,7 +68,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 
-public final class MainActivity extends Activity {
+public final class MainActivity extends ThemedActivity {
     private static final int PICK_PROFILE = 1;
     private static final int EXPORT_MODULE = 2;
     private static final int REQUEST_APP_LIST = 3;
@@ -78,13 +80,6 @@ public final class MainActivity extends Activity {
     private static final int REQUEST_SUBSCRIPTION_NOTIFICATIONS = 9;
     static final String NOTIFICATION_CONTROL = "notification_control";
     private static final String ROOT_INVENTORY = "root_app_inventory";
-    private static final int BG = 0xff0d131a;
-    private static final int CARD = 0xff17212b;
-    private static final int BORDER = 0xff293641;
-    private static final int TEXT = 0xffedf4f7;
-    private static final int MUTED = 0xff9baebc;
-    private static final int MINT = 0xff79e7c9;
-    private static final int AMBER = 0xfff5ca88;
 
     private static final ExecutorService worker = RoutingStore.WORKER;
     private final ExecutorService networkWorker = Executors.newFixedThreadPool(NetworkCheck.values().length + 2);
@@ -139,6 +134,7 @@ public final class MainActivity extends Activity {
     private Button routingButton;
     private Button personalRulesButton;
     private Button connectionsButton;
+    private TrafficCard trafficCard;
     private record RulesScreen(RoutingStore.State state, int generation, List<String> targets) {}
     private String routingFilter = AppCategories.APPS;
     private String routingQuery = "";
@@ -225,7 +221,7 @@ public final class MainActivity extends Activity {
         statusRow.addView(label("连接状态", 13, MUTED, true), new LinearLayout.LayoutParams(0, -2, 1));
         statusBadge = label("待检测", 11, MINT, true);
         statusBadge.setPadding(dp(10), dp(5), dp(10), dp(5));
-        statusBadge.setBackground(shape(0xff203a35, 10, false));
+        statusBadge.setBackground(shape(AppUi.tone(0xff203a35, 0xffdff2e9), 10, false));
         statusRow.addView(statusBadge);
         add(dashboard, statusRow, 0);
         LinearLayout connectionRow = new LinearLayout(this);
@@ -242,7 +238,13 @@ public final class MainActivity extends Activity {
             if (!status.installed()) { selectPage(2); return; }
             boolean stop = isActive();
             execute("", true, () -> {
+                BackupStore backup = new BackupStore(this);
+                if (!stop) {
+                    if (backup.recoverPending()) refreshSubscriptionCatalog();
+                    ExperimentalFeatures.reconcile(this, Module.status());
+                }
                 Module.run(stop ? Module.Command.STOP : Module.Command.START, null);
+                if (stop && backup.recoverPending()) refreshSubscriptionCatalog();
                 return Module.status();
             });
         });
@@ -256,7 +258,7 @@ public final class MainActivity extends Activity {
 
         setupHint = label("", 13, AMBER, false);
         setupHint.setPadding(dp(14), dp(12), dp(14), dp(12));
-        setupHint.setBackground(shape(0xff302b22, 14, false));
+        setupHint.setBackground(shape(AppUi.tone(0xff302b22, 0xfffff0d6), 14, false));
         setupHint.setOnClickListener(view -> selectPage(2));
         add(overview, setupHint, 12);
 
@@ -289,6 +291,9 @@ public final class MainActivity extends Activity {
         connectionsButton = button("连接管理", false);
         connectionsButton.setOnClickListener(view -> startActivity(new Intent(this, ConnectionsActivity.class)));
         add(overview, connectionsButton, 10);
+        trafficCard = new TrafficCard(this);
+        trafficCard.setOnClickListener(view -> startActivity(new Intent(this, TrafficActivity.class)));
+        add(overview, trafficCard, 14);
         proxyHint = label("", 13, MUTED, false);
         add(overview, proxyHint, 10);
 
@@ -389,7 +394,7 @@ public final class MainActivity extends Activity {
         LinearLayout commonSettings = settingsNavigation.group("常用");
         LinearLayout notificationPage = settingsNavigation.page(commonSettings, "notification", "通知栏控制", "连接、网速与快捷切换");
         settingsNavigation.action(commonSettings, "subscription", "订阅显示与提醒", "额度布局与到期通知", this::showSubscriptionSettings);
-        settingsNavigation.action(commonSettings, "appearance", "外观", "桌面图标", this::showLauncherIcons);
+        settingsNavigation.action(commonSettings, "appearance", "外观", "桌面图标", this::showAppearance);
         LinearLayout connectionSettings = settingsNavigation.group("连接");
         settingsNavigation.action(connectionSettings, "protection", "应用防泄漏保护 · 开发中", "指定应用使用代理，断线时暂停联网", () -> startActivity(new Intent(this, ProtectionActivity.class)));
         LinearLayout servicePage = settingsNavigation.page(connectionSettings, "connection", "连接与启动", "开机自启与热点共享");
@@ -406,13 +411,20 @@ public final class MainActivity extends Activity {
         experimentalSwitch.setMinHeight(dp(48));
         experimentalSwitch.setChecked(ExperimentalFeatures.enabled(this));
         experimentalSwitch.setOnCheckedChangeListener((button, checked) -> {
-            if (updatingSwitch) return;
-            appPreferences().edit().putBoolean(ExperimentalFeatures.KEY, checked).apply();
-            render();
+            if (updatingSwitch || checked == ExperimentalFeatures.enabled(this)) return;
+            if (checked) {
+                execute("已开启开发中功能。", () -> {
+                    ExperimentalFeatures.enable(this);
+                    return null;
+                });
+            } else {
+                showMessage("正在关闭开发中功能…");
+                execute("已关闭开发中功能。", true, () -> ExperimentalFeatures.disable(this, Module.status()));
+            }
         });
         add(experimentalPage, experimentalSwitch, 0);
-        add(experimentalPage, label("包含「应用防泄漏保护」和「绕过 TUN」。开启后，入口和选项会出现在原来的位置，供你尝鲜。", 13, MUTED, false), 12);
-        add(experimentalPage, label("功能仍在开发中。关闭此开关只隐藏入口，不会自动撤销已生效的保护或绕过设置；需要调整时，请重新开启后到原入口操作。", 13, MUTED, false), 12);
+        add(experimentalPage, label("开启后可设置「应用防泄漏保护」和「绕过 TUN」。", 13, MUTED, false), 12);
+        add(experimentalPage, label("关闭会清除应用防泄漏保护、域名查询保护和绕过 TUN 设置。应用恢复按普通分流联网，TUN 可能短暂重连。", 13, MUTED, false), 12);
         LinearLayout backupPage = settingsNavigation.page(managementSettings, "backup", "备份与恢复", "配置、订阅与分流规则");
         LinearLayout service = card(servicePage, 0);
 
@@ -425,7 +437,7 @@ public final class MainActivity extends Activity {
         bootSwitch.setThumbTintList(new ColorStateList(new int[][] {{android.R.attr.state_checked}, {}},
             new int[] {MINT, MUTED}));
         bootSwitch.setTrackTintList(new ColorStateList(new int[][] {{android.R.attr.state_checked}, {}},
-            new int[] {0xff325f54, BORDER}));
+            new int[] {AppUi.tone(0xff325f54, 0xff9dcbbb), BORDER}));
         bootSwitch.setOnCheckedChangeListener((button, checked) -> {
             if (updatingSwitch) return;
             execute(checked ? "已开启开机自启。" : "已关闭开机自启。", () -> {
@@ -497,7 +509,7 @@ public final class MainActivity extends Activity {
         add(keepAlive, label("识别后台 TCP 长连接的失效状态，改善应用返回前台后的连接恢复。", 13, MUTED, false), 6);
         LinearLayout keepAliveExample = column();
         keepAliveExample.setPadding(dp(12), dp(12), dp(12), dp(12));
-        keepAliveExample.setBackground(shape(0xff102b28, 12, false));
+        keepAliveExample.setBackground(shape(AppUi.tone(0xff102b28, 0xffe6f4ee), 12, false));
         add(keepAliveExample, label("使用示例", 12, MINT, true), 0);
         add(keepAliveExample, label("例如：Telegram 在后台停留后，返回时长时间“连接中”、消息刷新延迟。请先检查 Telegram 自身的自启动与后台省电限制；仍有失效连接时，再尝试均衡保活。", 13, TEXT, false), 6);
         add(keepAlive, keepAliveExample, 12);
@@ -561,9 +573,9 @@ public final class MainActivity extends Activity {
         add(identity, identityRow, 0);
         LinearLayout appUpdates = card(information, 14);
         GradientDrawable updateBackground = new GradientDrawable();
-        updateBackground.setColor(0xff182c3a);
+        updateBackground.setColor(AppUi.tone(0xff182c3a, 0xffe8f2fa));
         updateBackground.setCornerRadius(dp(20));
-        updateBackground.setStroke(dp(1), 0xff3b7088);
+        updateBackground.setStroke(dp(1), AppUi.tone(0xff3b7088, 0xffa6c8db));
         appUpdates.setBackground(updateBackground);
         add(appUpdates, label("应用更新", 18, TEXT, true), 0);
         add(appUpdates, label("检查新版本，在 App 内下载并安装。", 12, MUTED, false), 7);
@@ -580,9 +592,9 @@ public final class MainActivity extends Activity {
 
         LinearLayout channelCard = card(information, 14);
         GradientDrawable channelBackground = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-            new int[] {0xff183c36, 0xff152b30});
+            new int[] {AppUi.tone(0xff183c36, 0xffdff4e9), AppUi.tone(0xff152b30, 0xffe9f5f7)});
         channelBackground.setCornerRadius(dp(20));
-        channelBackground.setStroke(dp(1), 0xff4f9c88);
+        channelBackground.setStroke(dp(1), AppUi.tone(0xff4f9c88, 0xff94cbb9));
         channelCard.setBackground(channelBackground);
         add(channelCard, label("项目频道", 12, MINT, true), 0);
         add(channelCard, label("Telegram · @mbazhuan", 21, TEXT, true), 10);
@@ -634,7 +646,7 @@ public final class MainActivity extends Activity {
 
         messageText = label("", 12, AMBER, false);
         messageText.setPadding(dp(18), dp(12), dp(18), dp(12));
-        messageText.setBackgroundColor(0xff302b22);
+        messageText.setBackgroundColor(AppUi.tone(0xff302b22, 0xfffff0d6));
         messageText.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         messageText.setOnClickListener(view -> { main.removeCallbacks(dismissMessage); dismissMessage.run(); });
         root.addView(messageText);
@@ -696,6 +708,8 @@ public final class MainActivity extends Activity {
         });
         confirmNextLatency = true;
         if (appPreferences().getBoolean("connected", false)) main.post(poll);
+        else if (status == null && appPreferences().contains(ExperimentalFeatures.KEY)
+            && !ExperimentalFeatures.enabled(this)) refresh();
         scheduleLatency(0);
         warmAppRouting();
     }
@@ -877,6 +891,7 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         resumed = true;
+        trafficCard.setActive(selectedPage == 0);
         if (subscriptionNotificationSettingsOpened) {
             subscriptionNotificationSettingsOpened = false;
             worker.execute(this::refreshSubscriptionCatalog);
@@ -903,6 +918,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onPause() {
         resumed = false;
+        trafficCard.setActive(false);
         background.stopObserving();
         UpdateInstallReceiver.listen(null);
         super.onPause();
@@ -1065,7 +1081,18 @@ public final class MainActivity extends Activity {
         result.setTextColor(color);
     }
 
-    private void refresh() { execute("", Module::status); }
+    private void refresh() {
+        execute("", () -> {
+            Module.Status current = Module.status();
+            try { return ExperimentalFeatures.reconcile(this, current); }
+            catch (Exception error) {
+                main.post(() -> {
+                    if (!isDestroyed()) showMessage("关闭开发中功能时遇到问题，请在检测环境后重试。\n" + error.getMessage());
+                });
+                return Module.status();
+            }
+        });
+    }
 
     private void pollStatus() {
         if (!visible || busy || polling) return;
@@ -1122,6 +1149,7 @@ public final class MainActivity extends Activity {
 
     private void refreshSubscriptionCatalog() {
         try {
+            new BackupStore(this).recoverPending();
             SubscriptionCatalog.Snapshot loaded = subscriptionCatalog.load();
             SubscriptionReminders.reconcile(getApplicationContext(), loaded);
             main.post(() -> {
@@ -1134,7 +1162,7 @@ public final class MainActivity extends Activity {
             main.post(() -> {
                 if (isDestroyed()) return;
                 if (subscriptions == null) subscriptionSummary.setText("无法读取订阅列表");
-                showMessage("无法读取订阅列表。");
+                showMessage(error instanceof BackupStore.RecoveryPending ? error.getMessage() : "无法读取订阅列表。");
             });
         }
     }
@@ -1439,7 +1467,7 @@ public final class MainActivity extends Activity {
         add(content, input, 10);
         boolean canActivate = canApplySubscription();
         AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle("添加订阅")
-            .setMessage("粘贴机场提供的 Clash / Mihomo 订阅链接。\n" + Subscription.PROXY_HINT)
+            .setMessage("粘贴机场提供的 HTTPS 格式 Clash / Mihomo 订阅链接。\n" + Subscription.PROXY_HINT)
             .setView(content).setNegativeButton("取消", null).setPositiveButton(canActivate ? "保存并启用" : "保存", null);
         if (canActivate) builder.setNeutralButton("仅保存", null);
         AlertDialog dialog = builder.show();
@@ -1453,7 +1481,7 @@ public final class MainActivity extends Activity {
         if (busy) return;
         String address = input.getText().toString().trim();
         String host;
-        try { host = Subscription.host(address); }
+        try { host = Subscription.secureHost(address); }
         catch (IOException invalid) {
             input.setError(invalid.getMessage());
             return;
@@ -1496,6 +1524,7 @@ public final class MainActivity extends Activity {
 
     private void saveSubscriptions(List<SubscriptionCatalog.Entry> entries, String success) {
         execute(success, () -> {
+            BackupStore.requireResolved(this);
             subscriptionCatalog.save(entries);
             refreshSubscriptionCatalog();
             return null;
@@ -1843,7 +1872,7 @@ public final class MainActivity extends Activity {
     private void updateLauncherIcon() {
         LauncherIcon icon = LauncherIcon.current(this);
         aboutLogo.setImageResource(getResources().getIdentifier(icon.drawable, "drawable", getPackageName()));
-        settingsNavigation.summary("appearance", "桌面图标 · " + icon.label);
+        settingsNavigation.summary("appearance", AppUi.ColorMode.current(this).label + " · " + icon.label);
     }
 
     private TcpKeepAlive.Mode selectedKeepAliveLevel() {
@@ -1870,6 +1899,30 @@ public final class MainActivity extends Activity {
                 render();
             }
         }));
+    }
+
+    private void showAppearance() {
+        new AlertDialog.Builder(this).setTitle("外观")
+            .setItems(new String[] {"颜色模式 · " + AppUi.ColorMode.current(this).label, "桌面图标"},
+                (dialog, index) -> { if (index == 0) showColorMode(); else showLauncherIcons(); })
+            .setNegativeButton("关闭", null).show();
+    }
+
+    private void showColorMode() {
+        AppUi.ColorMode current = AppUi.ColorMode.current(this);
+        AppUi.ColorMode[] modes = AppUi.ColorMode.values();
+        String[] labels = new String[modes.length];
+        for (int i = 0; i < modes.length; i++) labels[i] = modes[i].label;
+        new AlertDialog.Builder(this).setTitle("颜色模式")
+            .setSingleChoiceItems(labels, current.ordinal(),
+                (dialog, index) -> {
+                    dialog.dismiss();
+                    if (modes[index] == current) return;
+                    boolean wasLight = AppUi.isLight(this);
+                    appPreferences().edit().putString(AppUi.ColorMode.PREFERENCE, modes[index].value).apply();
+                    if (wasLight != AppUi.isLight(this)) recreate();
+                    else updateLauncherIcon();
+                }).setNegativeButton("取消", null).show();
     }
 
     private void showLauncherIcons() {
@@ -2220,9 +2273,9 @@ public final class MainActivity extends Activity {
             holder.badge().setOnClickListener(view -> measure(item.index()));
             boolean accent = item.selected() || item.badge().equals("直连") || item.badge().equals("自动");
             holder.badge().setTextColor(accent ? MINT : MUTED);
-            holder.badge().setBackground(shape(accent ? 0xff25473e : 0xff2a3946, 9, false));
+            holder.badge().setBackground(shape(accent ? AppUi.tone(0xff25473e, 0xffd3ecdf) : AppUi.tone(0xff2a3946, 0xffe5ebef), 9, false));
             holder.card().setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9),
-                shape(item.selected() ? 0xff213b37 : 0xff1f2d39, 14, item.selected()), null));
+                shape(item.selected() ? AppUi.tone(0xff213b37, 0xffe2f2ea) : AppUi.tone(0xff1f2d39, 0xfff0f4f7), 14, item.selected()), null));
             holder.arrow().setText(item.navigates() ? "›" : item.selected() ? "✓" : "○");
             holder.arrow().setTextColor(item.selected() ? MINT : MUTED);
             return row;
@@ -2423,7 +2476,7 @@ public final class MainActivity extends Activity {
         info.setPadding(dp(12), dp(6), dp(12), dp(6));
         info.setOnClickListener(view -> new AlertDialog.Builder(this).setTitle("应用分流说明")
             .setMessage("• 个人选择优先于订阅规则，仅在规则模式下生效。\n\n"
-                + (ExperimentalFeatures.enabled(this) || !screen.state().bypassedApps().isEmpty() ? "• “直连”仍经过 TUN；“绕过 TUN”让应用自己的 TCP／UDP 直接使用手机网络，在所有模式下生效。只能选择普通且独立 UID 的应用，同包名的其他 Android 资料也会一并绕过。\n\n"
+                + (ExperimentalFeatures.enabled(this) ? "• “直连”仍经过 TUN；“绕过 TUN”让应用自己的 TCP／UDP 直接使用手机网络，在所有模式下生效。只能选择普通且独立 UID 的应用，同包名的其他 Android 资料也会一并绕过。\n\n"
                 + "• 有绕过应用时，DNS 改为返回真实 IP，防止虚拟 IP 导致游戏断网；系统代发的 DNS 仍可能经过 TUN。不能同时启用域名查询保护，也不能绕过已受防泄漏保护的应用。\n\n"
                 + "• 修改绕过设置会短暂重建 TUN，保存后请重新打开游戏；游戏卸载重装后，可在应用分流列表点击“重新应用绕过”，再保存并应用，或重启 TUN。\n\n" : "")
                 + "• 选择“跟随订阅规则”可移除个人设置。保存后现有连接会按新规则重连。\n\n"
@@ -2542,7 +2595,7 @@ public final class MainActivity extends Activity {
                 if (error == null || error instanceof RoutingStore.SelectionRestoreFailure) {
                     dialog.dismiss();
                     routingSnapshot = null;
-                    if (error == null) showMessage("应用分流已保存。普通分流在规则模式下生效。");
+                    if (error == null) showMessage("应用分流已保存。规则模式下，新连接使用新规则。");
                     else new AlertDialog.Builder(this).setTitle("分流已保存，请检查节点")
                         .setMessage(error.getMessage()).setPositiveButton("知道了", null).show();
                 } else {
@@ -2749,10 +2802,10 @@ public final class MainActivity extends Activity {
                 LinearLayout card = new LinearLayout(MainActivity.this);
                 card.setGravity(Gravity.CENTER_VERTICAL);
                 card.setPadding(dp(12), dp(13), dp(12), dp(13));
-                card.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9), shape(0xff1f2d39, 14, false), null));
+                card.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9), shape(AppUi.tone(0xff1f2d39, 0xfff0f4f7), 14, false), null));
                 card.setDuplicateParentStateEnabled(true);
                 FrameLayout iconBox = new FrameLayout(MainActivity.this);
-                iconBox.setBackground(shape(0xff2b4149, 10, false));
+                iconBox.setBackground(shape(AppUi.tone(0xff2b4149, 0xffe0ebef), 10, false));
                 iconBox.setClipToOutline(true);
                 ImageView icon = new ImageView(MainActivity.this);
                 icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
@@ -2807,7 +2860,7 @@ public final class MainActivity extends Activity {
                 : denied ? "图标读取无权限 · " + app.packageName() : app.packageName());
             holder.policy().setText(app.bypassed() ? "绕过 TUN" : app.target().isEmpty() ? "跟随规则" : app.target().equals("DIRECT") ? "直连" : app.target());
             holder.policy().setTextColor(app.assigned() ? MINT : MUTED);
-            holder.policy().setBackground(shape(app.assigned() ? 0xff25473e : 0xff2a3946, 9, false));
+            holder.policy().setBackground(shape(app.assigned() ? AppUi.tone(0xff25473e, 0xffd3ecdf) : AppUi.tone(0xff2a3946, 0xffe5ebef), 9, false));
             return row;
         }
     }
@@ -2941,7 +2994,7 @@ public final class MainActivity extends Activity {
     }
 
     private void savePersonalRules(RulesScreen screen, List<PersonalRules.Rule> rules) {
-        execute("自定义规则已保存。", true, () -> {
+        execute("自定义规则已保存。规则模式下，新连接使用新规则。", true, () -> {
             if (screen.generation() != RoutingStore.generation()) throw new IOException("配置已变化，请重新打开自定义分流。");
             RoutingStore store = new RoutingStore(this);
             RoutingStore.State latest = store.load();
@@ -3136,11 +3189,16 @@ public final class MainActivity extends Activity {
                 : status == null ? "先检测环境，再导入你的配置。" : "前往设置，安装 App 内置的模块。" );
         }
         boolean running = installed && status.running();
+        TrafficMonitor.INSTANCE.updateStatus(status);
+        if (installed && status.runtime.protectionDegraded()) detailText.setText(detailText.getText()
+            + "\n防泄漏规则未通过检查，正在尝试恢复。请查看保护设置。");
+        if (installed && status.runtime.tun6Required() && !status.runtime.tun6()) detailText.setText(detailText.getText()
+            + "\n检测到 IPv6 上游，IPv6 路由正在恢复。");
         if (installed && status.protectionArmed) detailText.setText(detailText.getText()
             + "\n已配置防泄漏阻断；停止 TUN 不会解除，可在设置中关闭保护。");
         statusBadge.setText(running ? "● TUN 就绪" : busy ? "处理中" : pending ? "待重启" : "未连接");
         statusBadge.setTextColor(running ? MINT : MUTED);
-        statusBadge.setBackground(shape(running ? 0xff203a35 : 0xff25313c, 10, false));
+        statusBadge.setBackground(shape(running ? AppUi.tone(0xff203a35, 0xffdff2e9) : AppUi.tone(0xff25313c, 0xffe9eef2), 10, false));
         String setup = pending ? "模块已安装，重启手机后生效  →"
             : status != null && !installed ? "首次使用：前往设置安装内置模块  →"
             : moduleUpdate ? "模块有功能更新：" + bundledModule.version() + "，前往设置安装  →" : "";
@@ -3350,7 +3408,7 @@ public final class MainActivity extends Activity {
         } else {
             TextView version = label("v" + appVersion(), 11, MINT, true);
             version.setPadding(dp(10), dp(6), dp(10), dp(6));
-            version.setBackground(shape(0xff203a35, 10, false));
+            version.setBackground(shape(AppUi.tone(0xff203a35, 0xffdff2e9), 10, false));
             row.addView(version);
         }
         add(parent, row, 0);
@@ -3369,8 +3427,9 @@ public final class MainActivity extends Activity {
             navigation[i].setSelected(i == selectedPage);
             navigation[i].setTextColor(i == selectedPage ? MINT : MUTED);
             navigation[i].setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9),
-                shape(i == selectedPage ? 0xff203a35 : CARD, 12, false), null));
+                shape(i == selectedPage ? AppUi.tone(0xff203a35, 0xffdff2e9) : CARD, 12, false), null));
         }
+        trafficCard.setActive(resumed && selectedPage == 0);
         updateSubscriptionIndicator();
         updateSettingsBack();
         scheduleLatency(0);
@@ -3447,11 +3506,11 @@ public final class MainActivity extends Activity {
     private void styleButton(Button button, boolean primary) {
         button.setActivated(primary);
         StateListDrawable states = new StateListDrawable();
-        states.addState(new int[] {-android.R.attr.state_enabled}, shape(0xff202c36, 14, false));
-        states.addState(new int[] {}, shape(primary ? MINT : 0xff202e3a, 14, !primary));
+        states.addState(new int[] {-android.R.attr.state_enabled}, shape(AppUi.tone(0xff202c36, 0xffe7ecef), 14, false));
+        states.addState(new int[] {}, shape(primary ? MINT : AppUi.tone(0xff202e3a, 0xffedf2f5), 14, !primary));
         button.setBackground(new RippleDrawable(ColorStateList.valueOf(primary ? 0x22000000 : 0x2279e7c9), states, null));
         button.setTextColor(new ColorStateList(new int[][] {{-android.R.attr.state_enabled}, {}},
-            new int[] {0xff708390, primary ? Color.rgb(8, 39, 34) : TEXT}));
+            new int[] {AppUi.tone(0xff708390, 0xff72818c), primary ? AppUi.tone(Color.rgb(8, 39, 34), Color.WHITE) : TEXT}));
     }
 
     private GradientDrawable shape(int color, int radius, boolean border) {

@@ -60,8 +60,8 @@ public final class LiveRoutingCheck {
         Files.writeString(Path.of("build/checks-0.2.3/live-script.sh"), LiveProfile.SCRIPT);
 
         Fake success = new Fake(""); RoutingStore.applyLive(success);
-        require(success.steps.equals(List.of("reload", "verify", "selections", "reconnect", "commit")), "no stop/start in successful fast path; nodes before reconnect");
-        for (String failure : List.of("reload", "verify", "reconnect", "commit")) {
+        require(success.steps.equals(List.of("reload", "verify", "selections", "commit")), "successful hot reload preserves existing connections");
+        for (String failure : List.of("reload", "verify", "commit")) {
             Fake change = new Fake(failure);
             try { RoutingStore.applyLive(change); throw new AssertionError("failure ignored"); }
             catch (IOException expected) { require(expected.getMessage().contains("已恢复"), "honest recovery status"); }
@@ -98,7 +98,6 @@ public final class LiveRoutingCheck {
         }
         public void reload() throws Exception { step("reload"); }
         public void verify() throws Exception { step("verify"); }
-        public void reconnect() throws Exception { step("reconnect"); }
         public void commit() throws Exception { step("commit"); }
         public void rollback() throws Exception { step("rollback"); }
         public void restoreSelections() throws Exception { step("selections"); }

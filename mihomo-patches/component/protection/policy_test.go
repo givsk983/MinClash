@@ -142,6 +142,42 @@ func TestProtectionFirewallLifecycle(t *testing.T) {
 		}
 	}
 }
+func TestProtectionWatchRestoresOwnedRules(t *testing.T) {
+	mock := &fakeFW{}
+	f := Firewall{mock.run}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.json")
+	p := Policy{Version: 1, Apps: []App{{"org.example.app", 10123, "Safe"}}}
+	if err := writePolicy(path, p); err != nil {
+		t.Fatal(err)
+	}
+	verify := func(Policy) error { return nil }
+	for _, command := range []string{"hold", "activate", "mark", "check"} {
+		if err := manage(command, path, nil, &bytes.Buffer{}, f, verify); err != nil {
+			t.Fatal(command, err)
+		}
+	}
+	mock.chains["6"]["OUTPUT"] = [][]string{{"-j", "VENDOR_CHAIN"}}
+	if err := manage("check", path, nil, &bytes.Buffer{}, f, verify); err == nil {
+		t.Fatal("watchdog reported a missing anchor as healthy")
+	}
+	if err := manage("repair-running", path, nil, &bytes.Buffer{}, f, verify); err != nil {
+		t.Fatal(err)
+	}
+	if !f.Healthy(p) || strings.Join(mock.chains["6"]["OUTPUT"][1], " ") != "-j VENDOR_CHAIN" {
+		t.Fatal("repair failed to restore the owned policy while retaining the vendor rule")
+	}
+	if err := os.Remove(filepath.Join(dir, "protection-core")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manage("repair-running", path, nil, &bytes.Buffer{}, f, verify); err == nil {
+		t.Fatal("released protection without a matching running policy")
+	}
+	if _, err := f.call("ip6tables", "-C", "OUTPUT", "-j", hold); err != nil {
+		t.Fatal("repair must keep HOLD when the loaded protection policy is unknown")
+	}
+}
+
 func TestProtectionStageCompareAndFailureRecovery(t *testing.T) {
 	m := &fakeFW{}
 	f := Firewall{m.run}

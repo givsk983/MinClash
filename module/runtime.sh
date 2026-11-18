@@ -1,6 +1,14 @@
 # Shared supervisor helpers. No Android service calls may inherit the root-only log FD.
 runtime_now() { local value rest; read -r value rest < /proc/uptime; printf '%s\n' "${value%%.*}"; }
 
+has_ipv6_uplink() {
+    printf '%s\n' "$1" | grep -q '^-6 '
+}
+
+tun_ready_for_uplink() {
+    tun_ready && { ! has_ipv6_uplink "$1" || tun6_ready; }
+}
+
 uplink_watch_reset() {
     uplink_baseline=$(uplink_routes)
     uplink_candidate=

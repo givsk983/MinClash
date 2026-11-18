@@ -36,10 +36,15 @@ with zipfile.ZipFile(ROOT / 'build/downloads/mihomo-windows-amd64-v1-v1.19.33.zi
 with socket.socket() as port_socket:
     port_socket.bind(('127.0.0.1', 0))
     PORT = port_socket.getsockname()[1]
+with socket.socket() as port_socket:
+    port_socket.bind(('127.0.0.1', 0))
+    PROXY = port_socket.getsockname()[1]
 
 source = f'''mode: rule
 log-level: silent
 external-controller: 127.0.0.1:{PORT}
+bind-address: 127.0.0.1
+mixed-port: {PROXY}
 tun: {{enable: false}}
 dns: {{enable: false}}
 proxy-groups: [{{name: Test, type: select, proxies: [DIRECT, REJECT]}}]
@@ -137,18 +142,35 @@ def failed(result, marker):
 try:
     start()
     pid = process.pid
-    began = time.monotonic()
-    # Background API requests briefly hold the same lock. Saving must wait and then reload.
-    result = invoke(TEST_LOCK_BUSY_ATTEMPTS='3')
-    elapsed = time.monotonic() - began
-    assert result.returncode == 0, (result.stdout, result.stderr)
+    with socket.create_server(('127.0.0.1', 0)) as target, socket.create_connection(('127.0.0.1', PROXY), 5) as client:
+        target.settimeout(5)
+        address = f'127.0.0.1:{target.getsockname()[1]}'
+        client.sendall(f'CONNECT {address} HTTP/1.1\r\nHost: {address}\r\n\r\n'.encode())
+        upstream, _ = target.accept()
+        with upstream, client.makefile('rb') as response:
+            assert response.readline().split()[1] == b'200', 'local test connection was not established'
+            for header in response:
+                if header == b'\r\n':
+                    break
+            else:
+                raise AssertionError('incomplete reply to local test connection')
+            upstream.settimeout(5)
+            with upstream.makefile('rb') as received:
+                client.sendall(b'before reload\n')
+                assert received.readline() == b'before reload\n'
+                began = time.monotonic()
+                # Background API requests briefly hold the same lock. Saving waits and reloads.
+                result = invoke(TEST_LOCK_BUSY_ATTEMPTS='3')
+                elapsed = time.monotonic() - began
+                assert result.returncode == 0, (result.stdout, result.stderr)
+                client.sendall(b'after reload\n')
+                assert received.readline() == b'after reload\n', 'existing TCP connection was interrupted'
     assert process.pid == pid and process.poll() is None, 'core restarted'
     assert PROFILE.read_bytes() == saved, 'persistent profile differs from framed bytes'
     assert api('/configs')['mode'] == 'global', 'session mode lost'
     assert any(r.get('payload') == 'com.example.app' for r in api('/rules')['rules']), 'rule was not applied'
-    api('/connections', 'DELETE')
     assert not list(DATA.glob('live-*'))
-    print(f'PASS: real Mihomo reload, same PID, mode/rules, DELETE connections and atomic persistence ({elapsed*1000:.0f} ms; Windows synthetic fixture only).')
+    print(f'PASS: real Mihomo reload, same PID and TCP connection, mode/rules and atomic persistence ({elapsed*1000:.0f} ms; Windows synthetic fixture only).')
 
     # Return to the known old file and core, emulating the production cold recovery.
     stop(); PROFILE.write_bytes(source); start()

@@ -1,6 +1,6 @@
 # MinClash Mihomo modifications
 
-Modified on 2026-11-16, based on Mihomo v1.19.33, commit
+Modified through 2026-11-18, based on Mihomo v1.19.33, commit
 `3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8`. The upstream GPL v3 license applies.
 The source archive SHA-256 is
 `ecda5f8c8a8a1d60bc088c2640c85d92c8f002c0686234a26bdf671735afe216`.
@@ -57,7 +57,7 @@ GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
   CC='clang --target=aarch64-linux-android28' \
   CGO_LDFLAGS='-Wl,-z,max-page-size=16384' \
   go build -mod=vendor -tags with_gvisor -trimpath \
-  -ldflags '-X github.com/metacubex/mihomo/constant.Version=v1.19.33-minclash.2 -X github.com/metacubex/mihomo/constant.BuildTime=2026-11-16T00:00:00Z -w -s -buildid=' \
+  -ldflags '-X github.com/metacubex/mihomo/constant.Version=v1.19.33-minclash.4 -X github.com/metacubex/mihomo/constant.BuildTime=2026-11-18T00:00:00Z -w -s -buildid=' \
   -o mihomo .
 ```
 
@@ -121,7 +121,7 @@ It does not change device identifiers, SIM, GPS, uploaded data or account identi
 Run local regression tests (loopback sockets are required):
 
 ```sh
-go test -mod=vendor ./component/protection ./adapter/outbound ./config ./tunnel -run 'MinClash|Protection' -count=1
+go test -mod=vendor ./component/protection ./adapter/outbound ./config ./tunnel ./hub/route -run 'MinClash|Protection' -count=1
 ```
 
 The tests include real SOCKS payload transfer, nested aliased DIRECT denial for
@@ -130,3 +130,12 @@ mode precedence, unknown-origin rejection, policy compare-and-swap, both-family
 firewall staging/failure/cleanup through a stateful runner, and explicit recovery
 from corrupt policy. Android kernel firewall and phone handoff/reboot acceptance
 remain separate device checks; host tests do not certify those behaviors.
+
+## Traffic statistics and firewall recovery (2026-11-18)
+
+The authenticated controller routes include `GET /minclash/statistics`. It
+returns counters and a core session identifier. The `details=1` query also
+returns the active connection count and resident memory. The response excludes
+individual connection records. The protection helper fingerprints its private
+IPv4 and IPv6 rules for the module watchdog, which can reinstall them when the
+running core matches the saved protection policy.

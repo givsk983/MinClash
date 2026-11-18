@@ -44,7 +44,24 @@ final class Controller {
 
     static JSONObject runtimeSettings() throws Exception { return new JSONObject(request("GET", "/configs", "")); }
 
-    static void reconnectConnections() throws Exception { request("DELETE", "/connections", ""); }
+    static JSONObject trafficStatistics(boolean details) throws Exception {
+        return new JSONObject(probe(details ? "/minclash/statistics?details=1" : "/minclash/statistics"));
+    }
+
+    static long coreMemory() throws Exception {
+        String value = Module.runRoot("""
+            read -r pid stamp boot < /data/adb/minclash/core.pid || exit 1
+            case "$pid" in ''|*[!0-9]*) exit 1 ;; esac
+            [ "$(readlink /proc/$pid/exe)" = /data/adb/modules/minclash/bin/mihomo ] || exit 1
+            [ "$(cat /proc/sys/kernel/random/boot_id)" = "$boot" ] || exit 1
+            actual=$(sed 's/.*) //' /proc/$pid/stat | awk '{print $20}')
+            [ "$actual" = "$stamp" ] || exit 1
+            awk '$1 == "VmRSS:" {print $2}' /proc/$pid/status
+            """, Module.Command.API, null, 5).trim();
+        if (!value.matches("[0-9]{1,15}")) return -1;
+        long kib = Long.parseLong(value);
+        return kib > 0 ? Math.multiplyExact(kib, 1024L) : -1;
+    }
 
     static JSONObject connections() throws Exception { return new JSONObject(probe("/connections")); }
 

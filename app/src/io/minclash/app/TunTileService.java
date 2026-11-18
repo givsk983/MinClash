@@ -78,7 +78,13 @@ public final class TunTileService extends TileService {
                 Module.Status current = Module.status();
                 if (start != active(current)) {
                     if (!canToggle(current)) throw new IOException("TUN prerequisites unavailable");
+                    BackupStore backup = new BackupStore(this);
+                    if (start) {
+                        if (backup.recoverPending()) current = Module.status();
+                        ExperimentalFeatures.reconcile(this, current);
+                    }
                     Module.run(start ? Module.Command.START : Module.Command.STOP, null);
+                    if (!start) backup.recoverPending();
                     current = Module.status();
                 }
                 SharedPreferences preferences = getSharedPreferences("MainActivity", MODE_PRIVATE);

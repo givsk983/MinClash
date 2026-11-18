@@ -29,7 +29,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /** Live-only view. Snapshots and application labels never leave this Activity. */
-public final class ConnectionsActivity extends Activity {
+public final class ConnectionsActivity extends ThemedActivity {
     private record AppName(String label, String name) {}
     private record Row(ConnectionSnapshot.Entry connection, AppName app) {
         String key() { return connection.id().isEmpty() ? connection.host() + connection.process() + connection.started() : connection.id(); }

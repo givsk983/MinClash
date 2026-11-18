@@ -36,6 +36,18 @@ route=mobile
 if uplink_changed; then exit 1; fi
 uplink_changed
 
+v4=1 v6=0
+tun_ready() { [ "$v4" = 1 ]; }
+tun6_ready() { [ "$v6" = 1 ]; }
+tun_ready_for_uplink '-4 wlan0 default'
+if tun_ready_for_uplink "$(printf '%s\n' '-4 wlan0 default' '-6 wlan0 default')"; then
+    echo 'Missing IPv6 TUN route reported ready on a dual-stack uplink'; exit 1
+fi
+v6=1
+tun_ready_for_uplink '-6 wlan0 default'
+v4=0
+if tun_ready_for_uplink '-6 wlan0 default'; then echo 'Missing IPv4 TUN route reported ready'; exit 1; fi
+
 notification_user() { printf '0\n'; }
 allowed=1
 notification_launch_allowed() { [ "$allowed" = 1 ]; }

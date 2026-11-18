@@ -11,7 +11,6 @@ import static io.minclash.app.AppUi.*;
 
 /** A compact, stationary entry point; the arc always represents remaining quota. */
 final class SubscriptionQuotaIndicator extends View {
-    private static final int RED = 0xffff9a9e;
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF arc = new RectF();
     private final float density, scaledDensity;

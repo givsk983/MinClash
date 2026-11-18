@@ -24,7 +24,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 /** Explicit, opt-in controls; networking and persistence never depend on this Activity. */
-public final class ProtectionActivity extends Activity {
+public final class ProtectionActivity extends ThemedActivity {
     private static final class Model extends ProtectionEdits {
         JSONObject remote;
         Module.Status status;
@@ -111,7 +111,7 @@ public final class ProtectionActivity extends Activity {
         action("‹ 返回",this::onBackPressed);
         ui.add(content,ui.label("应用防泄漏保护 · 开发中",23,AppUi.TEXT,true),0);
         if (!ExperimentalFeatures.enabled(this)) {
-            note("请先在「设置 → 开发中功能」开启尝鲜，再使用应用防泄漏保护。已有保护设置保持不变。");
+            note("请先在「设置 → 开发中功能」开启总开关，再设置应用防泄漏保护。");
             return;
         }
         note("为应用指定代理；代理不可用或 TUN 停止时，所选应用会暂停联网，直到代理恢复或你关闭保护。");
@@ -259,6 +259,7 @@ public final class ProtectionActivity extends Activity {
             String failure="";
             boolean persisted = false;
             try{
+                if (!off && !ExperimentalFeatures.enabled(context)) throw new java.io.IOException("请先在「设置 → 开发中功能」开启总开关。");
                 List<Controller.Group> selections=List.of();
                 if(m.status.running())try{selections=Controller.groups().values();}catch(Exception ignored){ }
                 if (!off) {

@@ -313,6 +313,9 @@ public final class ProxyNotificationService extends Service {
         try {
             Module.Status status = Module.notificationStatus();
             NotificationRecovery.sync(this, status);
+            if (status.runtime.protectionDegraded()) {
+                return new Connection("防泄漏规则待恢复", "请检查保护设置", status.running(), false);
+            }
             if (!status.active()) {
                 return new Connection("TUN 已停止", status.protectionArmed ? "防泄漏阻断仍保留" : "暂无节点", false, true);
             }

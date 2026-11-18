@@ -140,6 +140,11 @@ final class Profile {
         return resolvers.getValue().stream().anyMatch(Profile::isLoopbackDns);
     }
 
+    static boolean hasTunBypass(byte[] content) throws IOException {
+        return field(routingRoot(content), "tun") instanceof MappingNode tun
+            && field(tun, "exclude-package") instanceof SequenceNode packages && !packages.getValue().isEmpty();
+    }
+
     static byte[] repairDns(byte[] content) throws IOException {
         MappingNode root = routingRoot(content);
         if (!(field(root, "dns") instanceof MappingNode dns)) return content;
@@ -192,14 +197,14 @@ final class Profile {
         }
         String group = "MinClash";
         for (int suffix = 2; proxyNames.contains(group); suffix++) group = "MinClash " + suffix;
-        String defaults = """
+        String defaults = String.format(java.util.Locale.ROOT, """
             proxy-groups:
               - name: %s
                 type: select
                 include-all: true
             rules:
               - MATCH,%s
-            """.formatted(group, group);
+            """, group, group);
         fields.addAll(((MappingNode) yaml.compose(new StringReader(defaults))).getValue());
     }
 

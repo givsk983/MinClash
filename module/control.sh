@@ -301,13 +301,14 @@ run_supervisor() {
             child=$!
             if save_pid core "$child"; then
                 age=0
+                was_ready=0
                 mode_restored=0
                 while enabled && read_pid core >/dev/null; do
                     if uplink_changed; then
                         log 'System uplink changed. Rebuilding TUN after stable network recovery.'
                         break
                     fi
-                    if tun_ready; then
+                    if tun_ready_for_uplink "$uplink_baseline"; then
                         if [ ! -f "$DATA/protection-core" ]; then
                             protection_command mark || break
                         fi
@@ -326,11 +327,16 @@ run_supervisor() {
                         sync_notification
                         delay=3
                         age=0
+                        was_ready=1
                     else
                         write_state starting
                         age=$((age + 1))
+                        if [ "$was_ready" = 1 ] && [ "$age" -ge 2 ]; then
+                            log 'Required TUN routing disappeared. Rebuilding the connection.'
+                            break
+                        fi
                         if [ "$age" -ge 15 ]; then
-                            log 'TUN did not become ready within 45 seconds.'
+                            log 'TUN IPv4 or required IPv6 routes did not become ready within 45 seconds.'
                             break
                         fi
                     fi
@@ -365,6 +371,7 @@ start() {
     [ -x "$IP" ] || fail 'The Android ip command is unavailable.'
     read_pid daemon >/dev/null && return 0
     protection_command hold && protection_command activate || fail '无法建立完整防泄漏保护；TUN 未启动。请检查保护设置。'
+    rm -f "$DATA/protection-degraded"
     write_state starting || fail 'Cannot write MinClash state.'
     "$BB" nohup "$BB" sh "$MODDIR/control.sh" run "${1:-manual}" </dev/null >> "$LOG" 2>&1 9>&- &
     count=0
@@ -446,7 +453,11 @@ case "${1:-}" in
         core_up=0
         if read_pid core >/dev/null; then echo core_running=1; core_up=1; fi
         if tun_ready; then echo tun4=1; fi
-        if tun6_ready; then echo tun6=1; fi
+        if tun6_ready; then
+            echo tun6=1
+        elif [ "$core_up" = 1 ] && has_ipv6_uplink "$(uplink_routes)"; then
+            echo tun6_required=1
+        fi
         if [ -S "$SOCKET" ] && read_pid core >/dev/null; then echo controller_ready=1; fi
         if [ -s "$PROFILE" ]; then echo profile=1; else echo profile=0; fi
         if [ -e "$DATA/boot-off" ]; then echo boot=0; else echo boot=1; fi
@@ -464,7 +475,14 @@ case "${1:-}" in
         if [ -f "$DATA/notification-on" ]; then echo notification_enabled=1; fi
         echo validate=1
         echo protection=1
-        if [ -f "$DATA/protection-owned" ]; then echo protection_armed=1; fi
+        if [ -f "$DATA/protection-owned" ]; then
+            if [ -f "$DATA/protection-degraded" ]; then
+                echo protection_degraded=1
+            else
+                echo protection_armed=1
+            fi
+        fi
+        echo traffic_summary=1
         keepalive_status "$core_up"
         exit ;;
     logs)
@@ -474,6 +492,9 @@ case "${1:-}" in
         exit ;;
     protection-get) protection_command get; exit ;;
     protection-policy) protection_command policy; exit ;;
+    protection-watch)
+        [ -f "$DATA/protection-owned" ] || exit 0
+        if [ ! -f "$DATA/protection-degraded" ] && protection_command check; then exit 0; fi ;;
 esac
 
 exec 9>"$DATA/action.lock"
@@ -481,12 +502,30 @@ lock_fd 9 || fail 'Another MinClash operation is in progress or flock is unavail
 case "${1:-}" in
     protection-early) protection_command hold ;;
     protection-restore) protection_command hold && protection_command activate ;;
+    protection-watch)
+        if [ -f "$DATA/protection-owned" ]; then
+            repair=repair
+            if read_pid core >/dev/null; then repair=repair-running; fi
+            if protection_command "$repair"; then
+                rm -f "$DATA/protection-degraded"
+            else
+                [ -f "$DATA/protection-degraded" ] || log 'Could not verify or restore the application protection firewall.'
+                : > "$DATA/protection-degraded"
+                exit 1
+            fi
+        fi ;;
     protection-set) set_protection set ;;
     protection-off) set_protection off ;;
     boot) protection_command hold && protection_command activate || fail '无法恢复防泄漏规则。'; if [ ! -e "$DATA/boot-off" ] && [ -s "$PROFILE" ]; then start boot; fi ;;
     start) start ;;
     stop) stop ;;
     import|validate) check_profile "$1" ;;
+    clear-profile)
+        enabled || fail 'Enable the MinClash module before restoring a profile.'
+        if read_pid daemon >/dev/null || read_pid core >/dev/null; then
+            fail 'Stop TUN before clearing the profile.'
+        fi
+        rm -f "$PROFILE" ;;
     api) api ;;
     mode-rule|mode-global|mode-direct) set_mode "${1#mode-}" ;;
     boot-on) rm -f "$DATA/boot-off" ;;

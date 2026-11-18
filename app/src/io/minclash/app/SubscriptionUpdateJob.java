@@ -70,11 +70,12 @@ public final class SubscriptionUpdateJob extends JobService {
         SharedPreferences preferences = preferences();
         try {
             if (active != params || !preferences.getBoolean(ENABLED, false)) { finish(params, null, request); return; }
+            if (new BackupStore(this).recoverPending()) { finish(params, null, request); return; }
             RoutingStore routing = new RoutingStore(this);
             SubscriptionCatalog.Entry current = new SubscriptionCatalog(preferences, routing).load().active();
             if (current == null) { finish(params, null, request); return; }
             Module.Status status = Module.status();
-            if (!status.enabled || !status.profile || !status.state.equals("running") && !status.state.equals("stopped")) {
+            if (!canRefresh(status)) {
                 finish(params, "跳过，模块或配置未就绪", request);
                 return;
             }
@@ -90,6 +91,8 @@ public final class SubscriptionUpdateJob extends JobService {
         try {
             Subscription.Download downloaded = Subscription.download(current.address(), request);
             RoutingStore.WORKER.execute(() -> apply(params, current, generation, downloaded, request));
+        } catch (Subscription.SecureRequired error) {
+            finish(params, "旧 HTTP 订阅已跳过，请添加 HTTPS 链接", request);
         } catch (Exception error) {
             finish(params, "更新失败，请在配置页手动重试", request);
         }
@@ -100,6 +103,7 @@ public final class SubscriptionUpdateJob extends JobService {
         String outcome = null;
         try {
             if (active != params || !preferences.getBoolean(ENABLED, false)) return;
+            BackupStore.requireResolved(this);
             request.seal();
             RoutingStore routing = new RoutingStore(this);
             SubscriptionCatalog.Entry latest = new SubscriptionCatalog(preferences, routing).load().active();
@@ -112,7 +116,7 @@ public final class SubscriptionUpdateJob extends JobService {
                 return;
             }
             Module.Status status = Module.status();
-            if (!status.enabled || !status.profile || !status.state.equals("running") && !status.state.equals("stopped")) {
+            if (!canRefresh(status)) {
                 outcome = "跳过，模块或配置未就绪";
                 return;
             }
@@ -125,6 +129,10 @@ public final class SubscriptionUpdateJob extends JobService {
         } finally {
             finish(params, outcome, request);
         }
+    }
+
+    private static boolean canRefresh(Module.Status status) {
+        return status.enabled && status.profile && (status.running() || status.phase() == Module.Phase.STOPPED);
     }
 
     private void finish(JobParameters params, String outcome, DownloadRequest request) {

@@ -21,5 +21,6 @@ set_protection() {
     else
         protection_command activate || fail '防火墙或应用 UID 校验失败；已保持阻断，请重新选择应用或关闭保护。'
     fi
+    rm -f "$DATA/protection-degraded"
     if [ "$was_running" = 1 ]; then start; fi
 }

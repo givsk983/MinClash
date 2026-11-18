@@ -35,4 +35,39 @@
         <item name="android:textColorPrimary">#EDF4F7</item>
         <item name="android:textColorSecondary">#9BAEBC</item>
     </style>
+    <style name="AppThemeLight" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#006B55</item>
+        <item name="android:windowBackground">#F6F8FA</item>
+        <item name="android:colorBackground">#FFFFFF</item>
+        <item name="android:textColorPrimary">#182630</item>
+        <item name="android:textColorSecondary">#566875</item>
+        <item name="android:statusBarColor">#F6F8FA</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:alertDialogTheme">@style/AppDialogLight</item>
+    </style>
+    <style name="AppDialogLight" parent="android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#006B55</item>
+        <item name="android:colorBackground">#FFFFFF</item>
+        <item name="android:windowBackground">@drawable/dialog_background_light</item>
+        <item name="android:windowMinWidthMinor">88%</item>
+        <item name="android:windowMinWidthMajor">70%</item>
+        <item name="android:textColorPrimary">#182630</item>
+        <item name="android:textColorSecondary">#566875</item>
+    </style>
+    <style name="ProxyQuickControlsLight" parent="android:style/Theme.Material.Light.Dialog.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#006B55</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@drawable/dialog_background_light</item>
+        <item name="android:windowMinWidthMinor">88%</item>
+        <item name="android:windowMinWidthMajor">62%</item>
+        <item name="android:backgroundDimAmount">0.28</item>
+        <item name="android:windowSoftInputMode">stateAlwaysHidden|adjustResize</item>
+        <item name="android:alertDialogTheme">@style/AppDialogLight</item>
+    </style>
 </resources>

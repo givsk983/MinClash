@@ -17,7 +17,6 @@ import static io.minclash.app.AppUi.*;
 
 /** Both layouts bind the same snapshot; neither depends on TUN state. */
 final class SubscriptionCard extends LinearLayout {
-    private static final int RED = 0xffff9a9e;
     private final AppUi ui;
     private final TextView name, largeRemaining, largeExpiry, largeDate, compactRemaining, compactExpiry, compactDate;
     private final TextView used, total, percent, warning, freshness, reminder, badge;
@@ -34,7 +33,7 @@ final class SubscriptionCard extends LinearLayout {
         name = ui.label("当前订阅", 14, TEXT, true);
         heading.addView(name, new LayoutParams(0, -2, 1));
         badge = ui.label("当前使用", 11, MINT, true);
-        badge.setPadding(ui.dp(8), ui.dp(4), ui.dp(8), ui.dp(4)); badge.setBackground(ui.shape(0xff203a35, 8));
+        badge.setPadding(ui.dp(8), ui.dp(4), ui.dp(8), ui.dp(4)); badge.setBackground(ui.shape(AppUi.tone(0xff203a35, 0xffdff2e9), 8));
         heading.addView(badge); ui.add(this, heading, 0);
 
         quota = ui.column();

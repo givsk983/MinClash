@@ -40,7 +40,7 @@ final class KeepAliveDialog {
                 boolean checked = CHOICES[i].mode() == selected[0];
                 cards[i].setSelected(checked);
                 indicators[i].setChecked(checked);
-                GradientDrawable shape = ui.shape(checked ? 0xff1b3430 : AppUi.BG, 14);
+                GradientDrawable shape = ui.shape(checked ? AppUi.tone(0xff1b3430, 0xffe2f2ea) : AppUi.BG, 14);
                 shape.setStroke(ui.dp(checked ? 2 : 1), checked ? AppUi.MINT : AppUi.BORDER);
                 cards[i].setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9), shape, null));
             }
@@ -82,7 +82,7 @@ final class KeepAliveDialog {
             if (choice.mode() == TcpKeepAlive.Mode.BALANCED) {
                 TextView badge = ui.label("推荐", 11, AppUi.MINT, true);
                 badge.setPadding(ui.dp(7), ui.dp(2), ui.dp(7), ui.dp(2));
-                badge.setBackground(ui.shape(0xff203a35, 6));
+                badge.setBackground(ui.shape(AppUi.tone(0xff203a35, 0xffdff2e9), 6));
                 heading.addView(badge);
             }
             ui.add(content, heading, 0);
