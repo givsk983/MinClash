@@ -1,9 +1,13 @@
 package io.minclash.app;
 
+import android.content.Context;
+import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -16,6 +20,7 @@ final class TrafficMonitor {
     static final long HISTORY_MS = 600_000;
     static final long MAX_SAMPLE_GAP_MS = 10_000;
     private static final long POLL_MS = 2_000;
+    private static final long SAVE_MS = 30_000;
 
     record Reading(long time, String session, long uploaded, long downloaded, int connections, long memory) {}
     record Rate(long time, long upload, long download) {}
@@ -35,13 +40,24 @@ final class TrafficMonitor {
     private int revision;
     private Reading previous;
     private Rate latest;
+    private List<DailyTraffic.Day> daily = Collections.emptyList();
+    // The traffic worker owns the persisted baseline and checkpoints.
+    private SharedPreferences historyPreferences;
+    private DailyTraffic dailyTraffic;
+    private long lastSave;
 
     private TrafficMonitor() {}
 
-    void observe(Observer observer, boolean details) {
+    void observe(Context context, Observer observer, boolean details) {
         if (this.observer == observer) return;
         this.observer = observer;
         this.details = details;
+        Context application = context.getApplicationContext();
+        worker.execute(() -> {
+            if (dailyTraffic != null) return;
+            historyPreferences = application.getSharedPreferences("daily_traffic", Context.MODE_PRIVATE);
+            dailyTraffic = new DailyTraffic(historyPreferences.getString("samples", "[]"));
+        });
         long now = SystemClock.elapsedRealtime();
         prune(now);
         if (ready && latest != null && now - latest.time() < 2 * interval()) observer.onTraffic(previous, latest);
@@ -53,9 +69,11 @@ final class TrafficMonitor {
         if (this.observer != observer) return;
         this.observer = null;
         main.removeCallbacks(poll);
+        worker.execute(this::saveDailyTraffic);
     }
 
     List<Rate> history() { return history; }
+    List<DailyTraffic.Day> daily() { return daily; }
 
     void updateStatus(Module.Status status) {
         boolean nextReady = status != null && status.running() && status.control;
@@ -89,6 +107,11 @@ final class TrafficMonitor {
         worker.execute(() -> {
             Reading reading = canSample ? read(useSummary, includeMemory) : null;
             Module.Status checked = includeMemory && reading == null ? checkStatus() : null;
+            long now = System.currentTimeMillis();
+            ZoneId zone = ZoneId.systemDefault();
+            if (reading != null) dailyTraffic.record(reading.session(), now, zone, reading.uploaded(), reading.downloaded());
+            if (SystemClock.elapsedRealtime() - lastSave >= SAVE_MS) saveDailyTraffic();
+            List<DailyTraffic.Day> recent = includeMemory ? dailyTraffic.recent(now, zone) : null;
             main.post(() -> {
                 pending = false;
                 if (observer == null) return;
@@ -97,10 +120,18 @@ final class TrafficMonitor {
                     return;
                 }
                 if (checked != null) updateStatus(checked);
+                if (recent != null) daily = recent;
                 publish(reading);
                 schedule(ready ? interval() : 10_000);
             });
         });
+    }
+
+    private void saveDailyTraffic() {
+        if (dailyTraffic == null) return;
+        String state = dailyTraffic.checkpoint();
+        if (state != null) historyPreferences.edit().putString("samples", state).apply();
+        lastSave = SystemClock.elapsedRealtime();
     }
 
     private static Module.Status checkStatus() {

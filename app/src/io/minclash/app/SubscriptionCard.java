@@ -20,6 +20,7 @@ final class SubscriptionCard extends LinearLayout {
     private final AppUi ui;
     private final TextView name, largeRemaining, largeExpiry, largeDate, compactRemaining, compactExpiry, compactDate;
     private final TextView used, total, percent, warning, freshness, reminder, badge;
+    private final TextView update;
     private final LinearLayout quota, dual;
     private final Meter meter;
     private final Button refresh;
@@ -70,6 +71,7 @@ final class SubscriptionCard extends LinearLayout {
 
         warning = ui.label("", 12, AMBER, false); ui.add(this, warning, 12);
         freshness = ui.label("", 11, MUTED, false); ui.add(this, freshness, 14);
+        update = ui.label("", 12, MUTED, false); ui.add(this, update, 8);
         reminder = ui.label("", 12, MUTED, false);
         if (settings != null) {
             reminder.setPadding(0, ui.dp(10), 0, ui.dp(10)); reminder.setMinHeight(ui.dp(44));
@@ -115,6 +117,9 @@ final class SubscriptionCard extends LinearLayout {
             + (usage.remaining() == 0 ? "流量已用尽，请检查服务商套餐。" : "剩余流量不足，请留意套餐余量。");
         warning.setText(notice); warning.setVisibility(notice.isEmpty() ? GONE : VISIBLE);
         freshness.setText(usage.freshness(now));
+        SubscriptionUpdateStatus.Result config = SubscriptionUpdateStatus.load(prefs, entry.address());
+        update.setText(config.summary(getContext()));
+        update.setTextColor(config.failed() ? AMBER : MUTED);
         reminder.setText(SubscriptionReminders.summary(getContext(), prefs, usage) + "  ›");
         if (refresh != null) { refresh.setEnabled(!refreshing); refresh.setText(refreshing ? "读取中…" : "刷新用量"); }
     }

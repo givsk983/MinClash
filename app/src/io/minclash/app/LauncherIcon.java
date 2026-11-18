@@ -8,15 +8,17 @@ import java.util.ArrayList;
 import java.util.List;
 
 enum LauncherIcon {
-    GRAPHITE("石墨灰", "LauncherGraphite", "ic_launcher"),
-    BLACK("纯黑", "LauncherBlack", "ic_launcher_black"),
-    GREEN("深墨绿", "LauncherGreen", "ic_launcher_green");
+    GRAPHITE("石墨灰", "LauncherGraphite", R.drawable.ic_launcher),
+    BLACK("纯黑", "LauncherBlack", R.drawable.ic_launcher_black),
+    GREEN("深墨绿", "LauncherGreen", R.drawable.ic_launcher_green),
+    BRIGHT_GREEN("绿底白标", "LauncherBrightGreen", R.drawable.ic_launcher_bright_green),
+    WHITE("白底黑线", "LauncherWhite", R.drawable.ic_launcher_white);
 
     final String label;
-    final String drawable;
+    final int drawable;
     private final String alias;
 
-    LauncherIcon(String label, String alias, String drawable) {
+    LauncherIcon(String label, String alias, int drawable) {
         this.label = label;
         this.alias = alias;
         this.drawable = drawable;

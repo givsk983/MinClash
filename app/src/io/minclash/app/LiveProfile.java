@@ -3,7 +3,6 @@ package io.minclash.app;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 
 /** Reuse the installed core's reload API; no module replacement or daemon restart. */
 final class LiveProfile {
@@ -29,12 +28,9 @@ final class LiveProfile {
     static byte[] packet(byte[] saved, byte[] runtime, byte[] previous) throws Exception {
         if (saved.length == 0 || runtime.length == 0 || saved.length > Profile.MAX_BYTES || runtime.length > Profile.MAX_BYTES)
             throw new Profile.TooLarge();
-        StringBuilder hash = new StringBuilder(64);
-        for (byte value : MessageDigest.getInstance("SHA-256").digest(previous)) {
-            hash.append(Character.forDigit((value & 255) >>> 4, 16)).append(Character.forDigit(value & 15, 16));
-        }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        bytes.write((saved.length + "\n" + runtime.length + "\n" + hash + "\n").getBytes(StandardCharsets.US_ASCII));
+        bytes.write((saved.length + "\n" + runtime.length + "\n" + Module.profileDigest(previous) + "\n")
+            .getBytes(StandardCharsets.US_ASCII));
         bytes.write(saved);
         bytes.write(runtime);
         return bytes.toByteArray();

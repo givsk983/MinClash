@@ -20,6 +20,25 @@ final class Subscription {
         SecureRequired() { super("请使用服务商的 HTTPS 订阅链接，或下载 YAML 后从本地导入。已启用的配置可继续使用。"); }
     }
 
+    static final class HttpFailure extends IOException {
+        final int status;
+
+        HttpFailure(int status) {
+            super("订阅服务器返回 HTTP " + status + "，请检查链接是否有效。");
+            this.status = status;
+        }
+    }
+
+    static final class ConfigFailure extends IOException {
+        ConfigFailure(IOException cause) {
+            super("无法导入订阅，请使用机场提供的 Clash / Mihomo YAML 链接。\n" + cause.getMessage(), cause);
+        }
+    }
+
+    static final class TlsFailure extends IOException {
+        TlsFailure() { super("订阅服务器的 TLS 连接失败。请检查手机时间、服务器证书和订阅链接。"); }
+    }
+
     static final class NetworkFailure extends IOException {
         enum Kind { DNS, TIMEOUT, CONNECT }
         final Kind kind;
@@ -91,7 +110,7 @@ final class Subscription {
                     url = requireSecure(next);
                     continue;
                 }
-                if (status != 200) throw new IOException("订阅服务器返回 HTTP " + status + "，请检查链接是否有效。");
+                if (status != 200) throw new HttpFailure(status);
                 SubscriptionUsage usage = SubscriptionUsage.parse(connection.getHeaderField("Subscription-Userinfo"), System.currentTimeMillis());
                 if (!includeConfig) return new Download(null, usage);
                 if (connection.getContentLengthLong() > Profile.MAX_BYTES) {
@@ -124,8 +143,7 @@ final class Subscription {
                     return new Download(source, usage);
                 } catch (IOException error) {
                     if (error instanceof DownloadRequest.Cancelled || error instanceof DownloadRequest.Expired) throw error;
-                    throw new IOException("无法导入订阅，请使用机场提供的 Clash / Mihomo YAML 链接。\n"
-                        + error.getMessage());
+                    throw new ConfigFailure(error);
                 }
             } finally {
                 request.detach(connection);
@@ -155,7 +173,7 @@ final class Subscription {
 
     private static IOException downloadError(IOException error) {
         if (error instanceof SSLException) {
-            return new IOException("订阅服务器的 TLS 连接失败。请检查手机时间、服务器证书和订阅链接。");
+            return new TlsFailure();
         }
         if (error instanceof UnknownHostException) return new NetworkFailure(NetworkFailure.Kind.DNS, "无法解析订阅服务器域名。请检查网络和 DNS。");
         if (error instanceof SocketTimeoutException) return new NetworkFailure(NetworkFailure.Kind.TIMEOUT, "下载订阅超时。请检查当前网络。");

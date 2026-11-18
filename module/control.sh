@@ -245,17 +245,59 @@ uplink_routes() {
                         if ($i == "linkdown") down = 1
                     }
                     if (!down && dev != "" && dev != tun && dev != "lo" && dev !~ /^dummy/)
-                        print family, dev, via, table
+                        print family, dev, (via == "" ? "-" : via), (table == "" ? "main" : table)
                 }
             '
     done | sort -u
+}
+
+uplink_snapshot() {
+    local routes family
+    routes=$(uplink_routes)
+    [ -n "$routes" ] || return 0
+    # Android can switch the default lookup rule while both physical route tables stay installed.
+    # Prefer the selected table when it matches a live route. Keep all routes for families
+    # where Android's rule is missing, ambiguous, or uses a different table representation.
+    for family in -4 -6; do
+        "$IP" "$family" rule show 2>/dev/null |
+            awk -v routes="$routes" -v family="$family" -v tun_table="$TABLE" -v tun="$IFACE" '
+                BEGIN {
+                    size = split(routes, rows, "\n")
+                    for (i = 1; i <= size; i++) {
+                        split(rows[i], columns)
+                        if (columns[1] != family) continue
+                        fallback = fallback rows[i] "\n"
+                        by_table[columns[4]] = by_table[columns[4]] rows[i] "\n"
+                    }
+                }
+                NF == 9 && $2 == "from" && $3 == "all" && $4 == "fwmark" &&
+                $6 == "iif" && $7 == "lo" && $8 == "lookup" && $9 != tun_table && $9 != tun {
+                    if ($5 ~ /^0x(0|[[:xdigit:]]+0000)\/0x[[:xdigit:]]*ffff$/) {
+                        tables[++count] = $9
+                        marks[count] = $5
+                    } else if ($5 ~ /^0x[[:xdigit:]]+\/0x[[:xdigit:]]*[13579bBdDfF]ffff$/) {
+                        # Android can assign a new netId while reusing the interface and table.
+                        net_ids[$9] = net_ids[$9] " " $5
+                    }
+                }
+                END {
+                    if (fallback == "") exit
+                    if (count == 1 && (tables[1] in by_table))
+                        printf "%s", by_table[tables[1]]
+                    else
+                        printf "%s", fallback
+                    for (i = 1; i <= count; i++)
+                        print "default-rule", family, marks[i], tables[i] net_ids[tables[i]]
+                }
+            '
+    done
 }
 
 wait_boot_uplink() {
     local previous= current
     log 'Waiting for a stable system uplink at boot.'
     while enabled; do
-        current=$(uplink_routes)
+        current=$(uplink_snapshot)
         if [ -n "$current" ] && [ "$current" = "$previous" ]; then
             boot_uplink="$current"
             return 0
@@ -276,6 +318,7 @@ trim_log() {
 
 run_supervisor() {
     local boot_uplink= uplink_baseline= uplink_candidate= uplink_samples=0 uplink_missing=0 uplink_restart_after=0
+    local delay=3 handoff child startup_deadline age was_ready mode_restored
     exec 8>"$DATA/daemon.lock"
     lock_fd 8 || exit 0
     trap 'stop_core && clean_routes; write_state stopped; rm -f "$DATA/daemon.pid"' EXIT
@@ -289,23 +332,26 @@ run_supervisor() {
         wait_boot_uplink || return 0
     fi
     export SKIP_SYSTEM_IPV6_CHECK=1
-    delay=3
     while enabled; do
+        handoff=0
         write_state starting
+        uplink_watch_reset
         if check_routes; then
             printf '%s\n' "$BOOT_ID" > "$DATA/routes-owned" || fail 'Cannot record routing ownership.'
             prepare_tether_dns && prepare_forwarding || fail 'Could not preserve Android tethering routes and DNS.'
-            uplink_watch_reset
             prepare_keepalive || fail 'Cannot save TCP keepalive state.'
             "$CORE" -d "$DATA" -f "$PROFILE" -ext-ctl-unix "$SOCKET" </dev/null >> "$LOG" 2>&1 8>&- &
             child=$!
             if save_pid core "$child"; then
+                startup_deadline=$(($(runtime_now) + 45))
                 age=0
                 was_ready=0
                 mode_restored=0
                 while enabled && read_pid core >/dev/null; do
                     if uplink_changed; then
                         log 'System uplink changed. Rebuilding TUN after stable network recovery.'
+                        write_state starting
+                        handoff=1
                         break
                     fi
                     if tun_ready_for_uplink "$uplink_baseline"; then
@@ -335,29 +381,30 @@ run_supervisor() {
                             log 'Required TUN routing disappeared. Rebuilding the connection.'
                             break
                         fi
-                        if [ "$age" -ge 15 ]; then
+                        if [ "$was_ready" = 0 ] && [ "$(runtime_now)" -ge "$startup_deadline" ]; then
                             log 'TUN IPv4 or required IPv6 routes did not become ready within 45 seconds.'
                             break
                         fi
                     fi
                     trim_log
-                    sleep 3
+                    if [ "$was_ready" = 1 ]; then sleep 3; else sleep 1; fi
                 done
             else
                 kill -TERM "$child" 2>/dev/null || :
                 wait "$child" 2>/dev/null || :
             fi
             stop_core && clean_routes || fail 'Could not stop the previous core.'
+            [ "$handoff" = 0 ] || continue
         fi
         enabled || break
         write_state retrying
         log "Mihomo TUN inactive. Retrying in ${delay}s."
         trim_log
-        sleep "$delay" &
-        pause=$!
-        trap 'kill "$pause" 2>/dev/null || :; exit 0' TERM INT
-        wait "$pause"
-        trap 'exit 0' TERM INT
+        if wait_retry_uplink "$delay" "$uplink_baseline"; then
+            log 'System uplink changed. Rebuilding TUN before retry delay elapsed.'
+            delay=3
+            continue
+        fi
         delay=$((delay * 2))
         [ "$delay" -le 60 ] || delay=60
     done
@@ -401,10 +448,15 @@ check_profile() {
     if [ "$1" = import ] && { read_pid daemon >/dev/null || read_pid core >/dev/null; }; then
         fail 'Stop TUN before replacing the profile.'
     fi
-    local operation="$1" candidate expected validation result
+    local operation="$1" candidate expected validation result profile_hash current
     read -r expected || fail 'No profile length was received.'
     case "$expected" in ''|*[!0-9]*) fail 'Invalid profile length.' ;; esac
     [ "$expected" -gt 0 ] && [ "$expected" -le "$LIMIT" ] || fail 'Profile must be 1 byte to 2 MiB.'
+    if [ "$operation" = replace-profile ]; then
+        read -r profile_hash || fail 'MINCLASH_PROFILE_REPLACE_STALE'
+        current=$(sha256sum "$PROFILE" 2>/dev/null) || fail 'MINCLASH_PROFILE_REPLACE_STALE'
+        [ "${current%% *}" = "$profile_hash" ] || fail 'MINCLASH_PROFILE_REPLACE_STALE'
+    fi
     candidate=$(mktemp "$DATA/import.XXXXXX") || fail 'Cannot create temporary profile.'
     validation="$candidate.log"
     trap 'rm -f "$candidate" "$validation"' EXIT
@@ -431,9 +483,22 @@ check_profile() {
             fi
             fail 'MINCLASH_PROFILE_REJECTED' ;;
     esac
-    if [ "$operation" = import ]; then
-        mv -f "$candidate" "$PROFILE" || fail 'Could not save profile.'
-    fi
+    case "$operation" in
+        replace-profile)
+            # Validate the root-owned file while TUN is running. Keep the action
+            # lock across shutdown and atomic replacement with those exact bytes.
+            if ! { read_pid daemon >/dev/null || read_pid core >/dev/null ||
+                [ "$(cat "$DATA/routes-owned" 2>/dev/null)" = "$BOOT_ID" ] ||
+                [ "$(cat "$DATA/forwarding-owned" 2>/dev/null)" = "$BOOT_ID" ]; }; then
+                fail 'MINCLASH_PROFILE_REPLACE_STATE'
+            fi
+            stop || fail 'Could not stop TUN before replacing the profile.'
+            mv -f "$candidate" "$PROFILE" || fail 'Could not save profile.' ;;
+        import)
+            mv -f "$candidate" "$PROFILE" || fail 'Could not save profile.' ;;
+    esac
+    rm -f "$candidate" "$validation"
+    trap - EXIT
 }
 
 case "${1:-}" in
@@ -474,6 +539,7 @@ case "${1:-}" in
         echo notification_recovery=1
         if [ -f "$DATA/notification-on" ]; then echo notification_enabled=1; fi
         echo validate=1
+        echo replace_profile=1
         echo protection=1
         if [ -f "$DATA/protection-owned" ]; then
             if [ -f "$DATA/protection-degraded" ]; then
@@ -519,7 +585,7 @@ case "${1:-}" in
     boot) protection_command hold && protection_command activate || fail '无法恢复防泄漏规则。'; if [ ! -e "$DATA/boot-off" ] && [ -s "$PROFILE" ]; then start boot; fi ;;
     start) start ;;
     stop) stop ;;
-    import|validate) check_profile "$1" ;;
+    import|validate|replace-profile) check_profile "$1" ;;
     clear-profile)
         enabled || fail 'Enable the MinClash module before restoring a profile.'
         if read_pid daemon >/dev/null || read_pid core >/dev/null; then

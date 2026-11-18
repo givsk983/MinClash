@@ -9,6 +9,9 @@ import android.os.Process;
 import java.util.concurrent.TimeUnit;
 
 final class ForegroundApp {
+    record App(String packageName, String label) {}
+    static final App UNKNOWN = new App(null, "当前应用 · 未知");
+
     private final Context context;
     private long lastQuery;
     private long lastEvent;
@@ -23,20 +26,20 @@ final class ForegroundApp {
             == AppOpsManager.MODE_ALLOWED;
     }
 
-    String label() {
+    App current() {
         if (!allowed(context)) {
             lastQuery = 0;
             lastEvent = 0;
             packageName = null;
             label = null;
-            return "当前应用 · 未授权";
+            return new App(null, "当前应用 · 未授权");
         }
         long now = System.currentTimeMillis();
         long lookback = now - TimeUnit.HOURS.toMillis(24);
         if (lastQuery > now) lastEvent = 0;
         long start = lastQuery > 0 && lastQuery <= now ? Math.max(lookback, lastQuery - 5000) : lookback;
         UsageEvents events = context.getSystemService(UsageStatsManager.class).queryEvents(start, now);
-        if (events == null) return "当前应用 · 未知";
+        if (events == null) return UNKNOWN;
         lastQuery = now;
         UsageEvents.Event event = new UsageEvents.Event();
         String foreground = packageName;
@@ -59,6 +62,6 @@ final class ForegroundApp {
                 label = null;
             }
         }
-        return label == null ? "当前应用 · 未知" : label;
+        return packageName == null ? UNKNOWN : new App(packageName, label == null ? packageName : label);
     }
 }

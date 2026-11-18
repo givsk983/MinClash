@@ -40,7 +40,7 @@ final class RoutingStore {
     record State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules,
                  Set<String> bypassedApps) {
         State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules) {
-            this(source, applications, subscription, rules, Set.of());
+            this(source, applications, subscription, rules, Collections.emptySet());
         }
         State(byte[] source, Map<String, String> applications, String subscription) {
             this(source, applications, subscription, Collections.emptyList());
@@ -120,7 +120,7 @@ final class RoutingStore {
             String name = keys.next();
             applications.put(name, rules.getString(name));
         }
-        Set<String> bypassed = version < 3 ? Set.of() : TunBypass.parse(object.getJSONArray("bypassedApps"));
+        Set<String> bypassed = version < 3 ? Collections.emptySet() : TunBypass.parse(object.getJSONArray("bypassedApps"));
         TunBypass.validate(bypassed, applications);
         return new State(Profile.normalize(object.getString("source").getBytes(StandardCharsets.UTF_8)), applications,
             object.optString("subscription", null), PersonalRules.parse(version == 1 ? null : object.getJSONArray("personalRules")), bypassed);
@@ -189,24 +189,23 @@ final class RoutingStore {
         generation++;
     }
 
-    void apply(State state) throws Exception {
-        apply(state, false);
+    enum ApplyMethod { UNCHANGED, SAVED, RELOADED, RESTARTED }
+
+    ApplyMethod apply(State state) throws Exception {
+        return apply(state, false);
     }
 
-    void apply(State state, boolean recreateTun) throws Exception {
+    ApplyMethod apply(State state, boolean recreateTun) throws Exception {
         BackupStore.requireResolved(context);
-        applyState(state, recreateTun);
+        checkExperimentalAccess(state);
+        byte[] merged = Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps());
+        return apply(merged, state, recreateTun);
     }
 
     void applyBackup(State state) throws Exception {
         checkExperimentalAccess(state);
         byte[] merged = Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps());
         apply(merged, state, false, true);
-    }
-
-    private void applyState(State state, boolean recreateTun) throws Exception {
-        checkExperimentalAccess(state);
-        apply(Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps()), state, recreateTun);
     }
 
     void checkExperimentalAccess(State state) throws Exception {
@@ -217,11 +216,11 @@ final class RoutingStore {
         apply(merged, state, false);
     }
 
-    private void apply(byte[] merged, State state, boolean recreateTun) throws Exception {
-        apply(merged, state, recreateTun, false);
+    private ApplyMethod apply(byte[] merged, State state, boolean recreateTun) throws Exception {
+        return apply(merged, state, recreateTun, false);
     }
 
-    private void apply(byte[] merged, State state, boolean recreateTun, boolean restoringBackup) throws Exception {
+    private ApplyMethod apply(byte[] merged, State state, boolean recreateTun, boolean restoringBackup) throws Exception {
         Module.Status before = Module.status();
         if (restoringBackup && before.phase() != Module.Phase.STOPPED) throw new IOException("请先停止 TUN。");
         if (state != null && !state.bypassedApps().isEmpty()) {
@@ -233,7 +232,7 @@ final class RoutingStore {
         byte[] previous = before.profile ? Module.readProfile() : null;
         if (!recreateTun && before.enabled && Arrays.equals(merged, previous)) {
             if (state != null) save(state);
-            return;
+            return ApplyMethod.UNCHANGED;
         }
         boolean reconnect = before.installed() && !before.state.equals("stopped");
         List<Controller.Group> selections = before.state.equals("running") && before.control
@@ -259,17 +258,30 @@ final class RoutingStore {
                     Controller.restoreSelections(selections);
                 }
             });
-            return;
+            return ApplyMethod.RELOADED;
         }
-        if (reconnect && before.validate) Module.run(Module.Command.VALIDATE, merged);
-        if (reconnect) Module.run(Module.Command.STOP, null);
+        boolean staged = reconnect && before.replaceProfile && previous != null;
+        if (!staged) {
+            if (reconnect && before.validate) Module.run(Module.Command.VALIDATE, merged);
+            if (reconnect) Module.run(Module.Command.STOP, null);
+        }
         boolean imported = false;
         try {
-            Module.run(Module.Command.IMPORT, merged);
+            if (staged) Module.replaceProfile(merged, previous);
+            else Module.run(Module.Command.IMPORT, merged);
             imported = true;
             if (reconnect) restart(before.control);
             if (state != null) save(state);
         } catch (Exception error) {
+            if (staged && !imported) {
+                if (error instanceof Module.ProfileFailure || error instanceof Module.ProfileUnchanged) throw error;
+                // A lost Root reply can leave the candidate committed or the original
+                // config stopped. A preflight failure with TUN still running needs no rollback.
+                Module.Status current = Module.status();
+                byte[] installed = current.profile ? Module.readProfile() : null;
+                imported = Arrays.equals(installed, merged);
+                if (!imported && (!Arrays.equals(installed, previous) || current.active())) throw error;
+            }
             try {
                 if (imported && reconnect) Module.run(Module.Command.STOP, null);
                 if (imported && previous != null) Module.run(Module.Command.IMPORT, previous);
@@ -292,6 +304,7 @@ final class RoutingStore {
                 throw new SelectionRestoreFailure(error);
             }
         }
+        return reconnect ? ApplyMethod.RESTARTED : ApplyMethod.SAVED;
     }
 
     static boolean canReload(Module.Status status, State saved, State changed, byte[] installed) throws Exception {

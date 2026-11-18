@@ -10,7 +10,7 @@ tun_ready_for_uplink() {
 }
 
 uplink_watch_reset() {
-    uplink_baseline=$(uplink_routes)
+    uplink_baseline=$(uplink_snapshot)
     uplink_candidate=
     uplink_samples=0
     uplink_missing=0
@@ -19,7 +19,7 @@ uplink_watch_reset() {
 
 uplink_changed() {
     local next now
-    next=$(uplink_routes)
+    next=$(uplink_snapshot)
     if [ -z "$next" ]; then
         uplink_missing=1
         uplink_candidate=
@@ -38,8 +38,29 @@ uplink_changed() {
     [ "$now" -ge "$uplink_restart_after" ] || return 1
     uplink_baseline="$next"
     uplink_missing=0
-    uplink_restart_after=$((now + 30))
+    uplink_restart_after=$((now + 6))
     return 0
+}
+
+wait_retry_uplink() {
+    local remaining="$1" failed_uplink="$2" next candidate= interval pause
+    while enabled; do
+        next=$(uplink_snapshot)
+        if [ -n "$next" ] && [ "$next" != "$failed_uplink" ] && [ "$next" = "$candidate" ]; then
+            return 0
+        fi
+        candidate="$next"
+        [ "$remaining" -gt 0 ] || break
+        interval="$remaining"
+        [ "$interval" -le 3 ] || interval=3
+        sleep "$interval" &
+        pause=$!
+        trap 'kill "$pause" 2>/dev/null || :; exit 0' TERM INT
+        wait "$pause"
+        trap 'exit 0' TERM INT
+        remaining=$((remaining - interval))
+    done
+    return 1
 }
 
 notification_user() {

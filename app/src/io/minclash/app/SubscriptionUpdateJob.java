@@ -17,9 +17,18 @@ public final class SubscriptionUpdateJob extends JobService {
     private static final String LAST_ATTEMPT = "auto_subscription_attempt";
     private static final String LAST_OUTCOME = "auto_subscription_outcome";
     private static final int JOB_ID = 102;
+    private static final long RETRY_DELAY_MS = 15_000;
     private volatile JobParameters active;
     private volatile DownloadRequest downloadRequest;
     private final Handler main = new Handler(Looper.getMainLooper());
+    private Runnable pendingRetry;
+    record Attempt(String address, int generation, long id, boolean retried) {
+        boolean stillCurrent(String activeAddress, int currentGeneration) {
+            return address.equals(activeAddress) && generation == currentGeneration;
+        }
+
+        Attempt retry() { return new Attempt(address, generation, id, true); }
+    }
 
     static boolean schedule(Context context, boolean enabled) {
         JobScheduler scheduler = context.getSystemService(JobScheduler.class);
@@ -46,88 +55,126 @@ public final class SubscriptionUpdateJob extends JobService {
     }
 
     @Override public boolean onStartJob(JobParameters params) {
+        cancelRetry();
         if (downloadRequest != null) downloadRequest.cancel();
         DownloadRequest request = new DownloadRequest();
         downloadRequest = request;
         active = params;
-        RoutingStore.WORKER.execute(() -> refresh(params, request));
+        RoutingStore.WORKER.execute(() -> refresh(params, request, null));
         return true;
     }
 
     @Override public boolean onStopJob(JobParameters params) {
         if (active == params) {
+            cancelRetry();
             active = null;
             if (downloadRequest != null) downloadRequest.cancel();
+            downloadRequest = null;
         }
         return preferences().getBoolean(ENABLED, false);
+    }
+
+    @Override public void onDestroy() {
+        cancelRetry();
+        active = null;
+        if (downloadRequest != null) downloadRequest.cancel();
+        downloadRequest = null;
+        super.onDestroy();
+    }
+
+    private void cancelRetry() {
+        if (pendingRetry != null) main.removeCallbacks(pendingRetry);
+        pendingRetry = null;
     }
 
     private SharedPreferences preferences() {
         return getSharedPreferences("MainActivity", MODE_PRIVATE);
     }
 
-    private void refresh(JobParameters params, DownloadRequest request) {
+    private boolean isActive(JobParameters params, DownloadRequest request) {
+        return active == params && downloadRequest == request;
+    }
+
+    private void refresh(JobParameters params, DownloadRequest request, Attempt retry) {
         SharedPreferences preferences = preferences();
         try {
-            if (active != params || !preferences.getBoolean(ENABLED, false)) { finish(params, null, request); return; }
+            if (!isActive(params, request) || !preferences.getBoolean(ENABLED, false)) { finish(params, null, request); return; }
             if (new BackupStore(this).recoverPending()) { finish(params, null, request); return; }
             RoutingStore routing = new RoutingStore(this);
             SubscriptionCatalog.Entry current = new SubscriptionCatalog(preferences, routing).load().active();
             if (current == null) { finish(params, null, request); return; }
-            Module.Status status = Module.status();
-            if (!canRefresh(status)) {
-                finish(params, "跳过，模块或配置未就绪", request);
+            int generation = RoutingStore.generation();
+            if (retry != null && !retry.stillCurrent(current.address(), generation)) {
+                finish(params, "跳过，等待重试期间配置或当前订阅已变化", request);
                 return;
             }
-            int generation = RoutingStore.generation();
-            BackgroundWork.DOWNLOADS.execute(() -> download(params, current, generation, request));
+            Attempt attempt = retry == null ? new Attempt(current.address(), generation, SubscriptionUpdateStatus.begin(), false) : retry;
+            Module.Status status = Module.status();
+            if (!canRefresh(status)) {
+                finish(params, "跳过，模块或配置未就绪", request, attempt, null, recovering(status));
+                return;
+            }
+            BackgroundWork.DOWNLOADS.execute(() -> download(params, attempt, request));
         } catch (Exception error) {
             finish(params, "更新失败，请在配置页手动重试", request);
         }
     }
 
-    private void download(JobParameters params, SubscriptionCatalog.Entry current, int generation, DownloadRequest request) {
-        if (active != params || !preferences().getBoolean(ENABLED, false)) { finish(params, null, request); return; }
+    private void download(JobParameters params, Attempt attempt, DownloadRequest request) {
+        if (!isActive(params, request) || !preferences().getBoolean(ENABLED, false)) { finish(params, null, request); return; }
         try {
-            Subscription.Download downloaded = Subscription.download(current.address(), request);
-            RoutingStore.WORKER.execute(() -> apply(params, current, generation, downloaded, request));
+            Subscription.Download downloaded = Subscription.download(attempt.address(), request);
+            RoutingStore.WORKER.execute(() -> apply(params, attempt, downloaded, request));
+        } catch (DownloadRequest.Cancelled error) {
+            finish(params, null, request);
         } catch (Subscription.SecureRequired error) {
-            finish(params, "旧 HTTP 订阅已跳过，请添加 HTTPS 链接", request);
+            finish(params, "旧 HTTP 订阅已跳过，请添加 HTTPS 链接", request, attempt, SubscriptionUpdateStatus.downloadFailure(error), false);
         } catch (Exception error) {
-            finish(params, "更新失败，请在配置页手动重试", request);
+            String reason = SubscriptionUpdateStatus.downloadFailure(error);
+            boolean retryable = error instanceof Subscription.NetworkFailure || error instanceof DownloadRequest.Expired;
+            finish(params, "更新失败 · " + reason, request, attempt, reason, retryable);
         }
     }
 
-    private void apply(JobParameters params, SubscriptionCatalog.Entry current, int generation, Subscription.Download downloaded, DownloadRequest request) {
+    private void apply(JobParameters params, Attempt attempt, Subscription.Download downloaded, DownloadRequest request) {
         SharedPreferences preferences = preferences();
         String outcome = null;
+        String failure = null;
+        boolean retryable = false;
         try {
-            if (active != params || !preferences.getBoolean(ENABLED, false)) return;
+            if (!isActive(params, request) || !preferences.getBoolean(ENABLED, false)) return;
             BackupStore.requireResolved(this);
             request.seal();
             RoutingStore routing = new RoutingStore(this);
             SubscriptionCatalog.Entry latest = new SubscriptionCatalog(preferences, routing).load().active();
-            if (latest != null && latest.address().equals(current.address())) {
-                downloaded.usage().cache(preferences, current.address());
+            if (latest != null && latest.address().equals(attempt.address())) {
+                downloaded.usage().cache(preferences, attempt.address());
                 SubscriptionReminders.reconcile(this, new SubscriptionCatalog(preferences, routing).load());
             }
-            if (generation != RoutingStore.generation() || latest == null || !latest.address().equals(current.address())) {
+            if (latest == null || !attempt.stillCurrent(latest.address(), RoutingStore.generation())) {
                 outcome = "跳过，下载期间配置或当前订阅已变化";
                 return;
             }
             Module.Status status = Module.status();
             if (!canRefresh(status)) {
                 outcome = "跳过，模块或配置未就绪";
+                retryable = recovering(status);
                 return;
             }
-            routing.importProfile(downloaded.source(), current.address());
+            routing.importProfile(downloaded.source(), attempt.address());
+            SubscriptionUpdateStatus.complete(preferences, attempt.address(), attempt.id(), "");
             outcome = "更新成功";
         } catch (RoutingStore.SelectionRestoreFailure warning) {
+            SubscriptionUpdateStatus.complete(preferences, attempt.address(), attempt.id(), "");
             outcome = "已更新，请检查节点选择";
+        } catch (DownloadRequest.Cancelled error) {
+            outcome = null;
         } catch (Exception error) {
-            outcome = "更新失败，请在配置页手动重试";
+            failure = error instanceof DownloadRequest.Expired ? SubscriptionUpdateStatus.downloadFailure(error)
+                : SubscriptionUpdateStatus.applyFailure(error);
+            outcome = "更新失败 · " + failure;
         } finally {
-            finish(params, outcome, request);
+            finish(params, outcome, request, attempt, failure, retryable);
         }
     }
 
@@ -135,12 +182,43 @@ public final class SubscriptionUpdateJob extends JobService {
         return status.enabled && status.profile && (status.running() || status.phase() == Module.Phase.STOPPED);
     }
 
+    static boolean recovering(Module.Status status) {
+        if (!status.enabled || !status.profile) return false;
+        return switch (status.phase()) {
+            case STARTING, WAITING_NETWORK, RETRYING, DEGRADED -> true;
+            default -> false;
+        };
+    }
+
     private void finish(JobParameters params, String outcome, DownloadRequest request) {
+        finish(params, outcome, request, null, null, false);
+    }
+
+    private void finish(JobParameters params, String outcome, DownloadRequest request, Attempt attempt, String failure,
+                        boolean retryable) {
         request.close();
         main.post(() -> {
-            if (active != params) return;
-            if (outcome != null) record(preferences(), outcome);
+            if (!isActive(params, request)) return;
+            SharedPreferences preferences = preferences();
+            boolean enabled = preferences.getBoolean(ENABLED, false);
+            if (retryable && !attempt.retried() && enabled) {
+                record(preferences, outcome + " · 稍后自动重试一次");
+                pendingRetry = () -> {
+                    pendingRetry = null;
+                    if (!isActive(params, request)) return;
+                    DownloadRequest next = new DownloadRequest();
+                    downloadRequest = next;
+                    RoutingStore.WORKER.execute(() -> refresh(params, next, attempt.retry()));
+                };
+                main.postDelayed(pendingRetry, RETRY_DELAY_MS);
+                return;
+            }
+            if (failure != null && enabled) {
+                SubscriptionUpdateStatus.complete(preferences, attempt.address(), attempt.id(), failure);
+            }
+            if (outcome != null) record(preferences, outcome);
             active = null;
+            downloadRequest = null;
             jobFinished(params, false);
         });
     }

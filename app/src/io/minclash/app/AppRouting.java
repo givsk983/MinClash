@@ -8,6 +8,7 @@ import android.content.pm.ResolveInfo;
 import android.os.SystemClock;
 import java.text.Collator;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -131,7 +132,7 @@ final class AppRouting {
     }
 
     static JSONArray rootUids(Context context) throws Exception {
-        return rootQuery(context, List.of(), true);
+        return rootQuery(context, Collections.emptyList(), true);
     }
 
     private static JSONArray rootQuery(Context context, List<String> packages, boolean uidsOnly) throws Exception {

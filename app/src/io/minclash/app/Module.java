@@ -5,12 +5,15 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
 final class Module {
     enum Command {
         STATUS("status"), START("start"), STOP("stop"), IMPORT("import"), VALIDATE("validate"), CLEAR_PROFILE("clear-profile"),
+        REPLACE_PROFILE("replace-profile"),
         BOOT_ON("boot-on"), BOOT_OFF("boot-off"), LOGS("logs"), API("api"),
         HOTSPOT_ON("hotspot-on"), HOTSPOT_OFF("hotspot-off"),
         PROTECTION_POLICY("protection-policy"), PROTECTION_GET("protection-get"), PROTECTION_SET("protection-set"), PROTECTION_OFF("protection-off"),
@@ -43,6 +46,7 @@ final class Module {
         final boolean enabled;
         final boolean control;
         final boolean validate;
+        final boolean replaceProfile;
         final String version;
         final String pendingVersion;
         final int revision;
@@ -54,7 +58,7 @@ final class Module {
         final boolean protection;
         final boolean protectionArmed;
 
-        Status(String state, boolean profile, boolean boot, boolean enabled, boolean control, boolean validate,
+        Status(String state, boolean profile, boolean boot, boolean enabled, boolean control, boolean validate, boolean replaceProfile,
                String version, String pendingVersion, int revision, boolean hotspot, boolean hotspotEnabled, String hotspotState,
                RuntimeStatus runtime, TcpKeepAlive.Status keepAlive, boolean protection, boolean protectionArmed) {
             this.state = state;
@@ -63,6 +67,7 @@ final class Module {
             this.enabled = enabled;
             this.control = control;
             this.validate = validate;
+            this.replaceProfile = replaceProfile;
             this.version = version;
             this.pendingVersion = pendingVersion;
             this.revision = revision;
@@ -195,12 +200,13 @@ final class Module {
                 echo LOG_SAMPLE
                 match() { printf '%s\\n' "$recent" | grep -Eiq "$1" && echo "$2"; }
                 match 'dns resolve failed|no such host|all DNS requests failed' NODE_DNS
+                match 'fake DNS record .* missing' FAKE_DNS_MISSING
                 match "can't download (geo(site|ip)\\.dat|mmdb|asn)|geodata.*(failed|error)" GEODATA
                 match 'provider.*(download failed|initial error|update failed|could not)' PROVIDER
                 match 'certificate signed by unknown authority|x509:|tls handshake timeout' CORE_TLS
                 match 'TUN did not become ready|priorities .* already in use|Interface minclash0 is already in use' TUN_SETUP
                 match 'Waiting for a stable system uplink at boot' BOOT_UPLINK_WAIT
-                match 'System uplink changed after boot' BOOT_UPLINK_RESTART
+                match 'System uplink changed( after boot)?[.]' BOOT_UPLINK_RESTART
                 match 'configuration (file .* )?test failed|parse config error' CONFIG
             fi
             exit 0
@@ -214,6 +220,7 @@ final class Module {
         boolean enabled = false;
         boolean control = false;
         boolean validate = false;
+        boolean replaceProfile = false;
         String version = "";
         String pendingVersion = "";
         int revision = 0;
@@ -234,6 +241,7 @@ final class Module {
             if (line.equals("enabled=1")) enabled = true;
             if (line.equals("control=1")) control = true;
             if (line.equals("validate=1")) validate = true;
+            if (line.equals("replace_profile=1")) replaceProfile = true;
             if (line.equals("protection=1")) protection = true;
             if (line.equals("protection_armed=1")) protectionArmed = true;
             if (line.equals("protection_degraded=1")) protectionDegraded = true;
@@ -272,7 +280,7 @@ final class Module {
             case "running", "starting", "waiting_network", "retrying", "orphaned", "stopped", "missing" -> { }
             default -> throw new IOException("无法读取 KernelSU / Magisk 模块的状态。");
         }
-        return new Status(state, profile, boot, enabled, control, validate, version, pendingVersion, revision,
+        return new Status(state, profile, boot, enabled, control, validate, replaceProfile, version, pendingVersion, revision,
             hotspot, hotspotEnabled, hotspotState, new RuntimeStatus(health, core, tun4, tun6, tun6Required, controller,
                 notificationRecovery, notificationEnabled, hotspotReason, hotspotSent, hotspotReceived, trafficSummary, protectionDegraded),
             TcpKeepAlive.parse(output), protection, protectionArmed && !protectionDegraded);
@@ -293,11 +301,33 @@ final class Module {
             : "if [ ! -f " + script + " ]; then echo MINCLASH_NO_MODULE; exit 72; fi; ";
         String action = metadata
             + "exec /system/bin/sh " + script + " " + command.argument;
-        return runRoot(action, command, payload, command == Command.IMPORT || command == Command.VALIDATE ? 135 : 65);
+        return runRoot(action, command, payload, command == Command.REPLACE_PROFILE ? 150
+            : command == Command.IMPORT || command == Command.VALIDATE ? 135 : 65);
+    }
+
+    static void replaceProfile(byte[] next, byte[] previous) throws Exception {
+        if (next.length == 0 || next.length > Profile.MAX_BYTES) throw new Profile.TooLarge();
+        byte[] header = (next.length + "\n" + profileDigest(previous) + "\n").getBytes(StandardCharsets.US_ASCII);
+        ByteArrayOutputStream packet = new ByteArrayOutputStream(header.length + next.length);
+        packet.write(header);
+        packet.write(next);
+        run(Command.REPLACE_PROFILE, packet.toByteArray());
+    }
+
+    static String profileDigest(byte[] content) throws NoSuchAlgorithmException {
+        StringBuilder hash = new StringBuilder(64);
+        for (byte value : MessageDigest.getInstance("SHA-256").digest(content)) {
+            hash.append(Character.forDigit((value & 255) >>> 4, 16)).append(Character.forDigit(value & 15, 16));
+        }
+        return hash.toString();
     }
 
     static final class ProfileFailure extends IOException {
         ProfileFailure(String message) { super(message); }
+    }
+
+    static final class ProfileUnchanged extends IOException {
+        ProfileUnchanged() { super("配置或 TUN 状态已变化，本次修改尚未应用。请重试。"); }
     }
 
     static String runRoot(String action, Command command, byte[] payload, int timeoutSeconds) throws Exception {
@@ -325,7 +355,7 @@ final class Module {
             if (result.contains("MINCLASH_NO_ROOT") || result.isEmpty()) {
                 throw new IOException("请在 KernelSU / Magisk 为 MinClash 授予超级用户权限。");
             }
-            if (command == Command.IMPORT || command == Command.VALIDATE) {
+            if (command == Command.IMPORT || command == Command.VALIDATE || command == Command.REPLACE_PROFILE) {
                 switch (result.substring(result.lastIndexOf('\n') + 1)) {
                     case "MINCLASH_PROFILE_GEODATA" ->
                         throw new ProfileFailure("配置依赖的地理规则数据下载失败。请在可访问数据源的网络下重试。");
@@ -335,6 +365,8 @@ final class Module {
                         throw new ProfileFailure("Mihomo 无法使用这份配置。请查看本次校验的内核日志。");
                     case "MINCLASH_PROFILE_NO_TIMEOUT" ->
                         throw new ProfileFailure("当前系统和 Root 管理器均缺少 timeout 命令，无法安全校验配置。");
+                    case "MINCLASH_PROFILE_REPLACE_STALE", "MINCLASH_PROFILE_REPLACE_STATE" ->
+                        throw new ProfileUnchanged();
                     case "Mihomo rejected the profile or validation timed out. Check logs." ->
                         throw new ProfileFailure("配置校验失败或超时。请查看日志；可在设置中更新模块以使用新版校验。");
                 }

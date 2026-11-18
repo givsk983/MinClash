@@ -19,12 +19,16 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 public final class TrafficActivity extends ThemedActivity {
     private static final long RECENT_MS = 60_000;
+    private static final DateTimeFormatter HISTORY_DATE = DateTimeFormatter.ofPattern("MM-dd");
     private final TrafficMonitor.Observer observer = this::bind;
     private final TextView[] values = new TextView[6];
+    private final TextView[] dailyValues = new TextView[DailyTraffic.DAYS];
+    private final TextView[] dailyDates = new TextView[DailyTraffic.DAYS];
     private AppUi ui;
     private TextView status;
     private Chart chart;
@@ -101,6 +105,22 @@ public final class TrafficActivity extends ThemedActivity {
         }
         ui.add(body, statistics, 12);
         ui.add(body, ui.label("仅统计内核流量，累计值随内核重启重置。", 12, AppUi.MUTED, false), 12);
+        LinearLayout history = ui.card();
+        TextView historyTitle = ui.label("近 7 天流量", 16, AppUi.TEXT, true);
+        historyTitle.setAccessibilityHeading(true);
+        ui.add(history, historyTitle, 0);
+        ui.add(history, ui.label("本机按日保存 Mihomo 采样。跨日缺少采样或内核重启时，部分流量可能未记入。",
+            12, AppUi.MUTED, false), 6);
+        for (int i = 0; i < DailyTraffic.DAYS; i++) {
+            LinearLayout row = new LinearLayout(this);
+            dailyDates[i] = ui.label("—", 12, AppUi.TEXT, true);
+            dailyValues[i] = ui.label("—", 12, AppUi.MUTED, false);
+            dailyValues[i].setGravity(Gravity.END);
+            row.addView(dailyDates[i], new LinearLayout.LayoutParams(-2, -2));
+            row.addView(dailyValues[i], new LinearLayout.LayoutParams(0, -2, 1));
+            ui.add(history, row, 12);
+        }
+        ui.add(body, history, 14);
         setContentView(scroll);
     }
 
@@ -121,7 +141,7 @@ public final class TrafficActivity extends ThemedActivity {
 
     @Override protected void onResume() {
         super.onResume();
-        TrafficMonitor.INSTANCE.observe(observer, true);
+        TrafficMonitor.INSTANCE.observe(this, observer, true);
     }
 
     @Override protected void onPause() {
@@ -143,6 +163,14 @@ public final class TrafficActivity extends ThemedActivity {
             values[5].setText(reading.memory() > 0 ? SubscriptionUsage.bytes(reading.memory()) : "—");
         }
         chart.invalidate();
+        List<DailyTraffic.Day> recent = TrafficMonitor.INSTANCE.daily();
+        for (int i = 0; i < recent.size(); i++) {
+            DailyTraffic.Day day = recent.get(i);
+            dailyDates[i].setText(day.date().format(HISTORY_DATE) + (i == 0 ? " 今天" : ""));
+            DailyTraffic.Totals total = day.totals();
+            dailyValues[i].setText(total == null ? "暂无记录"
+                : "↑ " + SubscriptionUsage.bytes(total.upload()) + "    ↓ " + SubscriptionUsage.bytes(total.download()));
+        }
     }
 
     private final class Chart extends View {

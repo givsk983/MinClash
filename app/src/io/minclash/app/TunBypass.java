@@ -24,7 +24,7 @@ final class TunBypass {
             Object value = array.get(i);
             if (!(value instanceof String name) || !packages.add(name)) throw new IOException("绕过 TUN 的应用列表无效。");
         }
-        validate(packages, Map.of());
+        validate(packages, Collections.emptyMap());
         return Collections.unmodifiableSet(packages);
     }
 
@@ -50,7 +50,7 @@ final class TunBypass {
     }
 
     static void check(Set<String> packages, List<App> inventory, ProtectionPolicy protection) throws IOException {
-        validate(packages, Map.of());
+        validate(packages, Collections.emptyMap());
         if (packages.isEmpty()) return;
         if (protection.strictDns) throw new IOException("绕过 TUN 不能与“域名查询保护”同时使用，请先关闭其中一项。");
         Map<String, Integer> uids = new HashMap<>();

@@ -38,7 +38,7 @@ final class TrafficCard extends LinearLayout {
     }
 
     void setActive(boolean active) {
-        if (active) TrafficMonitor.INSTANCE.observe(observer, false);
+        if (active) TrafficMonitor.INSTANCE.observe(getContext(), observer, false);
         else TrafficMonitor.INSTANCE.stopObserving(observer);
     }
 

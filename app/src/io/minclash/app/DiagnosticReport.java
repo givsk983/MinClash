@@ -15,7 +15,7 @@ import java.util.concurrent.TimeUnit;
 record DiagnosticReport(String text) {
     enum Fact {
         IFACE, ROUTE4, ROUTE6, UPLINK4, UPLINK6, APP_REJECT_RULE, LOG_SAMPLE,
-        NODE_DNS, GEODATA, PROVIDER, CORE_TLS, TUN_SETUP, BOOT_UPLINK_WAIT, BOOT_UPLINK_RESTART, CONFIG
+        NODE_DNS, FAKE_DNS_MISSING, GEODATA, PROVIDER, CORE_TLS, TUN_SETUP, BOOT_UPLINK_WAIT, BOOT_UPLINK_RESTART, CONFIG
     }
 
     static DiagnosticReport collect(String appVersion, long appCode, int androidApi,

@@ -46,7 +46,7 @@ public final class ProxyNotificationService extends Service {
         }
     }
 
-    private record Connection(String mode, String node, boolean running, boolean inactive) {}
+    private record Connection(String mode, String node, boolean running, boolean inactive, boolean canReadOutlets) {}
 
     // Compare the text that System UI will show, so rounded samples don't cause reposts.
     record Speed(String down, String up) {
@@ -63,8 +63,9 @@ public final class ProxyNotificationService extends Service {
         }
     }
 
-    private record Sample(Connection connection, String app, Speed speed, boolean overlayAllowed) {}
+    private record Sample(Connection connection, String app, String node, Speed speed, boolean overlayAllowed) {}
     private record CounterSample(Module.TunCounters counters, long time) {}
+    private record AppOutletSample(String packageName, String node, long time) {}
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -89,6 +90,7 @@ public final class ProxyNotificationService extends Service {
     // Owned by the worker.
     private Connection sampledConnection;
     private long connectionTime;
+    private AppOutletSample sampledOutlet;
     private CounterSample previousCounters;
 
     static boolean canShow(Context context) {
@@ -188,8 +190,8 @@ public final class ProxyNotificationService extends Service {
         // Also runs for a null intent when Android recreates this sticky foreground service.
         if (current == null) {
             notificationSince = System.currentTimeMillis();
-            current = new Sample(new Connection("代理模式", "正在读取连接…", false, false), "MinClash",
-                Speed.UNKNOWN, Settings.canDrawOverlays(this));
+            Connection starting = new Connection("代理模式", "正在读取连接…", false, false, false);
+            current = new Sample(starting, "MinClash", starting.node(), Speed.UNKNOWN, Settings.canDrawOverlays(this));
             startForeground(NOTIFICATION_ID, notification());
             main.post(poll);
         }
@@ -274,19 +276,42 @@ public final class ProxyNotificationService extends Service {
 
     private Sample sample() {
         long now = SystemClock.elapsedRealtime();
-        if (refreshConnection || sampledConnection == null || now - connectionTime >= CONNECTION_INTERVAL) {
+        boolean refresh = refreshConnection;
+        if (refresh || sampledConnection == null || now - connectionTime >= CONNECTION_INTERVAL) {
             refreshConnection = false;
             sampledConnection = readConnection();
             connectionTime = SystemClock.elapsedRealtime();
         }
         boolean interactive = getSystemService(PowerManager.class).isInteractive();
         Speed speed = sampleSpeed(interactive && sampledConnection.running());
-        String app = "MinClash";
+        ForegroundApp.App app = new ForegroundApp.App(null, "MinClash");
         if (interactive) {
-            try { app = foregroundApp.label(); }
-            catch (RuntimeException error) { app = "当前应用 · 未知"; }
+            try { app = foregroundApp.current(); }
+            catch (RuntimeException error) { app = ForegroundApp.UNKNOWN; }
         }
-        return new Sample(sampledConnection, app, speed, Settings.canDrawOverlays(this));
+        String node = sampleAppOutlet(app.packageName(), refresh);
+        return new Sample(sampledConnection, app.label(), node, speed, Settings.canDrawOverlays(this));
+    }
+
+    private String sampleAppOutlet(String packageName, boolean refresh) {
+        if (!sampledConnection.canReadOutlets() || packageName == null) {
+            sampledOutlet = null;
+        } else {
+            long now = SystemClock.elapsedRealtime();
+            // The first snapshot can arrive before the foreground app opens a connection.
+            if (refresh || sampledOutlet == null || !packageName.equals(sampledOutlet.packageName())
+                || sampledOutlet.node().isEmpty()
+                || now - sampledOutlet.time() >= CONNECTION_INTERVAL) {
+                String node = "";
+                try {
+                    int uid = LiveConnections.uniqueUid(getPackageManager(), packageName);
+                    node = LiveConnections.activeOutlet(Controller.connections(), packageName, uid);
+                } catch (Exception ignored) { }
+                sampledOutlet = new AppOutletSample(packageName, node, SystemClock.elapsedRealtime());
+            }
+            if (!sampledOutlet.node().isEmpty()) return sampledOutlet.node();
+        }
+        return sampledConnection.canReadOutlets() ? "默认 · " + sampledConnection.node() : sampledConnection.node();
     }
 
     private Speed sampleSpeed(boolean read) {
@@ -314,24 +339,24 @@ public final class ProxyNotificationService extends Service {
             Module.Status status = Module.notificationStatus();
             NotificationRecovery.sync(this, status);
             if (status.runtime.protectionDegraded()) {
-                return new Connection("防泄漏规则待恢复", "请检查保护设置", status.running(), false);
+                return new Connection("防泄漏规则待恢复", "请检查保护设置", status.running(), false, false);
             }
             if (!status.active()) {
-                return new Connection("TUN 已停止", status.protectionArmed ? "防泄漏阻断仍保留" : "暂无节点", false, true);
+                return new Connection("TUN 已停止", status.protectionArmed ? "防泄漏阻断仍保留" : "暂无节点", false, true, false);
             }
             if (!status.running()) {
-                return new Connection(status.phase().label, "等待连接", false, false);
+                return new Connection(status.phase().label, "等待连接", false, false, false);
             }
             if (status.control) {
                 try {
                     Controller.Mode mode = Controller.mode();
                     String node = mode == Controller.Mode.DIRECT ? "直接连接" : Controller.primaryNode(mode);
-                    return new Connection(mode.label + "模式", node, true, false);
+                    return new Connection(mode.label + "模式", node, true, false, true);
                 } catch (Exception ignored) { }
             }
-            return new Connection("TUN 运行中", "控制暂不可用", true, false);
+            return new Connection("TUN 运行中", "控制暂不可用", true, false, false);
         } catch (Exception error) {
-            return new Connection("状态不可用", "暂无节点", false, false);
+            return new Connection("状态不可用", "暂无节点", false, false, false);
         }
     }
 
@@ -341,10 +366,10 @@ public final class ProxyNotificationService extends Service {
         PendingIntent modePicker = openPicker(true);
         PendingIntent nodePicker = openPicker(false);
         String app = overlayFailed ? "浮窗受限 · 点此检查" : current.app();
-        RemoteViews controls = card.view(app, connection.mode(), connection.node(), current.speed(), modePicker, nodePicker);
+        RemoteViews controls = card.view(app, connection.mode(), current.node(), current.speed(), modePicker, nodePicker);
         Notification.Builder builder = new Notification.Builder(this, channelId)
             .setSmallIcon(R.drawable.ic_notification).setContentTitle("MinClash")
-            .setContentText(connection.mode() + " · " + connection.node())
+            .setContentText(connection.mode() + " · " + current.node())
             .setCustomContentView(controls)
             .setCustomBigContentView(new RemoteViews(controls))
             .setContentIntent(modePicker).setWhen(notificationSince).setShowWhen(false).setOnlyAlertOnce(true)

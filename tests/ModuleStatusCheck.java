@@ -32,6 +32,8 @@ public final class ModuleStatusCheck {
         Module.Status explicit = Module.parseStatus("version=0.0.2\nrevision=1\nstate=running\ncontrol=1\n");
         require(!explicit.updateAvailable(1) && explicit.updateAvailable(2), "independent functional revision");
         Module.Status validating = Module.parseStatus("version=0.0.3\nrevision=2\nstate=running\ncontrol=1\nvalidate=1\n");
+        Module.Status replacing = Module.parseStatus("state=running\nreplace_profile=1\n");
+        require(!validating.replaceProfile && replacing.replaceProfile, "staged restart is capability-gated");
         require(!explicit.validate && validating.validate && !validating.updateAvailable(2), "preflight uses advertised capability");
         require(!fresh.updateAvailable(1), "missing module uses first-install flow instead of update warning");
         Module.Status unknown = Module.parseStatus("version=9.0.0\nstate=running\ncontrol=1\n");

@@ -8,6 +8,7 @@ import java.io.StringWriter;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,6 +32,10 @@ import org.yaml.snakeyaml.nodes.Tag;
 
 final class Profile {
     static final int MAX_BYTES = 2 * 1024 * 1024;
+    static final class MissingRoutingTarget extends IOException {
+        MissingRoutingTarget(String message) { super(message); }
+    }
+
     private static final Pattern LOOPBACK_DNS = Pattern.compile(
         "(?i)^(?:[a-z][a-z0-9+.-]*://)?(?:localhost\\.?|127(?:\\.[0-9]{1,3}){3}|\\[(?:::1|0:0:0:0:0:0:0:1)\\])(?=[:/?#]|$)|^::1$");
     private static final List<String> DNS_UPSTREAMS = Arrays.asList("default-nameserver", "nameserver", "fallback",
@@ -263,7 +268,7 @@ final class Profile {
     }
 
     static byte[] withPersonalRules(byte[] source, Map<String, String> applications, List<PersonalRules.Rule> personal) throws IOException {
-        return withPersonalRules(source, applications, personal, Set.of());
+        return withPersonalRules(source, applications, personal, Collections.emptySet());
     }
 
     static byte[] withPersonalRules(byte[] source, Map<String, String> applications, List<PersonalRules.Rule> personal,
@@ -288,7 +293,7 @@ final class Profile {
                 throw new IOException("应用包名无效：" + entry.getKey());
             }
             if (!targets.contains(entry.getValue())) {
-                throw new IOException("应用 " + entry.getKey() + " 指定的代理组「" + entry.getValue()
+                throw new MissingRoutingTarget("应用 " + entry.getKey() + " 指定的代理组「" + entry.getValue()
                     + "」已不存在。请先在应用分流中重新选择，再更新订阅。");
             }
             rules.add(yaml.represent("PROCESS-NAME," + entry.getKey() + "," + entry.getValue()));
@@ -298,7 +303,7 @@ final class Profile {
         for (PersonalRules.Rule saved : personal) {
             PersonalRules.Rule rule = PersonalRules.create(saved.type(), saved.value(), saved.target());
             if (!targets.contains(rule.target()) && !rule.target().equals("REJECT")) {
-                throw new IOException("自定义规则「" + rule.value() + "」指定的出口已不存在，请先调整自定义分流。");
+                throw new MissingRoutingTarget("自定义规则「" + rule.value() + "」指定的出口已不存在，请先调整自定义分流。");
             }
             if (!unique.add(rule.type() + "," + rule.value())) throw new IOException("有重复的自定义规则。");
             rules.add(yaml.represent(rule.line()));
@@ -323,12 +328,13 @@ final class Profile {
 
     // Only the live copy carries session overrides; keep the saved subscription source unchanged.
     static byte[] forLiveReload(byte[] content, String mode, boolean identifyProcesses) throws IOException {
-        if (!Set.of("rule", "global", "direct").contains(mode)) throw new IOException("无法读取当前代理模式。");
+        List<String> modes = Arrays.asList("rule", "global", "direct");
+        if (!modes.contains(mode)) throw new IOException("无法读取当前代理模式。");
         MappingNode root = routingRoot(content);
         // Overriding a session field must not hide an invalid persistent value (for example
         // removing the last app rule exposes the source's original find-process-mode).
-        validateLiveField(root, "mode", Set.of("rule", "global", "direct"));
-        validateLiveField(root, "find-process-mode", Set.of("strict", "always", "off"));
+        validateLiveField(root, "mode", modes);
+        validateLiveField(root, "find-process-mode", Arrays.asList("strict", "always", "off"));
         Yaml yaml = new Yaml();
         root.getValue().removeIf(tuple -> keyOf(tuple).equals("mode")
             || identifyProcesses && keyOf(tuple).equals("find-process-mode"));
@@ -341,7 +347,7 @@ final class Profile {
         return result;
     }
 
-    private static void validateLiveField(MappingNode root, String name, Set<String> values) throws IOException {
+    private static void validateLiveField(MappingNode root, String name, List<String> values) throws IOException {
         Node node = field(root, name);
         if (node == null || Tag.NULL.equals(node.getTag())) return;
         if (!(node instanceof ScalarNode scalar) || !Tag.STR.equals(scalar.getTag())
