@@ -1,7 +1,6 @@
 package io.minclash.app;
 
 import java.io.IOException;
-import java.util.List;
 
 final class TcpKeepAlive {
     static final String LEVEL_PREFERENCE = "tcp_keepalive_level";
@@ -66,11 +65,8 @@ final class TcpKeepAlive {
         if (!before.keepAlive.available()) throw new IOException("当前模块不支持连接保活设置，请先更新模块。");
         if (!before.running()) throw new IOException("请等待 TUN 就绪，或在下次启动时应用设置。");
         if (!before.keepAlive.needsRestart(true)) return before;
-        List<Controller.Group> selections = Controller.groups().values();
-        Module.run(Module.Command.STOP, null);
         try {
-            RoutingStore.restart(before.control);
-            Controller.restoreSelections(selections);
+            RoutingStore.reconnect(before);
         } catch (Exception error) {
             throw new IOException("保活设置已保存，但重连或恢复节点选择未完成，请检查 TUN 状态与代理组。", error);
         }

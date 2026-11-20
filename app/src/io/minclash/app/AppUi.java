@@ -78,6 +78,13 @@ final class AppUi {
         drawable.setCornerRadius(dp(radius)); drawable.setStroke(dp(1), BORDER); return drawable;
     }
     LinearLayout column() { LinearLayout view = new LinearLayout(context); view.setOrientation(LinearLayout.VERTICAL); return view; }
+    GradientDrawable overviewCardSurface() {
+        GradientDrawable surface = new GradientDrawable();
+        surface.setColor(tone(0xff111a22, 0xffedf2f5));
+        surface.setCornerRadius(dp(16));
+        return surface;
+    }
+
     LinearLayout card() {
         LinearLayout view = column(); view.setPadding(dp(14), dp(12), dp(14), dp(12));
         view.setBackground(shape(CARD, 16)); return view;

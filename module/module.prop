@@ -1,7 +1,7 @@
 id=minclash
 name=MinClash Root TUN
-version=0.1.5
-versionCode=24
-revision=14
+version=0.1.8
+versionCode=27
+revision=17
 author=MinClash
-description=Mihomo v1.19.33-minclash.4 ARM64 with Android default-network handoff recovery, protection monitoring and traffic statistics.
+description=Mihomo v1.19.33-minclash.6 ARM64 with per-app WebRTC filtering, Android network recovery and traffic statistics.

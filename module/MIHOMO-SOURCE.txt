@@ -1,4 +1,4 @@
-MinClash packages Mihomo v1.19.33-minclash.4, modified on 2026-11-18.
+MinClash packages Mihomo v1.19.33-minclash.6, modified on 2026-11-20.
 Base commit: 3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8 (upstream v1.19.33).
 Modification: optional TCP keepalive, OFF by default, with three user-selected policies.
 Conservative: idle 180s / interval 30s; balanced: 120s / 20s; aggressive: 60s / 15s.
@@ -7,12 +7,14 @@ The supervisor sets MINCLASH_TCP_KEEPALIVE only for an explicitly enabled policy
 Missing/invalid policy or unsupported kernel retains upstream connection behavior.
 Additional modifications: opt-in per-app proxy enforcement, strict DNS,
 firewall health verification and repair, and a compact traffic statistics endpoint.
+Optional per-app WebRTC filtering checks UDP STUN headers and standard STUN/TURN
+ports at the TUN ingress. The Root supervisor applies the selected packages on core start.
 
 Upstream release: https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33
 Base source: https://github.com/MetaCubeX/mihomo/tree/3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8
 Base archive SHA-256: ecda5f8c8a8a1d60bc088c2640c85d92c8f002c0686234a26bdf671735afe216
 Official vendor archive SHA-256: 7ac4d4da0e6a29ef6ed18d2cf8f4c58d361d049ae364fd841acc883aa3a9e1cc
 Corresponding modified source, tests, dependencies and build instructions:
-  mihomo-v1.19.33-minclash.4-source.tar.gz (provided alongside the APK/module).
+  mihomo-v1.19.33-minclash.6-source.tar.gz (provided alongside the APK/module).
 MinClash repository: build_core.py and mihomo-patches/ contain the reproducible build.
 License: GNU General Public License v3, included as LICENSE-mihomo.txt.

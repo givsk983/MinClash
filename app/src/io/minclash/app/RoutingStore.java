@@ -347,6 +347,13 @@ final class RoutingStore {
         if (selectionError != null) throw new SelectionRestoreFailure(selectionError);
     }
 
+    static void reconnect(Module.Status before) throws Exception {
+        List<Controller.Group> selections = before.control ? Controller.groups().values() : Collections.emptyList();
+        Module.run(Module.Command.STOP, null);
+        restart(before.control);
+        Controller.restoreSelections(selections);
+    }
+
     static void restart(boolean control) throws Exception {
         Module.run(Module.Command.START, null);
         long deadline = SystemClock.elapsedRealtime() + 45_000;

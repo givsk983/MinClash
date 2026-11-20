@@ -61,13 +61,7 @@ final class AppRouting {
 
         Screen load(Context context, boolean allowRoot, Module.Status status) throws Exception {
             RoutingStore.State state = new RoutingStore(context).load();
-            int current = generation;
-            Inventory inventory = cached;
-            if (inventory == null || inventory.generation() != current || inventory.allowRoot() != allowRoot
-                || SystemClock.elapsedRealtime() - inventory.created() >= 60000) {
-                inventory = readInventory(context, allowRoot, current);
-                cached = inventory;
-            }
+            Inventory inventory = inventory(context, allowRoot);
             Map<String, Entry> entries = new TreeMap<>();
             for (Entry app : inventory.entries()) {
                 entries.put(app.packageName(), new Entry(app.label(), app.packageName(),
@@ -86,6 +80,21 @@ final class AppRouting {
                 .thenComparing(Entry::label, collator).thenComparing(Entry::packageName));
             return new Screen(state, applications, Profile.routingTargets(state.source()),
                 status == null ? Module.status() : status, inventory.root(), inventory.empty(), allowRoot);
+        }
+
+        List<Entry> installedApps(Context context, boolean allowRoot) throws Exception {
+            return inventory(context, allowRoot).entries();
+        }
+
+        private Inventory inventory(Context context, boolean allowRoot) throws Exception {
+            int current = generation;
+            Inventory inventory = cached;
+            if (inventory == null || inventory.generation() != current || inventory.allowRoot() != allowRoot
+                || SystemClock.elapsedRealtime() - inventory.created() >= 60000) {
+                inventory = readInventory(context, allowRoot, current);
+                cached = inventory;
+            }
+            return inventory;
         }
 
         private Inventory readInventory(Context context, boolean allowRoot, int current) throws Exception {

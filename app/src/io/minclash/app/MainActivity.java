@@ -29,11 +29,8 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.InputType;
 import android.text.Editable;
-import android.text.SpannableString;
 import android.text.TextWatcher;
 import android.text.TextUtils;
-import android.text.style.ForegroundColorSpan;
-import android.text.style.RelativeSizeSpan;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -80,6 +77,7 @@ public final class MainActivity extends ThemedActivity {
     private static final int EXPORT_BACKUP = 7;
     private static final int IMPORT_BACKUP = 8;
     private static final int REQUEST_SUBSCRIPTION_NOTIFICATIONS = 9;
+    private static final int REQUEST_WEBRTC_APP_LIST = 10;
     static final String NOTIFICATION_CONTROL = "notification_control";
     private static final String ROOT_INVENTORY = "root_app_inventory";
 
@@ -90,11 +88,15 @@ public final class MainActivity extends ThemedActivity {
     private final Runnable pollLatency = () -> checkNetwork(false);
     private Module.Status status;
     private BundledModule.Info bundledModule = new BundledModule.Info("", 0, 0);
+    private ModuleReleaseNotes moduleReleaseNotes = ModuleReleaseNotes.EMPTY;
     private boolean busy;
     private boolean polling;
+    private long fastStatusUntil;
     private boolean visible;
     private NetworkObserver networkObserver;
     private boolean updatingSwitch;
+    private View connectionCard;
+    private GradientDrawable connectionDot;
     private TextView stateText;
     private TextView detailText;
     private TextView messageText;
@@ -129,13 +131,12 @@ public final class MainActivity extends ThemedActivity {
     private boolean subscriptionNotificationSettingsOpened;
     private SubscriptionCatalog subscriptionCatalog;
     private SubscriptionCatalog.Snapshot subscriptions;
-    private Button modeButton;
-    private Button groupsButton;
-    private record ProxySummary(Controller.Mode mode, String node) {}
-    private ProxySummary proxySummary;
+    private ProxyModeRow modeRow;
+    private OverviewActionRow groupsRow;
+    private Controller.Overview proxySummary;
     private Button routingButton;
-    private Button personalRulesButton;
-    private Button connectionsButton;
+    private OverviewActionRow routingRow;
+    private OverviewActionRow connectionsRow;
     private TrafficCard trafficCard;
     private record RulesScreen(RoutingStore.State state, int generation, List<String> targets) {}
     private record AppRoutingSaved(RoutingStore.ApplyMethod method, List<AppRouting.Entry> apps, java.time.Instant cutoff) {}
@@ -162,6 +163,11 @@ public final class MainActivity extends ThemedActivity {
     private TextView keepAliveSummary;
     private Button keepAliveLevelButton;
     private Button keepAliveApplyButton;
+    private Switch webRtcSwitch;
+    private TextView webRtcSummary;
+    private Button webRtcApplyButton;
+    private Button webRtcRulesButton;
+    private record WebRtcRules(Set<String> packages, List<AppRouting.Entry> installed) {}
     private Button notificationButton;
     private Button backgroundPermissionButton;
     private Button overlayPermissionButton;
@@ -170,12 +176,12 @@ public final class MainActivity extends ThemedActivity {
     private Button backupImportButton;
     private ImageView aboutLogo;
     private Button installButton;
+    private Button moduleNotesButton;
     private Button exportButton;
     private TextView moduleSummary;
     private TextView profileSummary;
-    private TextView statusBadge;
     private TextView setupHint;
-    private View networkCheckArea;
+    private TextView networkCheckAction;
     private final TextView[] networkResults = new TextView[NetworkCheck.values().length];
     private int networkChecksPending;
     private volatile int networkCheckGeneration;
@@ -218,53 +224,26 @@ public final class MainActivity extends ThemedActivity {
         FrameLayout content = new FrameLayout(this);
         root.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
         LinearLayout overview = page(content, 0);
-        header(overview, "MinClash", "连接概览", true);
-
-        LinearLayout dashboard = card(overview, 22);
-        LinearLayout statusRow = new LinearLayout(this);
-        statusRow.setGravity(Gravity.CENTER_VERTICAL);
-        statusRow.addView(label("连接状态", 13, MUTED, true), new LinearLayout.LayoutParams(0, -2, 1));
-        statusBadge = label("待检测", 11, MINT, true);
-        statusBadge.setPadding(dp(10), dp(5), dp(10), dp(5));
-        statusBadge.setBackground(shape(AppUi.tone(0xff203a35, 0xffdff2e9), 10, false));
-        statusRow.addView(statusBadge);
-        add(dashboard, statusRow, 0);
-        LinearLayout connectionRow = new LinearLayout(this);
-        connectionRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout connectionDescription = column();
-        stateText = label("准备连接", 24, TEXT, true);
-        add(connectionDescription, stateText, 0);
-        detailText = label("先检测环境，再导入你的配置。", 13, MUTED, false);
-        add(connectionDescription, detailText, 4);
-        connectionRow.addView(connectionDescription, new LinearLayout.LayoutParams(0, -2, 1));
-        toggle = button("启动 TUN", true);
-        toggle.setOnClickListener(view -> {
-            if (status == null) { refresh(); return; }
-            if (!status.installed()) { selectPage(2); return; }
-            boolean stop = isActive();
-            execute("", true, () -> {
-                BackupStore backup = new BackupStore(this);
-                if (!stop) {
-                    if (backup.recoverPending()) refreshSubscriptionCatalog();
-                    ExperimentalFeatures.reconcile(this, Module.status());
-                }
-                Module.run(stop ? Module.Command.STOP : Module.Command.START, null);
-                if (stop && backup.recoverPending()) refreshSubscriptionCatalog();
-                return Module.status();
-            });
-        });
-        LinearLayout.LayoutParams toggleParams = new LinearLayout.LayoutParams(dp(112), -2);
-        toggleParams.leftMargin = dp(12);
-        connectionRow.addView(toggle, toggleParams);
-        add(dashboard, connectionRow, 12);
-        TextView backgroundHint = label("退出 App 后，连接仍会保持", 11, MUTED, false);
-        backgroundHint.setGravity(Gravity.CENTER);
-        add(dashboard, backgroundHint, 12);
+        LinearLayout overviewHeader = new LinearLayout(this);
+        overviewHeader.setGravity(Gravity.CENTER_VERTICAL);
+        overviewHeader.setMinimumHeight(dp(64));
+        TextView overviewTitle = label("MinClash", 28, TEXT, true);
+        overviewTitle.setAccessibilityHeading(true);
+        overviewHeader.addView(overviewTitle, new LinearLayout.LayoutParams(0, -2, 1));
+        subscriptionIndicator = new SubscriptionQuotaIndicator(this,
+            () -> { if (subscriptions != null && subscriptions.active() != null) showUsage(subscriptions.active()); });
+        subscriptionIndicator.setVisibility(View.GONE);
+        overviewHeader.addView(subscriptionIndicator, new LinearLayout.LayoutParams(dp(56), dp(64)));
+        add(overview, overviewHeader, 0);
+        addConnectionCard(overview);
 
         setupHint = label("", 13, AMBER, false);
         setupHint.setPadding(dp(14), dp(12), dp(14), dp(12));
         setupHint.setBackground(shape(AppUi.tone(0xff302b22, 0xfffff0d6), 14, false));
-        setupHint.setOnClickListener(view -> selectPage(2));
+        setupHint.setOnClickListener(view -> {
+            selectPage(2);
+            settingsNavigation.show("module");
+        });
         add(overview, setupHint, 12);
 
         LinearLayout firstSubscription = card(overview, 12);
@@ -281,26 +260,25 @@ public final class MainActivity extends ThemedActivity {
         Button useLocalProfile = button("使用本地 YAML 配置  →", false);
         useLocalProfile.setOnClickListener(view -> selectPage(1));
         add(firstSubscription, useLocalProfile, 10);
+        LinearLayout proxyControls = column();
+        proxyControls.setBackground(shape(CARD, 16, false));
+        proxyControls.setClipToOutline(true);
+        modeRow = new ProxyModeRow(this, this::changeProxyMode);
+        groupsRow = new OverviewActionRow(this, "代理组与节点", true, () -> execute("", Controller::groups));
+        routingRow = new OverviewActionRow(this, "分流规则", false, this::openAppRouting);
+        add(proxyControls, modeRow, 0);
+        addDivider(proxyControls, 14);
+        add(proxyControls, groupsRow, 0);
+        addDivider(proxyControls, 14);
+        add(proxyControls, routingRow, 0);
+        add(overview, proxyControls, 16);
+        proxyHint = label("", 13, MUTED, false);
+        add(overview, proxyHint, 8);
+
         addNetworkCheckCard(overview);
-        section(overview, "代理控制");
-        modeButton = button("代理模式", false);
-        modeButton.setOnClickListener(view -> execute("", Controller::mode));
-        groupsButton = button("代理组与节点", false);
-        groupsButton.setOnClickListener(view -> execute("", Controller::groups));
-        for (Button control : new Button[]{modeButton, groupsButton}) {
-            control.setLines(2);
-            control.setLineSpacing(dp(5), 1f);
-            control.setEllipsize(TextUtils.TruncateAt.END);
-        }
-        buttonRow(overview, modeButton, groupsButton, 10);
-        connectionsButton = button("连接管理", false);
-        connectionsButton.setOnClickListener(view -> startActivity(new Intent(this, ConnectionsActivity.class)));
-        add(overview, connectionsButton, 10);
         trafficCard = new TrafficCard(this);
         trafficCard.setOnClickListener(view -> startActivity(new Intent(this, TrafficActivity.class)));
-        add(overview, trafficCard, 14);
-        proxyHint = label("", 13, MUTED, false);
-        add(overview, proxyHint, 10);
+        add(overview, trafficCard, 12);
 
         LinearLayout current = card(overview, 22);
         currentConfigCard = current;
@@ -310,6 +288,14 @@ public final class MainActivity extends ThemedActivity {
         Button manage = button("管理配置  →", false);
         manage.setOnClickListener(view -> selectPage(1));
         add(current, manage, 14);
+
+        LinearLayout connections = column();
+        connections.setBackground(new AppUi(this).overviewCardSurface());
+        connections.setClipToOutline(true);
+        connectionsRow = new OverviewActionRow(this, "连接管理", false,
+            () -> startActivity(new Intent(this, ConnectionsActivity.class)));
+        add(connections, connectionsRow, 0);
+        add(overview, connections, 16);
 
         LinearLayout profiles = page(content, 1);
         header(profiles, "配置", "订阅、分流与本地配置");
@@ -340,14 +326,10 @@ public final class MainActivity extends ThemedActivity {
         LinearLayout routing = card(profiles, 14);
         add(routing, label("分流规则", 17, TEXT, true), 0);
         add(routing, label("应用分流 → 自定义规则 → 订阅规则", 12, MINT, false), 8);
-        routingButton = button("应用分流  ›", false);
+        routingButton = button("管理分流规则  ›", false);
         routingButton.setOnClickListener(view -> openAppRouting());
         add(routing, routingButton, 14);
-        add(routing, label("按应用指定直连或代理组。", 12, MUTED, false), 6);
-        personalRulesButton = button("域名与 IP 分流  ›", false);
-        personalRulesButton.setOnClickListener(view -> execute("", this::readPersonalRules));
-        add(routing, personalRulesButton, 12);
-        add(routing, label("按域名、IPv4 或 IPv6 自定义出口。", 12, MUTED, false), 6);
+        add(routing, label("按应用、域名或 IP 自定义出口。", 12, MUTED, false), 6);
         LinearLayout experimental = column();
         experimentalRouting = experimental;
         add(routing, experimental, 0);
@@ -403,6 +385,7 @@ public final class MainActivity extends ThemedActivity {
         LinearLayout connectionSettings = settingsNavigation.group("连接");
         settingsNavigation.action(connectionSettings, "protection", "应用防泄漏保护 · 开发中", "指定应用使用代理，断线时暂停联网", () -> startActivity(new Intent(this, ProtectionActivity.class)));
         LinearLayout servicePage = settingsNavigation.page(connectionSettings, "connection", "连接与启动", "开机自启与热点共享");
+        LinearLayout webRtcPage = settingsNavigation.page(connectionSettings, "webrtc", "WebRTC 管理", "按应用限制点对点连接");
         LinearLayout keepAlivePage = settingsNavigation.page(connectionSettings, "keepalive", "后台连接保活", "改善后台长连接恢复");
         LinearLayout backgroundGuidePage = settingsNavigation.page(connectionSettings, "background-guide", "后台连接恢复指南", "返回后连接中、消息刷新慢");
         new BackgroundConnectionGuide(this, backgroundGuidePage, this::showMessage,
@@ -498,6 +481,37 @@ public final class MainActivity extends ThemedActivity {
         add(notificationPermissions, foregroundAppButton, 8);
         add(notificationPermissions, label("悬浮窗用于切换模式与节点。使用情况访问用于显示当前应用及其实际出口。划掉后台后通知消失时，请检查自启动与省电策略。", 12, MUTED, false), 10);
 
+        LinearLayout webRtc = card(webRtcPage, 0);
+        webRtcSwitch = new Switch(this);
+        webRtcSwitch.setText("限制 WebRTC 连接");
+        webRtcSwitch.setTextColor(TEXT);
+        webRtcSwitch.setTextSize(16);
+        webRtcSwitch.setMinHeight(dp(48));
+        webRtcSwitch.setThumbTintList(bootSwitch.getThumbTintList());
+        webRtcSwitch.setTrackTintList(bootSwitch.getTrackTintList());
+        webRtcSwitch.setOnCheckedChangeListener((button, checked) -> {
+            if (!updatingSwitch) saveWebRtc(checked);
+        });
+        add(webRtc, webRtcSwitch, 0);
+        webRtcSummary = label("", 13, MINT, false);
+        add(webRtc, webRtcSummary, 8);
+        webRtcRulesButton = button("应用规则  ›", false);
+        webRtcRulesButton.setOnClickListener(view -> {
+            if (InstalledAppsAccess.needsRequest(this)) {
+                requestPermissions(new String[] {InstalledAppsAccess.RUNTIME_PERMISSION}, REQUEST_WEBRTC_APP_LIST);
+            } else openWebRtcRules();
+        });
+        add(webRtc, webRtcRulesButton, 10);
+        webRtcApplyButton = button("重连 TUN 并应用", false);
+        webRtcApplyButton.setOnClickListener(view -> applyWebRtc());
+        add(webRtc, webRtcApplyButton, 10);
+        add(webRtc, label("有些直播应用会通过点对点分享，把你正在观看的直播片段上传给其他观众，消耗上行流量。若某个直播应用观看时上传明显，可将它加入规则，再开启限制。",
+            13, MUTED, false), 14);
+        add(webRtc, label("只限制规则里选中的应用。要保留微信视频通话、屏幕共享或联机体验，让对应应用保持未勾选。",
+            13, MUTED, false), 8);
+        add(webRtc, label("仅拦截经过 TUN 的 UDP STUN 握手和常用 STUN／TURN 端口（3478、5349）。其他中继、自有协议、绕过 TUN 或无法归属到单个应用的连接仍可通过。",
+            12, MUTED, false), 8);
+
         LinearLayout keepAlive = card(keepAlivePage, 0);
         add(keepAlive, label("后台连接保活", 17, TEXT, true), 0);
         keepAliveSwitch = new Switch(this);
@@ -551,6 +565,9 @@ public final class MainActivity extends ThemedActivity {
         add(moduleCard, label("内置模块", 17, TEXT, true), 0);
         moduleSummary = label("", 13, MUTED, false);
         add(moduleCard, moduleSummary, 8);
+        moduleNotesButton = button("查看模块更新内容", false);
+        moduleNotesButton.setOnClickListener(view -> showModuleReleaseNotes());
+        add(moduleCard, moduleNotesButton, 12);
         installButton = button("安装内置模块", true);
         installButton.setOnClickListener(view -> confirmInstall());
         add(moduleCard, installButton, 18);
@@ -642,41 +659,16 @@ public final class MainActivity extends ThemedActivity {
                 })).show());
         add(diagnostics, repairDnsButton, 10);
 
-        subscriptionIndicator = new SubscriptionQuotaIndicator(this,
-            () -> { if (subscriptions != null && subscriptions.active() != null) showUsage(subscriptions.active()); });
-        FrameLayout.LayoutParams indicatorParams = new FrameLayout.LayoutParams(dp(56), dp(64), Gravity.TOP | Gravity.END);
-        indicatorParams.topMargin = dp(24); indicatorParams.setMarginEnd(dp(18));
-        subscriptionIndicator.setVisibility(View.GONE);
-        content.addView(subscriptionIndicator, indicatorParams);
-
         messageText = label("", 12, AMBER, false);
         messageText.setPadding(dp(18), dp(12), dp(18), dp(12));
         messageText.setBackgroundColor(AppUi.tone(0xff302b22, 0xfffff0d6));
         messageText.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         messageText.setOnClickListener(view -> { main.removeCallbacks(dismissMessage); dismissMessage.run(); });
         root.addView(messageText);
-        LinearLayout bar = new LinearLayout(this);
-        bar.setPadding(dp(16), dp(10), dp(16), dp(10));
-        bar.setBackgroundColor(CARD);
-        String[] titles = {"概览", "配置", "设置", "关于"};
-        for (int i = 0; i < navigation.length; i++) {
-            final int index = i;
-            Button item = button(titles[i], false);
-            item.setMinHeight(dp(46));
-            item.setMinimumHeight(dp(46));
-            item.setPadding(dp(8), dp(8), dp(8), dp(8));
-            item.setOnClickListener(view -> {
-                if (index == 2 && selectedPage == 2) settingsNavigation.back();
-                selectPage(index);
-            });
-            navigation[i] = item;
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1);
-            if (i > 0) params.leftMargin = dp(8);
-            bar.addView(item, params);
-        }
-        root.addView(bar);
+        addNavigation(root);
         try { bundledModule = BundledModule.info(this); }
         catch (IOException error) { showMessage("无法读取内置模块信息，现有模块仍可继续运行。"); }
+        moduleReleaseNotes = ModuleReleaseNotes.load(this);
         if (savedInstanceState != null) pendingUpdate = (AppUpdate.Release) savedInstanceState.getSerializable("pendingUpdate");
         if (autoUpdateSwitch.isChecked() && !SubscriptionUpdateJob.schedule(this, true)) {
             appPreferences().edit().putBoolean(SubscriptionUpdateJob.ENABLED, false).apply();
@@ -705,6 +697,7 @@ public final class MainActivity extends ThemedActivity {
         visible = true;
         networkObserver = new NetworkObserver(this, () -> {
             if (!visible || !appPreferences().getBoolean("connected", false)) return;
+            if (isActive()) fastStatusUntil = SystemClock.elapsedRealtime() + 8000;
             ProxyNotificationService.connectionChanged(this);
             resetNetworkChecks();
             scheduleLatency(1000);
@@ -944,40 +937,107 @@ public final class MainActivity extends ThemedActivity {
         super.onDestroy();
     }
 
+    private void addConnectionCard(LinearLayout overview) {
+        LinearLayout dashboard = column();
+        connectionCard = dashboard;
+        dashboard.setPadding(dp(16), dp(14), dp(16), dp(14));
+        GradientDrawable connected = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+            new int[] {AppUi.tone(0xff203a35, 0xffe2f3ec), CARD});
+        connected.setCornerRadius(dp(20));
+        connected.setStroke(dp(1), AppUi.tone(0xff386057, 0xffc2ded1));
+        StateListDrawable surface = new StateListDrawable();
+        surface.addState(new int[] {android.R.attr.state_activated}, connected);
+        surface.addState(new int[] {}, shape(CARD, 20, true));
+        dashboard.setBackground(surface);
+
+        LinearLayout heading = new LinearLayout(this);
+        heading.setGravity(Gravity.CENTER_VERTICAL);
+        connectionDot = shape(MUTED, 8, false);
+        connectionDot.setBounds(0, 0, dp(8), dp(8));
+        stateText = label("准备连接", 21, TEXT, true);
+        stateText.setCompoundDrawablesRelative(connectionDot, null, null, null);
+        stateText.setCompoundDrawablePadding(dp(8));
+        stateText.setAccessibilityHeading(true);
+        stateText.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        heading.addView(stateText, new LinearLayout.LayoutParams(0, -2, 1));
+
+        toggle = button("检测环境", true);
+        toggle.setTextSize(13);
+        toggle.setMinHeight(dp(48));
+        toggle.setOnClickListener(view -> toggleTun());
+        var configuration = getResources().getConfiguration();
+        boolean stack = configuration.screenWidthDp < 360 || configuration.fontScale >= 1.3f;
+        if (!stack) {
+            LinearLayout.LayoutParams action = new LinearLayout.LayoutParams(-2, -2);
+            action.setMarginStart(dp(8));
+            heading.addView(toggle, action);
+        }
+        add(dashboard, heading, 0);
+        detailText = label("先检测环境，再导入你的配置。", 13, MUTED, false);
+        add(dashboard, detailText, 6);
+        if (stack) add(dashboard, toggle, 12);
+        add(overview, dashboard, 10);
+    }
+
+    private void toggleTun() {
+        if (status == null) { refresh(); return; }
+        if (!status.installed()) { selectPage(2); return; }
+        boolean stop = isActive();
+        execute("", true, () -> {
+            BackupStore backup = new BackupStore(this);
+            if (!stop) {
+                if (backup.recoverPending()) refreshSubscriptionCatalog();
+                ExperimentalFeatures.reconcile(this, Module.status());
+            }
+            Module.run(stop ? Module.Command.STOP : Module.Command.START, null);
+            if (stop && backup.recoverPending()) refreshSubscriptionCatalog();
+            return Module.status();
+        });
+    }
+
     private void addNetworkCheckCard(LinearLayout overview) {
-        add(overview, label("连接延迟", 12, MUTED, true), 14);
-        FrameLayout checks = new FrameLayout(this);
-        checks.setMinimumHeight(dp(48));
-        checks.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9), shape(CARD, 14, true), null));
-        checks.setFocusable(true);
-        checks.setContentDescription("Google 和 Cloudflare 节点延迟，百度直连延迟，点按重新测试");
-        checks.setOnClickListener(view -> checkNetwork(true));
-        networkCheckArea = checks;
+        LinearLayout checks = column();
+        checks.setBackground(new AppUi(this).overviewCardSurface());
+        checks.setPadding(dp(14), 0, dp(14), dp(12));
+
+        LinearLayout heading = new LinearLayout(this);
+        heading.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = label("连接延迟 ›", 15, TEXT, true);
+        title.setAccessibilityHeading(true);
+        title.setContentDescription("连接延迟，打开封锁测试");
+        title.setGravity(Gravity.CENTER_VERTICAL);
+        title.setMinHeight(dp(48));
+        title.setFocusable(true);
+        title.setOnClickListener(view -> startActivity(new Intent(this, ServiceCheckActivity.class)));
+        heading.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        networkCheckAction = label("重新测试 ›", 12, MUTED, false);
+        networkCheckAction.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
+        networkCheckAction.setMinHeight(dp(48));
+        networkCheckAction.setPaddingRelative(dp(8), 0, 0, 0);
+        networkCheckAction.setFocusable(true);
+        networkCheckAction.setOnClickListener(view -> checkNetwork(true));
+        heading.addView(networkCheckAction);
+        add(checks, heading, 0);
 
         LinearLayout row = new LinearLayout(this);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        for (NetworkCheck target : NetworkCheck.values()) {
+        row.setBaselineAligned(false);
+        for (NetworkCheck target : new NetworkCheck[] {NetworkCheck.GOOGLE, NetworkCheck.CLOUDFLARE, NetworkCheck.BAIDU}) {
             LinearLayout site = column();
-            TextView name = label(target == NetworkCheck.BAIDU ? "百度 · 直连" : target.label, 11, TEXT, true);
-            name.setGravity(Gravity.CENTER);
+            TextView name = label(target == NetworkCheck.BAIDU ? "百度 · 直连" : target.label, 12, MUTED, false);
+            name.setIncludeFontPadding(true);
             add(site, name, 0);
-            TextView result = label("—", 12, MUTED, true);
-            result.setGravity(Gravity.CENTER);
-            add(site, result, 4);
+            TextView result = label("—", 15, MUTED, true);
+            result.setFontFeatureSettings("tnum");
+            add(site, result, 3);
             row.addView(site, new LinearLayout.LayoutParams(0, -2, 1));
             networkResults[target.ordinal()] = result;
         }
-        FrameLayout.LayoutParams rowParams = new FrameLayout.LayoutParams(-1, -2, Gravity.CENTER_VERTICAL);
-        rowParams.leftMargin = dp(12);
-        rowParams.rightMargin = dp(12);
-        rowParams.topMargin = dp(8);
-        rowParams.bottomMargin = dp(8);
-        checks.addView(row, rowParams);
-        add(overview, checks, 6);
+        add(checks, row, 2);
         networkWarning = label("", 12, AMBER, false);
         networkWarning.setVisibility(View.GONE);
         networkWarning.setOnClickListener(view -> selectPage(3));
-        add(overview, networkWarning, 6);
+        add(checks, networkWarning, 8);
+        add(overview, checks, 16);
     }
 
     private void scheduleLatency(long delay) {
@@ -1000,16 +1060,21 @@ public final class MainActivity extends ThemedActivity {
         nodeLatencyAvailable = false;
         boolean confirm = !manual && confirmNextLatency;
         if (confirm) confirmNextLatency = false;
-        networkCheckArea.setEnabled(false);
+        updateNetworkCheckAction();
         for (NetworkCheck target : NetworkCheck.values()) {
             if (manual || networkResults[target.ordinal()].getText().toString().equals("—")) {
-                showNetworkResult(target, "…", MUTED);
+                showNetworkResult(target, "测速中", MUTED);
             }
+        }
+        measureNetworkTarget(generation, "DIRECT", NetworkCheck.BAIDU, confirm);
+        if (!manual && proxySummary != null) {
+            measureProxyTargets(generation, proxySummary.probeOutlet(), confirm);
+            return;
         }
         networkWorker.execute(() -> {
             if (generation != networkCheckGeneration) return;
             String node = null;
-            try { node = Controller.primaryProxy(); }
+            try { node = Controller.overview().probeOutlet(); }
             catch (Exception ignored) { }
             String outlet = node;
             main.post(() -> {
@@ -1018,14 +1083,18 @@ public final class MainActivity extends ThemedActivity {
                     resetNetworkChecks();
                     return;
                 }
-                nodeLatencyAvailable = outlet != null;
-                for (NetworkCheck target : NetworkCheck.values()) {
-                    String exit = target == NetworkCheck.BAIDU ? "DIRECT" : outlet;
-                    if (exit == null) finishNetworkCheck(generation, target, -1);
-                    else measureNetworkTarget(generation, exit, target, confirm);
-                }
+                measureProxyTargets(generation, outlet, confirm);
             });
         });
+    }
+
+    private void measureProxyTargets(int generation, String outlet, boolean confirm) {
+        nodeLatencyAvailable = outlet != null;
+        for (NetworkCheck target : NetworkCheck.values()) {
+            if (target == NetworkCheck.BAIDU) continue;
+            if (outlet == null) finishNetworkCheck(generation, target, -1);
+            else measureNetworkTarget(generation, outlet, target, confirm);
+        }
     }
 
     private void measureNetworkTarget(int generation, String outlet, NetworkCheck target, boolean confirm) {
@@ -1041,7 +1110,7 @@ public final class MainActivity extends ThemedActivity {
                     finishNetworkCheck(generation, target, result);
                     return;
                 }
-                showNetworkResult(target, "复测中…", MUTED);
+                showNetworkResult(target, "复测中", MUTED);
                 main.postDelayed(() -> {
                     if (isDestroyed() || generation != networkCheckGeneration) return;
                     if (visible && selectedPage == 0) measureNetworkTarget(generation, outlet, target, false);
@@ -1057,9 +1126,9 @@ public final class MainActivity extends ThemedActivity {
         if (target == NetworkCheck.GOOGLE) googleReachable = reachable;
         if (target == NetworkCheck.CLOUDFLARE) cloudflareReachable = reachable;
         showNetworkResult(target, reachable ? delay + " ms" : delay < 0 ? "—" : "失败",
-            reachable ? MINT : delay < 0 ? MUTED : AMBER);
+            reachable ? TEXT : delay < 0 ? MUTED : AMBER);
         if (--networkChecksPending == 0) {
-            networkCheckArea.setEnabled(!busy);
+            updateNetworkCheckAction();
             boolean foreignUnavailable = nodeLatencyAvailable && !googleReachable && !cloudflareReachable;
             if (hasProxyControl(status) && foreignUnavailable) {
                 networkWarning.setText("节点的 Google 和 Cloudflare 测速均未通过 · 查看诊断  →");
@@ -1077,7 +1146,15 @@ public final class MainActivity extends ThemedActivity {
         confirmNextLatency = true;
         networkWarning.setVisibility(View.GONE);
         for (NetworkCheck target : NetworkCheck.values()) showNetworkResult(target, "—", MUTED);
-        networkCheckArea.setEnabled(!busy);
+        updateNetworkCheckAction();
+    }
+
+    private void updateNetworkCheckAction() {
+        boolean available = hasProxyControl(status);
+        networkCheckAction.setEnabled(available && !busy && networkChecksPending == 0);
+        networkCheckAction.setVisibility(available ? View.VISIBLE : View.GONE);
+        String action = networkChecksPending == 0 ? "重新测试 ›" : "测速中";
+        if (!action.contentEquals(networkCheckAction.getText())) networkCheckAction.setText(action);
     }
 
     private void showNetworkResult(NetworkCheck target, String value, int color) {
@@ -1110,7 +1187,7 @@ public final class MainActivity extends ThemedActivity {
         worker.execute(() -> {
             try {
                 Module.Status updated = Module.status();
-                ProxySummary summary = readProxySummary(updated);
+                Controller.Overview summary = readProxySummary(updated);
                 main.post(() -> {
                     if (isDestroyed()) return;
                     polling = false;
@@ -1136,20 +1213,19 @@ public final class MainActivity extends ThemedActivity {
     private void schedulePoll() {
         main.removeCallbacks(poll);
         // Root's boot service, a tile, or a repair can start TUN while this screen says stopped.
-        if (visible && !busy && status != null && status.installed()) main.postDelayed(poll, 4000);
+        if (visible && !busy && status != null && status.installed()) {
+            main.postDelayed(poll, SystemClock.elapsedRealtime() < fastStatusUntil ? 1000 : 4000);
+        }
     }
 
     private static boolean hasProxyControl(Module.Status status) {
         return status != null && status.running() && status.control;
     }
 
-    private static ProxySummary readProxySummary(Module.Status status) {
+    private static Controller.Overview readProxySummary(Module.Status status) {
         if (!hasProxyControl(status)) return null;
-        Controller.Mode mode;
-        try { mode = Controller.mode(); }
+        try { return Controller.overview(); }
         catch (Exception error) { return null; }
-        try { return new ProxySummary(mode, Controller.primaryNode(mode)); }
-        catch (Exception error) { return new ProxySummary(mode, "暂不可用"); }
     }
 
     private void refreshSubscriptionCatalog() {
@@ -1320,16 +1396,41 @@ public final class MainActivity extends ThemedActivity {
         }
     }
 
+    private void showModuleReleaseNotes() {
+        trackManagement(new AlertDialog.Builder(this).setTitle("模块更新内容")
+            .setMessage(moduleReleaseNotes.message(bundledModule, status))
+            .setPositiveButton("关闭", null).show());
+    }
+
     private void confirmInstall() {
-        new AlertDialog.Builder(this).setTitle("安装内置模块 " + bundledModule.version())
-            .setMessage("通过 Root 管理器安装模块，保留已有配置。安装完成后，请手动重启手机使其生效。")
-            .setNegativeButton("取消", null).setPositiveButton("安装", (dialog, which) -> {
+        boolean replacePending = status != null && status.pendingUpdateAvailable(bundledModule.revision());
+        boolean update = replacePending || status != null && status.updateAvailable(bundledModule.revision());
+        String installExplanation = replacePending
+            ? "将待生效的 " + status.pendingVersion + " 更新为内置模块 " + bundledModule.version()
+                + "。安装完成后，重启一次即可启用新版。"
+            : "通过 Root 管理器安装模块，保留已有配置。安装完成后，请手动重启手机使其生效。";
+        trackManagement(new AlertDialog.Builder(this).setTitle(update ? "确认更新模块" : "确认安装模块")
+            .setMessage(installExplanation + "\n\n" + moduleReleaseNotes.message(bundledModule, status))
+            .setNegativeButton("取消", null).setPositiveButton(update ? "更新" : "安装", (dialog, which) -> {
                 showMessage("正在安装内置模块，请稍候…");
                 execute("模块安装完成，重启手机后生效。", () -> {
+                    Module.Status before = Module.status();
+                    if (before.functionalRevision() > bundledModule.revision()) {
+                        throw new IOException("检测到更新的模块，请刷新模块状态。");
+                    }
+                    boolean replacing = before.hasPendingModule();
+                    if (replacing && !before.pendingUpdateAvailable(bundledModule.revision())) {
+                        throw new IOException("待生效模块状态已变化，请刷新模块状态。");
+                    }
                     BundledModule.install(this);
-                    return Module.status();
+                    Module.Status after = Module.status();
+                    if (replacing && (after.pendingFunctionalRevision() != bundledModule.revision()
+                        || !after.pendingVersion.equals(bundledModule.version()))) {
+                        throw new IOException("暂未确认新版已暂存，请在 Root 管理器核对待生效版本后再重启。");
+                    }
+                    return after;
                 });
-            }).show();
+            }).show());
     }
 
     private void exportModule() {
@@ -1938,6 +2039,139 @@ public final class MainActivity extends ThemedActivity {
         });
     }
 
+    private void saveWebRtc(boolean enabled) {
+        execute("WebRTC 设置已保存，下次启动 TUN 时应用。", () -> {
+            Module.Status current = Module.status();
+            if (!current.enabled || !current.webRtc.available() || enabled && !current.webRtc.rules()) {
+                throw new IOException("请启用支持 WebRTC 应用规则的 MinClash 模块。");
+            }
+            Module.run(enabled ? Module.Command.WEBRTC_ON : Module.Command.WEBRTC_OFF, null);
+            return Module.status();
+        });
+    }
+
+    private void openWebRtcRules() {
+        execute("", () -> {
+            requireWebRtcRules();
+            Set<String> packages = new LinkedHashSet<>();
+            for (String line : Module.run(Module.Command.WEBRTC_GET, null).split("\\R")) {
+                if (!line.isEmpty()) packages.add(line);
+            }
+            // Like application routing, try the Android inventory before the Root fallback.
+            List<AppRouting.Entry> installed = routingLoader.installedApps(this, true);
+            return new WebRtcRules(packages, installed);
+        });
+    }
+
+    private void requireWebRtcRules() throws Exception {
+        Module.Status current = Module.status();
+        if (!current.enabled || !current.webRtc.rules()) {
+            throw new IOException("请启用支持 WebRTC 应用规则的 MinClash 模块。");
+        }
+    }
+
+    private void showWebRtcRules(WebRtcRules rules) {
+        Set<String> selected = new LinkedHashSet<>(rules.packages());
+        Map<String, AppRouting.Entry> entries = new TreeMap<>();
+        for (AppRouting.Entry app : rules.installed()) {
+            if (app.userFacing() || selected.contains(app.packageName())) entries.put(app.packageName(), app);
+        }
+        for (String name : selected) {
+            entries.putIfAbsent(name, new AppRouting.Entry(name, name, "", false, false, false));
+        }
+        var collator = java.text.Collator.getInstance();
+        List<AppRouting.Entry> apps = new ArrayList<>(entries.values());
+        apps.sort(Comparator.comparing((AppRouting.Entry app) -> !selected.contains(app.packageName()))
+            .thenComparing(AppRouting.Entry::label, collator).thenComparing(AppRouting.Entry::packageName));
+
+        AppUi ui = new AppUi(this);
+        LinearLayout heading = column();
+        heading.setPadding(dp(20), dp(16), dp(20), dp(10));
+        add(heading, label("WebRTC 应用规则", 20, TEXT, true), 0);
+        EditText search = ui.search("搜索应用名称或包名");
+        add(heading, search, 10);
+        TextView count = label("", 12, MUTED, false);
+        add(heading, count, 8);
+        AppUi.Summaries adapter = ui.new Summaries();
+        AlertDialog dialog = new AlertDialog.Builder(this).setCustomTitle(heading)
+            .setAdapter(adapter, null).setNegativeButton("取消", null).setPositiveButton("保存规则", null).show();
+        trackManagement(dialog);
+        ui.styleList(dialog);
+        enableSearchKeyboard(dialog);
+        Button save = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        Runnable filter = () -> {
+            String query = search.getText().toString().trim().toLowerCase(Locale.ROOT);
+            List<AppUi.Summary> rows = new ArrayList<>();
+            for (int i = 0; i < apps.size(); i++) {
+                AppRouting.Entry app = apps.get(i);
+                if (!(app.label() + " " + app.packageName()).toLowerCase(Locale.ROOT).contains(query)) continue;
+                String detail = app.packageName() + (app.installed() ? "" : " · 未安装");
+                rows.add(new AppUi.Summary(app.label(), detail,
+                    selected.contains(app.packageName()) ? "✓ 限制" : "不限制", i));
+            }
+            adapter.empty("没有匹配的应用");
+            adapter.set(rows);
+            count.setText("仅限制已勾选的应用 · 已选 " + selected.size() + " 个");
+            save.setEnabled(!busy && !selected.equals(rules.packages()));
+        };
+        filter.run();
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence text, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence text, int start, int before, int count) { filter.run(); }
+            @Override public void afterTextChanged(Editable text) {}
+        });
+        dialog.getListView().setOnItemClickListener((parent, view, position, id) -> {
+            AppUi.Summary row = adapter.getItem(position);
+            if (busy || row == null) return;
+            String name = apps.get(row.sourceIndex()).packageName();
+            if (!selected.remove(name)) {
+                if (selected.size() >= 128) {
+                    count.setText("最多选择 128 个应用");
+                    return;
+                }
+                selected.add(name);
+            }
+            filter.run();
+        });
+        save.setOnClickListener(view -> {
+            if (busy) return;
+            byte[] payload = String.join("\n", selected).getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            save.setEnabled(false);
+            execute("WebRTC 应用规则已保存。", false, () -> {
+                requireWebRtcRules();
+                Module.run(Module.Command.WEBRTC_SET_APPS, payload);
+                return Module.status();
+            }, error -> {
+                if (!dialog.isShowing()) return;
+                if (error == null) dialog.dismiss();
+                else {
+                    count.setText(error.getMessage() == null ? "保存失败，请重试。" : error.getMessage());
+                    save.setEnabled(true);
+                }
+            });
+        });
+    }
+
+    private void applyWebRtc() {
+        execute("WebRTC 设置已应用。", true, () -> {
+            Module.Status before = Module.status();
+            if (!before.webRtc.available() || !before.running()) {
+                throw new IOException("请等待 TUN 就绪，或在下次启动时应用设置。");
+            }
+            if (!before.webRtc.needsRestart(true)) return before;
+            try {
+                RoutingStore.reconnect(before);
+            } catch (Exception error) {
+                throw new IOException("WebRTC 设置已保存，但重连或恢复节点选择未完成，请检查 TUN 状态与代理组。", error);
+            }
+            Module.Status after = Module.status();
+            if (!after.running() || !after.webRtc.available() || after.webRtc.needsRestart(true)) {
+                throw new IOException("WebRTC 设置已保存，等待 TUN 就绪后应用。");
+            }
+            return after;
+        });
+    }
+
     private void showKeepAliveLevels() {
         boolean enabled = status != null && status.keepAlive.configured() != TcpKeepAlive.Mode.OFF;
         trackManagement(KeepAliveDialog.show(this, selectedKeepAliveLevel(), enabled, mode -> {
@@ -2005,21 +2239,12 @@ public final class MainActivity extends ThemedActivity {
         }).setNegativeButton("取消", null).show();
     }
 
-    private void showModes(Controller.Mode current) {
-        Controller.Mode[] modes = Controller.Mode.values();
-        String[] labels = new String[modes.length];
-        for (int i = 0; i < modes.length; i++) labels[i] = modes[i].label;
-        new AlertDialog.Builder(this).setTitle("代理模式")
-            .setSingleChoiceItems(labels, current.ordinal(), (dialog, index) -> {
-                dialog.dismiss();
-                if (modes[index] != current) {
-                    Controller.Mode mode = modes[index];
-                    execute("已切换到" + mode.label + "模式。", true, () -> {
-                        Module.run(mode.command, null);
-                        return Module.status();
-                    });
-                }
-            }).setNegativeButton("取消", null).show();
+    private void changeProxyMode(Controller.Mode mode) {
+        if (!hasProxyControl(status)) return;
+        execute("已切换到" + mode.label + "模式。", true, () -> {
+            Module.run(mode.command, null);
+            return Module.status();
+        });
     }
 
     private void showGroups(List<Controller.Group> groups) {
@@ -2377,6 +2602,10 @@ public final class MainActivity extends ThemedActivity {
             return;
         }
         if (request == REQUEST_APP_LIST) refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false));
+        if (request == REQUEST_WEBRTC_APP_LIST) {
+            routingLoader.invalidate();
+            openWebRtcRules();
+        }
     }
 
     private void refreshAppRouting(boolean allowRoot) {
@@ -2439,8 +2668,15 @@ public final class MainActivity extends ThemedActivity {
             showAppRouting(cached);
             return;
         }
-        AlertDialog loading = new AlertDialog.Builder(this).setTitle("应用分流")
+        TextView title = routingTitle(true);
+        title.setPaddingRelative(dp(20), 0, dp(20), 0);
+        AlertDialog loading = new AlertDialog.Builder(this).setCustomTitle(title)
             .setMessage("正在读取应用和出口…").setNegativeButton("关闭", null).show();
+        title.setOnClickListener(view -> {
+            if (busy) return;
+            loading.dismiss();
+            openPersonalRules(loading);
+        });
         readAppRouting(allowRoot).whenComplete((snapshot, error) -> main.post(() -> {
             if (isDestroyed() || !loading.isShowing()) return;
             if (error != null) {
@@ -2506,8 +2742,11 @@ public final class MainActivity extends ThemedActivity {
                 ? "此系统没有可弹窗申请的应用列表权限；已声明的查询权限在安装时授予，但普通查询仍未返回其他应用。"
                 : InstalledAppsAccess.needsRequest(this) ? "读取应用列表权限尚未授予，普通查询未返回其他应用。"
                 : "读取应用列表权限已授予，但普通查询仍未返回其他应用。";
-            new AlertDialog.Builder(this).setTitle("未能读取应用列表")
-                .setMessage(reason + "\n\n可前往应用设置检查权限，或使用现有 Root 授权读取。选择 Root 后会记住此选择，每次仍先尝试普通查询。")
+            TextView title = routingTitle(true);
+            title.setPaddingRelative(dp(20), 0, dp(20), 0);
+            AlertDialog unavailable = new AlertDialog.Builder(this).setCustomTitle(title)
+                .setMessage("未能读取应用列表。\n\n" + reason
+                    + "\n\n可前往应用设置检查权限，或使用现有 Root 授权读取。选择 Root 后会记住此选择，每次仍先尝试普通查询。")
                 .setNegativeButton("取消", null)
                 .setNeutralButton("应用设置", (dialog, which) -> {
                     try {
@@ -2516,6 +2755,7 @@ public final class MainActivity extends ThemedActivity {
                     } catch (android.content.ActivityNotFoundException error) { showMessage("无法打开系统应用设置。"); }
                 })
                 .setPositiveButton("用 Root 读取", (dialog, which) -> enableRootRouting()).show();
+            title.setOnClickListener(view -> openPersonalRules(unavailable));
             return;
         }
         LinearLayout content = column();
@@ -2523,7 +2763,8 @@ public final class MainActivity extends ThemedActivity {
         content.setPadding(dp(20), dp(18), dp(20), dp(8));
         LinearLayout heading = new LinearLayout(this);
         heading.setGravity(Gravity.CENTER_VERTICAL);
-        heading.addView(label("应用分流", 20, TEXT, true), new LinearLayout.LayoutParams(0, -2, 1));
+        TextView title = routingTitle(true);
+        heading.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
         Button permission = button("权限", false);
         permission.setTextSize(12);
         permission.setMinHeight(dp(32));
@@ -2639,6 +2880,7 @@ public final class MainActivity extends ThemedActivity {
             for (int which : new int[]{AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_NEUTRAL})
                 dialog.getButton(which).setEnabled(false);
             permission.setEnabled(false);
+            title.setEnabled(false);
             categoryButton.setEnabled(false);
             manageCategories.setEnabled(false);
             execute("", true, () -> {
@@ -2671,6 +2913,7 @@ public final class MainActivity extends ThemedActivity {
                     for (int which : new int[]{AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_NEUTRAL})
                         dialog.getButton(which).setEnabled(true);
                     permission.setEnabled(true);
+                    title.setEnabled(true);
                     categoryButton.setEnabled(true);
                     manageCategories.setEnabled(true);
                 }
@@ -2681,6 +2924,13 @@ public final class MainActivity extends ThemedActivity {
             if (pending.isEmpty() && !reapply[0]) dialog.dismiss();
             else new AlertDialog.Builder(this).setTitle("放弃未应用的分流修改？")
                 .setNegativeButton("继续编辑", null).setPositiveButton("放弃", (d,w) -> dialog.dismiss()).show();
+        });
+        title.setOnClickListener(view -> {
+            if (busy) return;
+            if (pending.isEmpty() && !reapply[0]) openPersonalRules(dialog);
+            else new AlertDialog.Builder(this).setTitle("切换前放弃未应用的分流修改？")
+                .setNegativeButton("继续编辑", null)
+                .setPositiveButton("放弃并切换", (d, w) -> openPersonalRules(dialog)).show();
         });
         dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
             if (busy) return;
@@ -2952,12 +3202,33 @@ public final class MainActivity extends ThemedActivity {
         return new RulesScreen(state, RoutingStore.generation(), targets);
     }
 
+    private TextView routingTitle(boolean applications) {
+        String current = applications ? "应用分流" : "域名与 IP 分流";
+        String other = applications ? "域名与 IP 分流" : "应用分流";
+        TextView title = label(current + " ⇄", 20, TEXT, true);
+        title.setGravity(Gravity.CENTER_VERTICAL);
+        title.setMinHeight(dp(48));
+        title.setFocusable(true);
+        title.setAccessibilityHeading(true);
+        title.setContentDescription(current + "，点击切换到" + other);
+        return title;
+    }
+
+    private void openPersonalRules(AlertDialog previous) {
+        execute("", false, this::readPersonalRules, error -> {
+            if (error == null) previous.dismiss();
+            else new AlertDialog.Builder(this).setMessage(error.getMessage() == null
+                ? "无法读取域名与 IP 分流。" : error.getMessage()).setPositiveButton("知道了", null).show();
+        });
+    }
+
     private void showPersonalRules(RulesScreen screen) {
         List<PersonalRules.Rule> rules = screen.state().rules();
         AppUi ui = new AppUi(this);
         LinearLayout heading = column();
         heading.setPadding(dp(20), dp(16), dp(20), dp(12));
-        add(heading, label("自定义分流", 20, TEXT, true), 0);
+        TextView title = routingTitle(false);
+        add(heading, title, 0);
         add(heading, label("应用分流 → 本列表顺序 → 订阅规则", 12, MUTED, false), 6);
         EditText search = ui.search("搜索域名、网段或出口"); add(heading, search, 12);
         TextView count = label("共 " + rules.size() + " 条 · 仅规则模式生效", 11, MUTED, false); add(heading, count, 8);
@@ -2984,6 +3255,11 @@ public final class MainActivity extends ThemedActivity {
             .setAdapter(adapter, null)
             .setNegativeButton("关闭", null).setPositiveButton("添加规则", (dialog, which) -> editPersonalRule(screen, -1));
         AlertDialog shown = builder.show(); trackManagement(shown); ui.styleList(shown); enableSearchKeyboard(shown);
+        title.setOnClickListener(view -> {
+            if (busy) return;
+            shown.dismiss();
+            openAppRouting();
+        });
         shown.getListView().setOnItemClickListener((parent, view, position, id) -> {
             AppUi.Summary row = adapter.getItem(position); if (row == null) return;
             int index = row.sourceIndex(); shown.dismiss();
@@ -3202,7 +3478,7 @@ public final class MainActivity extends ThemedActivity {
                 Object result = operation.run();
                 Module.Status updatedStatus = result instanceof Module.Status updated ? updated
                     : result instanceof AppRouting.Screen screen ? screen.status() : null;
-                ProxySummary summary = readProxySummary(updatedStatus);
+                Controller.Overview summary = readProxySummary(updatedStatus);
                 main.post(() -> {
                     if (isDestroyed()) return;
                     busy = false;
@@ -3217,8 +3493,8 @@ public final class MainActivity extends ThemedActivity {
                     } else if (visible) {
                         if (result instanceof String logs) showLogs(logs);
                         if (result instanceof DiagnosticReport report) showDiagnosticReport(report.text());
-                        if (result instanceof Controller.Mode mode) showModes(mode);
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
+                        if (result instanceof WebRtcRules rules) showWebRtcRules(rules);
                         if (result instanceof RulesScreen screen) showPersonalRules(screen);
                         if (result instanceof AppRoutingSaved saved) showAppRoutingSaved(saved);
                         if (result instanceof AppConnectionsClosed closed)
@@ -3259,7 +3535,7 @@ public final class MainActivity extends ThemedActivity {
         });
     }
 
-    private void checkNetworkAfterStatus(Module.Status updated, ProxySummary summary, boolean requested) {
+    private void checkNetworkAfterStatus(Module.Status updated, Controller.Overview summary, boolean requested) {
         boolean running = hasProxyControl(updated);
         if (!requested && running == hasProxyControl(status)
             && (!running || summary == null || summary.equals(proxySummary))) return;
@@ -3293,37 +3569,17 @@ public final class MainActivity extends ThemedActivity {
         experimentalSwitch.setEnabled(!busy);
         updatingSwitch = false;
         boolean installed = status != null && status.installed();
-        boolean pending = status != null && !status.pendingVersion.isEmpty();
+        boolean pending = status != null && status.hasPendingModule();
         boolean enabled = installed && status.enabled;
-        boolean moduleUpdate = installed && bundledModule.valid() && status.updateAvailable(bundledModule.revision());
-        if (installed) {
-            stateText.setText(status.phase().label);
-            stateText.setTextColor(status.running() ? MINT : TEXT);
-            detailText.setText(status.profile ? status.hotspotEnabled
-                ? status.running() && status.hotspotState.startsWith("active") ? "配置已就绪 · 本机与热点共享代理"
-                    : "配置已就绪 · 热点共享待就绪"
-                : "配置已就绪 · 本机流量接管"
-                : "导入订阅或本地配置，开始连接。" );
-        } else {
-            stateText.setText(pending ? "等待重启" : status == null ? "准备连接" : "完成初始化");
-            stateText.setTextColor(TEXT);
-            detailText.setText(pending ? "重启手机后，内置模块将生效。"
-                : status == null ? "先检测环境，再导入你的配置。" : "前往设置，安装 App 内置的模块。" );
-        }
+        boolean pendingUpdate = pending && bundledModule.valid() && status.pendingUpdateAvailable(bundledModule.revision());
+        boolean moduleUpdate = pending ? pendingUpdate
+            : installed && bundledModule.valid() && status.updateAvailable(bundledModule.revision());
+        renderConnection(installed, pending, enabled);
         boolean running = installed && status.running();
         TrafficMonitor.INSTANCE.updateStatus(status);
-        if (installed && status.runtime.protectionDegraded()) detailText.setText(detailText.getText()
-            + "\n防泄漏规则未通过检查，正在尝试恢复。请查看保护设置。");
-        if (installed && status.runtime.tun6Required() && !status.runtime.tun6()) detailText.setText(detailText.getText()
-            + "\n检测到 IPv6 上游，IPv6 路由正在恢复。");
-        if (installed && status.protectionArmed) detailText.setText(detailText.getText()
-            + "\n已配置防泄漏阻断；停止 TUN 不会解除，可在设置中关闭保护。");
-        statusBadge.setText(running ? "● TUN 就绪" : busy ? "处理中" : pending ? "待重启" : "未连接");
-        statusBadge.setTextColor(running ? MINT : MUTED);
-        statusBadge.setBackground(shape(running ? AppUi.tone(0xff203a35, 0xffdff2e9) : AppUi.tone(0xff25313c, 0xffe9eef2), 10, false));
-        String setup = pending ? "模块已安装，重启手机后生效  →"
-            : status != null && !installed ? "首次使用：前往设置安装内置模块  →"
-            : moduleUpdate ? "模块有功能更新：" + bundledModule.version() + "，前往设置安装  →" : "";
+        String setup = pendingUpdate ? "可在重启前更新待生效模块至 " + bundledModule.version() + "  ›"
+            : pending ? "模块 " + status.pendingVersion + " 已暂存，重启手机后生效  →"
+            : moduleUpdate ? "模块有功能更新 · " + bundledModule.version() + " · 查看模块  ›" : "";
         setupHint.setText(setup);
         setupHint.setVisibility(setup.isEmpty() ? View.GONE : View.VISIBLE);
         SubscriptionCatalog.Entry active = subscriptions == null ? null : subscriptions.active();
@@ -3343,9 +3599,6 @@ public final class MainActivity extends ThemedActivity {
             + SubscriptionUsage.load(appPreferences(), active.address()).summary() + "\n" + update.summary(this)));
         if (busy) refreshButton.setText("处理中…");
         else refreshButton.setText(installed ? "刷新状态" : "检测环境");
-        toggle.setText(status == null ? "检测环境" : !installed ? "前往安装模块" : isActive() ? "停止 TUN" : "启动 TUN");
-        toggle.setEnabled(!busy && (status == null || (!installed && !pending)
-            || installed && (isActive() || enabled && status.profile)));
         boolean canImport = !busy && enabled && !isActive();
         importButton.setEnabled(canImport);
         subscriptionButton.setEnabled(!busy && subscriptions != null);
@@ -3360,19 +3613,18 @@ public final class MainActivity extends ThemedActivity {
         cancelSubscriptionButton.setEnabled(!busy);
         boolean hasControl = hasProxyControl(status);
         boolean canControl = !busy && hasControl;
-        modeButton.setEnabled(canControl);
-        groupsButton.setEnabled(canControl);
+        modeRow.render(hasControl && proxySummary != null ? proxySummary.mode() : null, canControl);
+        groupsRow.setEnabled(canControl);
         String unavailable = hasControl ? "暂不可用" : "—";
-        setProxyButtonText(modeButton, "代理模式", proxySummary == null ? unavailable : proxySummary.mode().label + "模式");
-        setProxyButtonText(groupsButton, "代理组与节点", proxySummary == null ? unavailable : proxySummary.node());
+        groupsRow.summary(!hasControl || proxySummary == null ? unavailable : proxySummary.node());
         routingButton.setEnabled(!busy && enabled && status.profile);
-        personalRulesButton.setEnabled(!busy && enabled && status.profile);
-        connectionsButton.setEnabled(!busy && hasProxyControl(status));
-        proxyHint.setText(installed && !status.control ? "请升级 MinClash Root 模块以使用代理控制。"
-            : installed && status.state.equals("running") ? "全局模式使用 GLOBAL 组。"
-            : "TUN 启动后可切换模式和节点。");
+        routingRow.setEnabled(routingButton.isEnabled());
+        connectionsRow.setEnabled(canControl);
+        boolean needsProxyControl = installed && !status.control;
+        proxyHint.setVisibility(needsProxyControl ? View.VISIBLE : View.GONE);
+        if (needsProxyControl) proxyHint.setText("请升级 MinClash Root 模块以使用代理控制。");
         refreshButton.setEnabled(!busy);
-        networkCheckArea.setEnabled(!busy && networkChecksPending == 0);
+        updateNetworkCheckAction();
         logsButton.setEnabled(!busy && installed);
         diagnosticsButton.setEnabled(!busy);
         checkAppUpdateButton.setEnabled(!background.updateCheck.running() && background.updateCheck.outcome() == null
@@ -3383,14 +3635,16 @@ public final class MainActivity extends ThemedActivity {
             && (status.state.equals("stopped") || status.state.equals("running")));
         autoUpdateSummary.setText(SubscriptionUpdateJob.summary(this, appPreferences()));
         moduleSummary.setText("内置模块 " + (bundledModule.valid() ? bundledModule.version() : "信息不可用")
-            + (pending ? "\n已提交安装，重启手机后生效。"
+            + (pending ? "\n待生效模块 " + status.pendingVersion
+                + (pendingUpdate ? "。可先更新至 " + bundledModule.version() + "，再重启手机。" : "，重启手机后生效。")
             : installed ? "\n当前模块 " + (status.version.isEmpty() ? "版本未知" : status.version)
                 + (moduleUpdate ? "\n模块功能有更新，可按需安装。" : "\n现有模块可继续使用，无需重装。")
             : "\n无需另外下载，授权 Root 后即可安装。"));
-        installButton.setText(pending ? "等待重启" : moduleUpdate ? "更新模块"
+        installButton.setText(pendingUpdate ? "更新待生效模块" : pending ? "等待重启" : moduleUpdate ? "更新模块"
             : installed ? "重新安装模块" : "安装内置模块");
-        installButton.setEnabled(!busy && !pending && bundledModule.valid());
+        installButton.setEnabled(!busy && (!pending || pendingUpdate) && bundledModule.valid());
         if (installButton.isActivated() != (!installed || moduleUpdate)) styleButton(installButton, !installed || moduleUpdate);
+        moduleNotesButton.setEnabled(bundledModule.valid());
         exportButton.setEnabled(!busy && bundledModule.valid());
         boolean backupIdle = !busy && !background.backup.running() && background.backup.outcome() == null
             && background.pendingExport == null;
@@ -3411,7 +3665,29 @@ public final class MainActivity extends ThemedActivity {
         keepAliveSummary.setText(installed ? status.keepAlive.summary(running) : "安装支持此功能的模块并重启后可用，默认关闭。");
         keepAliveApplyButton.setVisibility(installed && status.keepAlive.needsRestart(running) ? View.VISIBLE : View.GONE);
         keepAliveApplyButton.setEnabled(!busy && keepAliveAvailable && running);
+        boolean webRtcAvailable = installed && status.webRtc.available();
+        boolean webRtcRules = webRtcAvailable && status.webRtc.rules();
+        boolean webRtcPending = webRtcAvailable && status.webRtc.needsRestart(running);
+        webRtcSwitch.setChecked(webRtcAvailable && status.webRtc.configured());
+        webRtcSwitch.setEnabled(!busy && enabled && webRtcAvailable && (webRtcRules || status.webRtc.configured()));
+        webRtcRulesButton.setEnabled(!busy && enabled && webRtcRules);
+        webRtcRulesButton.setText(webRtcRules ? "应用规则 · " + status.webRtc.ruleCount() + " 个  ›" : "应用规则  ›");
+        webRtcApplyButton.setVisibility(webRtcPending ? View.VISIBLE : View.GONE);
+        webRtcApplyButton.setEnabled(!busy && webRtcPending);
         updatingSwitch = false;
+        String webRtcState = !webRtcAvailable ? "需要支持应用规则的模块"
+            : !enabled ? "模块已禁用"
+            : webRtcPending ? "有更改待应用"
+            : !webRtcRules ? (status.webRtc.configured() ? "旧版全局限制已开启" : "需要更新模块")
+            : !status.webRtc.configured() ? "已关闭"
+            : status.webRtc.ruleCount() == 0 ? "已开启 · 尚未添加应用"
+            : running ? "限制已生效" : "已开启 · 等待 TUN 就绪";
+        webRtcSummary.setText(webRtcPending ? "规则有更改待应用。重连会短暂中断网络，TUN 下次启动也会应用。"
+            : !webRtcRules && installed ? (webRtcAvailable && status.webRtc.configured() ? "旧版仍会全局限制，可在此关闭。" : "")
+                + "更新内置模块并重启手机后可按应用限制。"
+            : webRtcRules && status.webRtc.legacy() ? "旧版全局限制已停用，请添加应用后开启。"
+            : webRtcState);
+        settingsNavigation.summary("webrtc", webRtcState);
         boolean notification = notificationEnabled();
         notificationButton.setText(notification ? "关闭通知栏控制" : "开启通知栏控制");
         overlayPermissionButton.setText(notification && Settings.canDrawOverlays(this) ? "检查悬浮窗权限" : "允许悬浮窗");
@@ -3426,7 +3702,8 @@ public final class MainActivity extends ThemedActivity {
             : status.keepAlive.needsRestart(running) ? "有更改待应用 · 下次启动生效"
             : status.keepAlive.configured() == TcpKeepAlive.Mode.OFF ? "已关闭 · 按需启用"
             : running ? "已开启 · " + status.keepAlive.configured().label : "已选择" + status.keepAlive.configured().label + " · 下次启动生效");
-        settingsNavigation.summary("module", pending ? "已提交安装 · 等待重启" : moduleUpdate ? "有功能更新 · 可按需安装"
+        settingsNavigation.summary("module", pendingUpdate ? "待生效模块可更新"
+            : pending ? "已提交安装 · 等待重启" : moduleUpdate ? "有功能更新 · 可按需安装"
             : installed ? "当前 " + status.version + " · 可继续使用" : "首次使用请安装内置模块");
         if (visible && !busy && status != null) ProxyNotificationService.sync(this, notification && enabled && isActive());
         NotificationRecovery.sync(this, status);
@@ -3434,14 +3711,52 @@ public final class MainActivity extends ThemedActivity {
         warmAppRouting();
     }
 
-    private void setProxyButtonText(Button button, String title, String summary) {
-        SpannableString text = new SpannableString(title + "\n" + summary);
-        text.setSpan(new RelativeSizeSpan(0.85f), title.length() + 1, text.length(), SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE);
-        if (button.isEnabled()) {
-            int muted = (button.getCurrentTextColor() & 0x00ffffff) | 0xaa000000;
-            text.setSpan(new ForegroundColorSpan(muted), title.length() + 1, text.length(), SpannableString.SPAN_EXCLUSIVE_EXCLUSIVE);
+    private void renderConnection(boolean installed, boolean pending, boolean enabled) {
+        Module.Phase phase = status == null ? null : status.phase();
+        boolean running = phase == Module.Phase.RUNNING;
+        boolean active = phase != null && phase.active;
+        String title;
+        String description;
+        if (installed) {
+            title = switch (phase) {
+                case RUNNING -> "TUN 已连接";
+                case STOPPED -> "TUN 已停止";
+                default -> phase.label;
+            };
+            description = switch (phase) {
+                case RUNNING -> !status.hotspotEnabled ? "本机流量已接管"
+                    : status.hotspotState.startsWith("active") ? "本机与热点共享代理" : "本机流量已接管 · 热点共享待就绪";
+                case STOPPED -> status.profile ? "配置已就绪，可以启动 TUN。" : "先添加订阅或导入本地配置。";
+                case DISABLED -> "在 Root 管理器启用 MinClash 模块后重启手机。";
+                case STARTING -> "正在建立连接，稍候片刻。";
+                case WAITING_NETWORK -> "打开 Wi‑Fi 或移动数据，TUN 会自动恢复。";
+                case RETRYING -> "TUN 会自动重试，可在「关于」运行诊断。";
+                case ORPHANED -> "先停止 TUN，再重新启动。";
+                case DEGRADED -> "TUN 正在尝试恢复，可在「关于」运行诊断。";
+                case MISSING -> "前往设置，安装 App 内置的模块。";
+            };
+        } else {
+            title = pending ? "等待重启" : phase == null ? "准备连接" : phase.label;
+            description = pending ? "重启手机后，已暂存的模块 " + status.pendingVersion + " 将生效。"
+                : phase == null ? "先检测环境，再导入你的配置。" : "安装模块后就能启动 TUN。";
         }
-        button.setText(text);
+
+        StringBuilder detail = new StringBuilder(description);
+        if (installed && status.runtime.protectionDegraded())
+            detail.append("\n防泄漏规则未通过检查，正在尝试恢复。请查看保护设置。");
+        if (installed && status.runtime.tun6Required() && !status.runtime.tun6())
+            detail.append("\n检测到 IPv6 上游，IPv6 路由正在恢复。");
+        if (installed && status.protectionArmed)
+            detail.append("\n已配置防泄漏阻断；停止 TUN 不会解除，可在设置中关闭保护。");
+
+        connectionCard.setActivated(running);
+        connectionDot.setColor(running ? MINT : pending || active && phase != Module.Phase.STARTING ? AMBER : MUTED);
+        if (!title.contentEquals(stateText.getText())) stateText.setText(title);
+        if (!TextUtils.equals(detail, detailText.getText())) detailText.setText(detail.toString());
+        toggle.setText(busy ? "处理中…" : !installed && pending ? "待重启" : status == null ? "检测环境"
+            : !installed ? "安装模块" : active ? "停止 TUN" : "启动 TUN");
+        toggle.setEnabled(!busy && (status == null || !installed && !pending || installed && (active || enabled && status.profile)));
+        if (toggle.isActivated() == active) styleButton(toggle, !active);
     }
 
     private void showMessage(String text) {
@@ -3510,7 +3825,7 @@ public final class MainActivity extends ThemedActivity {
         scroll.setClipToPadding(false);
         scroll.setVerticalScrollBarEnabled(false);
         LinearLayout body = column();
-        body.setPadding(dp(20), dp(26), dp(20), dp(28));
+        body.setPadding(dp(20), dp(index == 0 ? 12 : 26), dp(20), dp(28));
         scroll.addView(body);
         parent.addView(scroll, new FrameLayout.LayoutParams(-1, -1));
         pages[index] = scroll;
@@ -3518,28 +3833,54 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void header(LinearLayout parent, String title, String description) {
-        header(parent, title, description, false);
-    }
-
-    private void header(LinearLayout parent, String title, String description, boolean quotaCorner) {
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.addView(label(title, 30, TEXT, true), new LinearLayout.LayoutParams(0, -2, 1));
-        if (quotaCorner) {
-            View space = new View(this);
-            row.addView(space, new LinearLayout.LayoutParams(dp(56), dp(40)));
-        } else {
-            TextView version = label("v" + appVersion(), 11, MINT, true);
-            version.setPadding(dp(10), dp(6), dp(10), dp(6));
-            version.setBackground(shape(AppUi.tone(0xff203a35, 0xffdff2e9), 10, false));
-            row.addView(version);
-        }
+        TextView version = label("v" + appVersion(), 11, MINT, true);
+        version.setPadding(dp(10), dp(6), dp(10), dp(6));
+        version.setBackground(shape(AppUi.tone(0xff203a35, 0xffdff2e9), 10, false));
+        row.addView(version);
         add(parent, row, 0);
         add(parent, label(description, 13, MUTED, false), 5);
     }
 
-    private void section(LinearLayout parent, String title) {
-        add(parent, label(title, 15, TEXT, true), 24);
+    private void addDivider(LinearLayout parent, int inset) {
+        View divider = new View(this);
+        divider.setBackgroundColor(BORDER);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(1));
+        params.setMarginStart(dp(inset));
+        params.setMarginEnd(dp(inset));
+        parent.addView(divider, params);
+    }
+
+    private void addNavigation(LinearLayout root) {
+        addDivider(root, 0);
+        LinearLayout bar = new LinearLayout(this);
+        bar.setPadding(dp(8), dp(3), dp(8), dp(3));
+        bar.setBackgroundColor(CARD);
+        String[] titles = {"概览", "配置", "设置", "关于"};
+        int[] icons = {R.drawable.ic_nav_overview, R.drawable.ic_nav_profiles, R.drawable.ic_nav_settings, R.drawable.ic_nav_about};
+        ColorStateList colors = new ColorStateList(new int[][] {{android.R.attr.state_selected}, {}}, new int[] {MINT, MUTED});
+        for (int i = 0; i < navigation.length; i++) {
+            int index = i;
+            Button item = button(titles[i], false);
+            item.setMinHeight(dp(52));
+            item.setMinimumHeight(dp(52));
+            item.setTextSize(12);
+            item.setPadding(dp(2), dp(6), dp(2), dp(6));
+            item.setCompoundDrawablesRelativeWithIntrinsicBounds(0, icons[i], 0, 0);
+            item.setCompoundDrawablePadding(dp(4));
+            item.setCompoundDrawableTintList(colors);
+            item.setTextColor(colors);
+            item.setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9), null, shape(Color.WHITE, 12, false)));
+            item.setOnClickListener(view -> {
+                if (index == 2 && selectedPage == 2) settingsNavigation.back();
+                selectPage(index);
+            });
+            navigation[i] = item;
+            bar.addView(item, new LinearLayout.LayoutParams(0, -1, 1));
+        }
+        root.addView(bar);
     }
 
     private void selectPage(int index) {
@@ -3548,9 +3889,6 @@ public final class MainActivity extends ThemedActivity {
         for (int i = 0; i < pages.length; i++) {
             pages[i].setVisibility(i == selectedPage ? View.VISIBLE : View.GONE);
             navigation[i].setSelected(i == selectedPage);
-            navigation[i].setTextColor(i == selectedPage ? MINT : MUTED);
-            navigation[i].setBackground(new RippleDrawable(ColorStateList.valueOf(0x2279e7c9),
-                shape(i == selectedPage ? AppUi.tone(0xff203a35, 0xffdff2e9) : CARD, 12, false), null));
         }
         trafficCard.setActive(resumed && selectedPage == 0);
         updateSubscriptionIndicator();

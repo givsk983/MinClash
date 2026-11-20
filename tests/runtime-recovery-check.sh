@@ -12,10 +12,13 @@ uplink_snapshot() { [ -z "$route" ] || printf '%s\n' "$route"; }
 uplink_watch_reset
 route=wifi
 if uplink_changed; then echo 'Unstable handoff accepted'; exit 1; fi
+uplink_confirmation_pending
 uplink_changed
 if uplink_changed; then echo 'Unchanged uplink restarted'; exit 1; fi
+if uplink_confirmation_pending; then echo 'Unchanged uplink polled rapidly'; exit 1; fi
 route=sim2
 if uplink_changed; then exit 1; fi
+if uplink_confirmation_pending; then echo 'Cooldown used fast polling'; exit 1; fi
 if uplink_changed; then echo 'Cooldown ignored'; exit 1; fi
 clock=105
 if uplink_changed; then echo 'Handoff accepted before cooldown expired'; exit 1; fi
@@ -24,9 +27,11 @@ uplink_changed
 route=
 if uplink_changed; then exit 1; fi
 [ "$uplink_missing" = 1 ]
+if uplink_confirmation_pending; then echo 'Missing uplink polled rapidly'; exit 1; fi
 route=sim2
 clock=112
 if uplink_changed; then exit 1; fi
+uplink_confirmation_pending
 uplink_changed
 [ "$uplink_missing" = 0 ]
 # Offline manual starts recover as soon as the first physical network is stable.
@@ -36,6 +41,7 @@ uplink_watch_reset
 if uplink_changed; then exit 1; fi
 route=mobile
 if uplink_changed; then exit 1; fi
+uplink_confirmation_pending
 uplink_changed
 
 # A working new uplink interrupts failure backoff only after two matching readings.
@@ -53,12 +59,12 @@ uplink_changed
     }
     : > "$elapsed"
     wait_retry_uplink 60 mobile || { echo 'New uplink did not interrupt retry'; exit 1; }
-    [ "$(awk '{ total += $1 } END { print total }' "$elapsed")" -eq 12 ]
+    [ "$(cat "$elapsed")" = "$(printf '%s\n' 3 1 3 1)" ]
 
     uplink_snapshot() { printf 'mobile\n'; }
     : > "$elapsed"
     if wait_retry_uplink 6 mobile; then echo 'Same uplink interrupted retry'; exit 1; fi
-    [ "$(awk '{ total += $1 } END { print total }' "$elapsed")" -eq 6 ]
+    [ "$(cat "$elapsed")" = "$(printf '%s\n' 3 3)" ]
 )
 
 v4=1 v6=0
@@ -77,9 +83,24 @@ if tun_ready_for_uplink '-6 wlan0 default'; then echo 'Missing IPv4 TUN route re
 (
     supervisor=$(awk '/^run_supervisor\(\)/ { copy=1 } /^start\(\)/ { copy=0 } copy' "$CONTROL")
     eval "$supervisor"
+    . "${CONTROL%/*}/webrtc.sh"
+    : > "$DATA/webrtc-on"
+    prepare_webrtc
+    [ -z "$MINCLASH_WEBRTC_APPS" ]
+    webrtc_status 1 | grep -qx 'webrtc_legacy=1'
+    printf '%s\n' org.example.live | set_webrtc_apps
+    set_webrtc on
+    prepare_webrtc
+    printf '%s\n' org.example.other | set_webrtc_apps
+    webrtc_status 1 | grep -qx 'webrtc_pending=1'
+    if printf '%s\n' 'com.example.*' | set_webrtc_apps; then exit 1; fi
+    [ "$(cat "$DATA/webrtc-apps")" = org.example.other ]
+    printf '%s\n' org.example.live | set_webrtc_apps
+    if webrtc_status 1 | grep -qx 'webrtc_pending=1'; then exit 1; fi
     CORE=mock_core PROFILE=unused SOCKET="$DATA/test.sock" LOG="$DATA/core.log"
     events="$DATA/supervisor-events"
     state= clock=0 launches=0
+    route_check_failure=0
     mock_core() { :; }
     fail() { echo "$*" >&2; exit 1; }
     log() { :; }
@@ -94,9 +115,13 @@ if tun_ready_for_uplink '-6 wlan0 default'; then echo 'Missing IPv4 TUN route re
     sync_notification() { :; }
     enabled() { [ "$launches" -lt 3 ]; }
     uplink_snapshot() { if [ "$clock" -lt 4 ]; then echo mobile; else echo wifi; fi; }
-    tun_ready_for_uplink() { [ "$clock" -ge 1 ]; }
+    tun_ready_for_uplink() {
+        [ "$clock" -ge 1 ] && { [ "$route_check_failure" = 0 ] || [ "$clock" -ne 4 ]; }
+    }
     save_pid() {
         if [ "$1" = core ]; then
+            [ "$MINCLASH_WEBRTC_APPS" = org.example.live ] || fail 'WebRTC app rule was lost on core startup.'
+            webrtc_status 1 | grep -qx 'webrtc_active=1' || fail 'WebRTC session was not reported.'
             launches=$((launches + 1))
             echo "launch $launches" >> "$events"
         fi
@@ -125,7 +150,7 @@ launch 1
 sleep 1
 running
 sleep 3
-sleep 3
+sleep 1
 starting
 stop starting
 clean routes
@@ -137,6 +162,30 @@ launch 3'
     actual=$(cat "$events")
     if [ "$actual" != "$expected" ]; then
         printf 'Unexpected supervisor timeline:\n%s\n' "$actual" >&2
+        exit 1
+    fi
+    # Preserve the slower health-check cadence when a TUN route check fails
+    # at the first observation of a possible uplink change.
+    : > "$events"
+    state= clock=0 launches=0 route_check_failure=1
+    run_supervisor
+    expected='starting
+launch 1
+sleep 1
+running
+sleep 3
+starting
+sleep 3
+stop starting
+clean routes
+launch 2
+retrying
+sleep 3
+starting
+launch 3'
+    actual=$(cat "$events")
+    if [ "$actual" != "$expected" ]; then
+        printf 'Unexpected route recovery timeline:\n%s\n' "$actual" >&2
         exit 1
     fi
 )

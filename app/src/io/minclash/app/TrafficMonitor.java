@@ -20,6 +20,7 @@ final class TrafficMonitor {
     static final long HISTORY_MS = 600_000;
     static final long MAX_SAMPLE_GAP_MS = 10_000;
     private static final long POLL_MS = 2_000;
+    private static final long FIRST_RATE_MS = 750;
     private static final long SAVE_MS = 30_000;
 
     record Reading(long time, String session, long uploaded, long downloaded, int connections, long memory) {}
@@ -62,7 +63,7 @@ final class TrafficMonitor {
         prune(now);
         if (ready && latest != null && now - latest.time() < 2 * interval()) observer.onTraffic(previous, latest);
         else observer.onTraffic(null, null);
-        schedule(previous == null ? 0 : Math.max(0, interval() - (now - previous.time())));
+        schedule(ready ? nextDelay(details && (previous == null || previous.connections() < 0), now) : 0);
     }
 
     void stopObserving(Observer observer) {
@@ -88,6 +89,13 @@ final class TrafficMonitor {
 
     private long interval() { return summary ? POLL_MS : 2 * POLL_MS; }
 
+    private long nextDelay(boolean needsDetails, long now) {
+        if (previous == null) return 0;
+        boolean needsRate = latest != null && latest.upload() < 0;
+        long delay = summary && (needsRate || needsDetails) ? FIRST_RATE_MS : interval();
+        return Math.max(0, delay - (now - previous.time()));
+    }
+
     private void schedule(long delay) {
         main.removeCallbacks(poll);
         if (observer != null && (ready || details)) main.postDelayed(poll, delay);
@@ -107,11 +115,15 @@ final class TrafficMonitor {
         worker.execute(() -> {
             Reading reading = canSample ? read(useSummary, includeMemory) : null;
             Module.Status checked = includeMemory && reading == null ? checkStatus() : null;
-            long now = System.currentTimeMillis();
-            ZoneId zone = ZoneId.systemDefault();
-            if (reading != null) dailyTraffic.record(reading.session(), now, zone, reading.uploaded(), reading.downloaded());
+            List<DailyTraffic.Day> recent = null;
+            if (reading != null || includeMemory) {
+                long now = System.currentTimeMillis();
+                ZoneId zone = ZoneId.systemDefault();
+                if (reading != null) dailyTraffic.record(reading.session(), now, zone, reading.uploaded(), reading.downloaded());
+                if (includeMemory) recent = dailyTraffic.recent(now, zone);
+            }
             if (SystemClock.elapsedRealtime() - lastSave >= SAVE_MS) saveDailyTraffic();
-            List<DailyTraffic.Day> recent = includeMemory ? dailyTraffic.recent(now, zone) : null;
+            List<DailyTraffic.Day> dailySnapshot = recent;
             main.post(() -> {
                 pending = false;
                 if (observer == null) return;
@@ -120,9 +132,12 @@ final class TrafficMonitor {
                     return;
                 }
                 if (checked != null) updateStatus(checked);
-                if (recent != null) daily = recent;
+                if (dailySnapshot != null) daily = dailySnapshot;
                 publish(reading);
-                schedule(ready ? interval() : 10_000);
+                if (!ready) schedule(10_000);
+                else if (!canSample) schedule(0);
+                else if (reading == null) schedule(interval());
+                else schedule(nextDelay(details && !includeMemory, SystemClock.elapsedRealtime()));
             });
         });
     }

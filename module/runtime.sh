@@ -42,6 +42,12 @@ uplink_changed() {
     return 0
 }
 
+uplink_confirmation_pending() {
+    [ "$uplink_samples" = 1 ] &&
+        { [ "$uplink_candidate" != "$uplink_baseline" ] || [ "$uplink_missing" = 1 ]; } &&
+        [ "$(runtime_now)" -ge "$uplink_restart_after" ]
+}
+
 wait_retry_uplink() {
     local remaining="$1" failed_uplink="$2" next candidate= interval pause
     while enabled; do
@@ -52,7 +58,11 @@ wait_retry_uplink() {
         candidate="$next"
         [ "$remaining" -gt 0 ] || break
         interval="$remaining"
-        [ "$interval" -le 3 ] || interval=3
+        if [ -n "$candidate" ] && [ "$candidate" != "$failed_uplink" ]; then
+            interval=1
+        elif [ "$interval" -gt 3 ]; then
+            interval=3
+        fi
         sleep "$interval" &
         pause=$!
         trap 'kill "$pause" 2>/dev/null || :; exit 0' TERM INT

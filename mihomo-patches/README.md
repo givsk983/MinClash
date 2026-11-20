@@ -1,6 +1,6 @@
 # MinClash Mihomo modifications
 
-Modified through 2026-11-18, based on Mihomo v1.19.33, commit
+Modified through 2026-11-20, based on Mihomo v1.19.33, commit
 `3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8`. The upstream GPL v3 license applies.
 The source archive SHA-256 is
 `ecda5f8c8a8a1d60bc088c2640c85d92c8f002c0686234a26bdf671735afe216`.
@@ -57,7 +57,7 @@ GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
   CC='clang --target=aarch64-linux-android28' \
   CGO_LDFLAGS='-Wl,-z,max-page-size=16384' \
   go build -mod=vendor -tags with_gvisor -trimpath \
-  -ldflags '-X github.com/metacubex/mihomo/constant.Version=v1.19.33-minclash.4 -X github.com/metacubex/mihomo/constant.BuildTime=2026-11-18T00:00:00Z -w -s -buildid=' \
+  -ldflags '-X github.com/metacubex/mihomo/constant.Version=v1.19.33-minclash.6 -X github.com/metacubex/mihomo/constant.BuildTime=2026-11-20T00:00:00Z -w -s -buildid=' \
   -o mihomo .
 ```
 
@@ -139,3 +139,17 @@ returns the active connection count and resident memory. The response excludes
 individual connection records. The protection helper fingerprints its private
 IPv4 and IPv6 rules for the module watchdog, which can reinstall them when the
 running core matches the saved protection policy.
+
+## WebRTC filtering (2026-11-20)
+
+Root module 0.1.7 (revision 16) filters only selected applications before TUN
+routing. For those applications the core drops UDP datagrams matching RFC 8489
+STUN headers and TCP or UDP connections to standard STUN/TURN ports 3478 and
+5349. Application matching uses socket endpoints and Android's package manager.
+Unidentified sockets, shared UIDs and traffic outside TUN continue through the
+ordinary network path.
+
+The setting defaults to off and is saved by the Root supervisor independently
+of subscriptions. A new core session receives its effective package list via
+`MINCLASH_WEBRTC_APPS`. The previous global setting does not activate the
+scoped filter. The App offers a TUN reconnect when the effective rules change.

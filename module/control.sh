@@ -25,6 +25,7 @@ LIMIT=2097152
 . "$MODDIR/runtime.sh" || exit 1
 . "$MODDIR/keepalive.sh" || exit 1
 . "$MODDIR/protection.sh" || exit 1
+. "$MODDIR/webrtc.sh" || exit 1
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
@@ -340,6 +341,7 @@ run_supervisor() {
             printf '%s\n' "$BOOT_ID" > "$DATA/routes-owned" || fail 'Cannot record routing ownership.'
             prepare_tether_dns && prepare_forwarding || fail 'Could not preserve Android tethering routes and DNS.'
             prepare_keepalive || fail 'Cannot save TCP keepalive state.'
+            prepare_webrtc || fail 'Cannot save WebRTC filter state.'
             "$CORE" -d "$DATA" -f "$PROFILE" -ext-ctl-unix "$SOCKET" </dev/null >> "$LOG" 2>&1 8>&- &
             child=$!
             if save_pid core "$child"; then
@@ -387,7 +389,13 @@ run_supervisor() {
                         fi
                     fi
                     trim_log
-                    if [ "$was_ready" = 1 ]; then sleep 3; else sleep 1; fi
+                    # Confirm a new uplink quickly while keeping the ordinary cadence
+                    # for steady networks and consecutive TUN route health failures.
+                    if [ "$was_ready" = 0 ] || { [ "$age" = 0 ] && uplink_confirmation_pending; }; then
+                        sleep 1
+                    else
+                        sleep 3
+                    fi
                 done
             else
                 kill -TERM "$child" 2>/dev/null || :
@@ -550,6 +558,7 @@ case "${1:-}" in
         fi
         echo traffic_summary=1
         keepalive_status "$core_up"
+        webrtc_status "$core_up"
         exit ;;
     logs)
         for file in "$DATA/previous.log" "$LOG"; do
@@ -558,6 +567,9 @@ case "${1:-}" in
         exit ;;
     protection-get) protection_command get; exit ;;
     protection-policy) protection_command policy; exit ;;
+    webrtc-get)
+        if [ -f "$DATA/webrtc-apps" ]; then cat "$DATA/webrtc-apps"; fi
+        exit ;;
     protection-watch)
         [ -f "$DATA/protection-owned" ] || exit 0
         if [ ! -f "$DATA/protection-degraded" ] && protection_command check; then exit 0; fi ;;
@@ -600,6 +612,12 @@ case "${1:-}" in
     hotspot-off) set_hotspot off ;;
     keepalive-off|keepalive-conservative|keepalive-balanced|keepalive-aggressive)
         set_keepalive "${1#keepalive-}" || fail 'Cannot save TCP keepalive setting.' ;;
+    webrtc-on|webrtc-off)
+        enabled || fail '请先启用 MinClash 模块。'
+        set_webrtc "${1#webrtc-}" || fail '无法保存 WebRTC 设置。' ;;
+    webrtc-set-apps)
+        enabled || fail '请先启用 MinClash 模块。'
+        set_webrtc_apps || fail '无法保存 WebRTC 应用规则，请检查应用包名和规则数量。' ;;
     notification-on) : > "$DATA/notification-on"; rm -f "$DATA/notification-attempt" ;;
     notification-off) rm -f "$DATA/notification-on" "$DATA/notification-heartbeat" "$DATA/notification-attempt" ;;
     *) fail 'Usage: control.sh status|start|stop|logs|boot-on|boot-off|hotspot-on|hotspot-off|import|validate|api|mode-rule|mode-global|mode-direct' ;;

@@ -19,6 +19,8 @@ final class Module {
         PROTECTION_POLICY("protection-policy"), PROTECTION_GET("protection-get"), PROTECTION_SET("protection-set"), PROTECTION_OFF("protection-off"),
         KEEPALIVE_OFF("keepalive-off"), KEEPALIVE_CONSERVATIVE("keepalive-conservative"),
         KEEPALIVE_BALANCED("keepalive-balanced"), KEEPALIVE_AGGRESSIVE("keepalive-aggressive"),
+        WEBRTC_ON("webrtc-on"), WEBRTC_OFF("webrtc-off"),
+        WEBRTC_GET("webrtc-get"), WEBRTC_SET_APPS("webrtc-set-apps"),
         STATUS_NOTIFICATION("status-notification"), NOTIFICATION_ON("notification-on"), NOTIFICATION_OFF("notification-off"),
         MODE_RULE("mode-rule"), MODE_GLOBAL("mode-global"), MODE_DIRECT("mode-direct");
 
@@ -39,6 +41,13 @@ final class Module {
                          boolean notificationRecovery, boolean notificationEnabled, String hotspotReason,
                          long hotspotSent, long hotspotReceived, boolean trafficSummary, boolean protectionDegraded) {}
 
+    record WebRtcStatus(boolean available, boolean rules, boolean configured, boolean active,
+                        boolean pending, boolean legacy, int ruleCount) {
+        boolean needsRestart(boolean running) {
+            return available && running && (rules ? pending : configured != active);
+        }
+    }
+
     static final class Status {
         final String state;
         final boolean profile;
@@ -50,17 +59,20 @@ final class Module {
         final String version;
         final String pendingVersion;
         final int revision;
+        final int pendingRevision;
         final boolean hotspot;
         final boolean hotspotEnabled;
         final String hotspotState;
         final RuntimeStatus runtime;
         final TcpKeepAlive.Status keepAlive;
+        final WebRtcStatus webRtc;
         final boolean protection;
         final boolean protectionArmed;
 
         Status(String state, boolean profile, boolean boot, boolean enabled, boolean control, boolean validate, boolean replaceProfile,
-               String version, String pendingVersion, int revision, boolean hotspot, boolean hotspotEnabled, String hotspotState,
-               RuntimeStatus runtime, TcpKeepAlive.Status keepAlive, boolean protection, boolean protectionArmed) {
+               String version, String pendingVersion, int revision, int pendingRevision,
+               boolean hotspot, boolean hotspotEnabled, String hotspotState,
+               RuntimeStatus runtime, TcpKeepAlive.Status keepAlive, WebRtcStatus webRtc, boolean protection, boolean protectionArmed) {
             this.state = state;
             this.profile = profile;
             this.boot = boot;
@@ -71,11 +83,13 @@ final class Module {
             this.version = version;
             this.pendingVersion = pendingVersion;
             this.revision = revision;
+            this.pendingRevision = pendingRevision;
             this.hotspot = hotspot;
             this.hotspotEnabled = hotspotEnabled;
             this.hotspotState = hotspotState;
             this.runtime = runtime;
             this.keepAlive = keepAlive;
+            this.webRtc = webRtc;
             this.protection = protection;
             this.protectionArmed = protectionArmed;
         }
@@ -136,6 +150,19 @@ final class Module {
             if (!installed() || bundledRevision <= 0) return false;
             int current = functionalRevision();
             return current > 0 ? current < bundledRevision : !control;
+        }
+
+        boolean hasPendingModule() { return !pendingVersion.isEmpty(); }
+
+        int pendingFunctionalRevision() {
+            if (!hasPendingModule()) return 0;
+            if (pendingRevision > 0) return pendingRevision;
+            return pendingVersion.equals("0.0.1") || pendingVersion.equals("0.0.2") ? 1 : 0;
+        }
+
+        boolean pendingUpdateAvailable(int bundledRevision) {
+            int pending = pendingFunctionalRevision();
+            return pending > 0 && pending < bundledRevision && functionalRevision() <= bundledRevision;
         }
     }
 
@@ -224,8 +251,12 @@ final class Module {
         String version = "";
         String pendingVersion = "";
         int revision = 0;
+        int pendingRevision = 0;
         boolean protection = false;
         boolean protectionArmed = false;
+        boolean webRtcAvailable = false, webRtcConfigured = false, webRtcActive = false;
+        boolean webRtcRules = false, webRtcPending = false, webRtcLegacy = false;
+        int webRtcCount = 0;
         boolean hotspot = false;
         boolean hotspotEnabled = false;
         String hotspotState = "off";
@@ -244,6 +275,15 @@ final class Module {
             if (line.equals("replace_profile=1")) replaceProfile = true;
             if (line.equals("protection=1")) protection = true;
             if (line.equals("protection_armed=1")) protectionArmed = true;
+            if (line.equals("webrtc_filter=1")) webRtcAvailable = true;
+            if (line.equals("webrtc_app_rules=1")) webRtcRules = true;
+            if (line.equals("webrtc_pending=1")) webRtcPending = true;
+            if (line.equals("webrtc_legacy=1")) webRtcLegacy = true;
+            if (line.startsWith("webrtc_rule_count=")) {
+                webRtcCount = (int) Math.min(128, nonnegativeLong(line.substring("webrtc_rule_count=".length()).trim()));
+            }
+            if (line.equals("webrtc_configured=1")) webRtcConfigured = true;
+            if (line.equals("webrtc_active=1")) webRtcActive = true;
             if (line.equals("protection_degraded=1")) protectionDegraded = true;
             if (line.equals("traffic_summary=1")) trafficSummary = true;
             if (line.equals("hotspot=1")) hotspot = true;
@@ -271,6 +311,9 @@ final class Module {
             }
             if (line.startsWith("version=")) version = line.substring(8);
             if (line.startsWith("pending=")) pendingVersion = line.substring(8);
+            if (line.startsWith("pending_revision=")) {
+                pendingRevision = (int) Math.min(Integer.MAX_VALUE, nonnegativeLong(line.substring(17)));
+            }
             if (line.startsWith("revision=")) {
                 try { revision = Math.max(0, Integer.parseInt(line.substring(9))); }
                 catch (NumberFormatException ignored) { revision = 0; }
@@ -280,10 +323,13 @@ final class Module {
             case "running", "starting", "waiting_network", "retrying", "orphaned", "stopped", "missing" -> { }
             default -> throw new IOException("无法读取 KernelSU / Magisk 模块的状态。");
         }
-        return new Status(state, profile, boot, enabled, control, validate, replaceProfile, version, pendingVersion, revision,
+        return new Status(state, profile, boot, enabled, control, validate, replaceProfile, version, pendingVersion, revision, pendingRevision,
             hotspot, hotspotEnabled, hotspotState, new RuntimeStatus(health, core, tun4, tun6, tun6Required, controller,
                 notificationRecovery, notificationEnabled, hotspotReason, hotspotSent, hotspotReceived, trafficSummary, protectionDegraded),
-            TcpKeepAlive.parse(output), protection, protectionArmed && !protectionDegraded);
+            TcpKeepAlive.parse(output), new WebRtcStatus(webRtcAvailable || webRtcRules, webRtcRules,
+                (webRtcAvailable || webRtcRules) && webRtcConfigured,
+                (webRtcAvailable || webRtcRules) && core && webRtcActive, core && webRtcPending,
+                webRtcRules && webRtcLegacy, webRtcRules ? webRtcCount : 0), protection, protectionArmed && !protectionDegraded);
     }
 
     private static long nonnegativeLong(String value) {
@@ -296,7 +342,8 @@ final class Module {
         String metadata = command == Command.STATUS || command == Command.STATUS_NOTIFICATION
             ? "grep -E '^(version|revision)=' /data/adb/modules/minclash/module.prop 2>/dev/null; "
                 + "if [ -f /data/adb/modules_update/minclash/module.prop ]; then "
-                + "sed -n 's/^version=/pending=/p' /data/adb/modules_update/minclash/module.prop; fi; "
+                + "sed -n -e 's/^version=/pending=/p' -e 's/^revision=/pending_revision=/p' "
+                + "/data/adb/modules_update/minclash/module.prop; fi; "
                 + "if [ ! -f " + script + " ]; then echo state=missing; exit 0; fi; "
             : "if [ ! -f " + script + " ]; then echo MINCLASH_NO_MODULE; exit 72; fi; ";
         String action = metadata

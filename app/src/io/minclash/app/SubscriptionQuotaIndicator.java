@@ -50,14 +50,16 @@ final class SubscriptionQuotaIndicator extends View {
         float x = getWidth() / 2f, y = 24 * density, radius = 19 * density;
         paint.setStyle(Paint.Style.FILL); paint.setColor(BG);
         canvas.drawCircle(x, y, 24 * density, paint);
-        paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(3 * density); paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(3.4f * density); paint.setStrokeCap(Paint.Cap.ROUND);
         paint.setColor(BORDER); canvas.drawCircle(x, y, radius, paint);
         if (ratio > 0) {
             arc.set(x - radius, y - radius, x + radius, y + radius);
             paint.setColor(quotaColor); canvas.drawArc(arc, -90, (float) (360 * ratio), false, paint);
         }
         paint.setStyle(Paint.Style.FILL); paint.setColor(TEXT);
-        text(canvas, percent, x, y, 11 * scaledDensity, 30 * density);
+        paint.setTypeface(android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL));
+        text(canvas, percent, x, y, 12 * scaledDensity, 30 * density);
+        paint.setTypeface(android.graphics.Typeface.DEFAULT);
         paint.setColor(BG); canvas.drawRoundRect(0, 47 * density, getWidth(), getHeight(), 4 * density, 4 * density, paint);
         paint.setColor(expiryColor);
         text(canvas, expiry, x, 56 * density, 11 * scaledDensity, getWidth() - 2 * density);

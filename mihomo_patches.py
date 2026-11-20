@@ -26,6 +26,24 @@ def apply(source):
  if err := protection.LoadRuntime(); err != nil { fmt.Fprintln(os.Stderr, "invalid protection policy:", err); os.Exit(1) }
 ''')
     replace("constant/metadata.go", 'type Metadata struct {', 'type Metadata struct {\n MinClashProtected bool `json:"-"`\n MinClashIdentified bool `json:"-"`')
+    replace("component/process/process_linux.go",
+            "func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uint32, inode uint32, err error) {",
+            "func querySocketByNetlink(network string, ip netip.Addr, srcPort int) ([]netlink.Message, error) {")
+    replace("component/process/process_linux.go", "return 0, 0, ErrInvalidNetwork\n\t}\n\n\tcopy(request.Src",
+            "return nil, ErrInvalidNetwork\n\t}\n\n\tcopy(request.Src")
+    replace("component/process/process_linux.go", '''conn, err := netlink.Dial(unix.NETLINK_INET_DIAG, nil)
+	if err != nil {
+		return 0, 0, err
+	}''', '''conn, err := netlink.Dial(unix.NETLINK_INET_DIAG, nil)
+	if err != nil {
+		return nil, err
+	}''')
+    replace("component/process/process_linux.go", "messages, err := conn.Execute(message)",
+            """return conn.Execute(message)
+}
+
+func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uint32, inode uint32, err error) {
+	messages, err := querySocketByNetlink(network, ip, srcPort)""")
     replace("adapter/outbound/direct.go", '"fmt"', '"fmt"\n "errors"')
     for signature in ['func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {',
                       'func (d *Direct) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {']:
@@ -49,7 +67,14 @@ def apply(source):
  key := packet.Key()
  if metadata.MinClashIdentified { key = fmt.Sprintf("%s|uid:%d", key, metadata.Uid) }
 ''')
-    replace("tunnel/tunnel.go", 'func handleUDPConn(packet C.PacketAdapter) {', 'func handleUDPConn(packet C.PacketAdapter) {\n packet = minclashIsolatePacket(packet)')
+    replace("tunnel/tunnel.go", 'func handleUDPConn(packet C.PacketAdapter) {', '''func handleUDPConn(packet C.PacketAdapter) {
+ if minclashRejectWebRTCUDP(packet) {
+   packet.Drop()
+   return
+ }
+ packet = minclashIsolatePacket(packet)''')
+    replace("tunnel/tunnel.go", 'if !isHandle(connCtx.Metadata().Type) {',
+            'if !isHandle(connCtx.Metadata().Type) || minclashRejectWebRTCTCP(connCtx.Metadata()) {')
     replace("config/config.go", 'func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {', '''func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
  minclashDNS(rawCfg)
 ''')

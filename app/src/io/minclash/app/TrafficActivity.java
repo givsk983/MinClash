@@ -10,6 +10,7 @@ import android.graphics.PathEffect;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowInsets;
@@ -29,6 +30,7 @@ public final class TrafficActivity extends ThemedActivity {
     private final TextView[] values = new TextView[6];
     private final TextView[] dailyValues = new TextView[DailyTraffic.DAYS];
     private final TextView[] dailyDates = new TextView[DailyTraffic.DAYS];
+    private List<DailyTraffic.Day> displayedDaily = List.of();
     private AppUi ui;
     private TextView status;
     private Chart chart;
@@ -151,26 +153,32 @@ public final class TrafficActivity extends ThemedActivity {
 
     private void bind(TrafficMonitor.Reading reading, TrafficMonitor.Rate rate) {
         if (reading == null) {
-            status.setText("暂无实时数据");
-            for (TextView value : values) value.setText("—");
+            setText(status, "暂无实时数据");
+            for (TextView value : values) setText(value, "—");
         } else {
-            status.setText("未采样时段留空");
-            values[0].setText(TrafficMonitor.formatRate(rate.upload()));
-            values[1].setText(TrafficMonitor.formatRate(rate.download()));
-            values[2].setText(SubscriptionUsage.bytes(reading.uploaded()));
-            values[3].setText(SubscriptionUsage.bytes(reading.downloaded()));
-            values[4].setText(reading.connections() < 0 ? "—" : String.valueOf(reading.connections()));
-            values[5].setText(reading.memory() > 0 ? SubscriptionUsage.bytes(reading.memory()) : "—");
+            setText(status, "未采样时段留空");
+            setText(values[0], TrafficMonitor.formatRate(rate.upload()));
+            setText(values[1], TrafficMonitor.formatRate(rate.download()));
+            setText(values[2], SubscriptionUsage.bytes(reading.uploaded()));
+            setText(values[3], SubscriptionUsage.bytes(reading.downloaded()));
+            setText(values[4], reading.connections() < 0 ? "—" : String.valueOf(reading.connections()));
+            setText(values[5], reading.memory() > 0 ? SubscriptionUsage.bytes(reading.memory()) : "—");
         }
         chart.invalidate();
         List<DailyTraffic.Day> recent = TrafficMonitor.INSTANCE.daily();
         for (int i = 0; i < recent.size(); i++) {
             DailyTraffic.Day day = recent.get(i);
-            dailyDates[i].setText(day.date().format(HISTORY_DATE) + (i == 0 ? " 今天" : ""));
+            if (i < displayedDaily.size() && day.equals(displayedDaily.get(i))) continue;
+            setText(dailyDates[i], day.date().format(HISTORY_DATE) + (i == 0 ? " 今天" : ""));
             DailyTraffic.Totals total = day.totals();
-            dailyValues[i].setText(total == null ? "暂无记录"
+            setText(dailyValues[i], total == null ? "暂无记录"
                 : "↑ " + SubscriptionUsage.bytes(total.upload()) + "    ↓ " + SubscriptionUsage.bytes(total.download()));
         }
+        displayedDaily = recent;
+    }
+
+    private static void setText(TextView view, String value) {
+        if (!TextUtils.equals(view.getText(), value)) view.setText(value);
     }
 
     private final class Chart extends View {

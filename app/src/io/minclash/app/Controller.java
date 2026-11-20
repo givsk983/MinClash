@@ -30,6 +30,7 @@ final class Controller {
     record Group(String name, String current, List<String> options, boolean automatic, boolean selectable) {}
     record Groups(List<Group> values) {}
     record Snapshot(Mode mode, String node, List<Group> groups) {}
+    record Overview(Mode mode, String node, String probeOutlet) {}
 
     static Mode mode() throws Exception {
         return mode(false);
@@ -108,6 +109,7 @@ final class Controller {
     }
 
     static String primaryNode(Mode mode) throws Exception {
+        if (mode == Mode.DIRECT) return "直连";
         return primaryNode(mode, readGroups());
     }
 
@@ -128,10 +130,21 @@ final class Controller {
     }
 
     private static String primaryNode(Mode mode, List<Group> groups) {
+        return overview(mode, groups).node();
+    }
+
+    private static Overview overview(Mode mode, List<Group> groups) {
+        if (mode == Mode.DIRECT) return new Overview(mode, "直连", null);
         Group primary = primaryGroup(mode, groups);
-        if (primary == null) return "未找到主代理";
-        List<String> route = route(primary, groups);
-        return route.isEmpty() ? "尚未选择" : outletLabel(route.get(route.size() - 1));
+        if (primary == null) return new Overview(mode, "未找到主代理", null);
+        List<String> chain = route(primary, groups);
+        if (chain.isEmpty()) return new Overview(mode, "尚未选择", null);
+        String outlet = chain.get(chain.size() - 1);
+        String probeOutlet = switch (outlet) {
+            case "DIRECT", "REJECT", "REJECT-DROP" -> null;
+            default -> outlet;
+        };
+        return new Overview(mode, outletLabel(outlet), probeOutlet);
     }
 
     enum OutletState { DIRECT_MODE, NO_GROUP, NO_SELECTION, DIRECT, REJECTED, HTTPS_OK, HTTPS_FAILED }
@@ -158,19 +171,11 @@ final class Controller {
         catch (IOException error) { return 0; }
     }
 
-    static String primaryProxy() throws Exception {
+    static Overview overview() throws Exception {
         Mode mode = mode(true);
-        if (mode == Mode.DIRECT) return null;
-        List<Group> groups = readGroups(true);
-        Group primary = primaryGroup(mode, groups);
-        if (primary == null) return null;
-        List<String> chain = route(primary, groups);
-        if (chain.isEmpty()) return null;
-        String node = chain.get(chain.size() - 1);
-        return switch (node) {
-            case "DIRECT", "REJECT", "REJECT-DROP" -> null;
-            default -> node;
-        };
+        if (mode == Mode.DIRECT) return overview(mode, List.of());
+        try { return overview(mode, readGroups(true)); }
+        catch (Exception error) { return new Overview(mode, "暂不可用", null); }
     }
 
     static Group primaryGroup(Mode mode, List<Group> groups) {

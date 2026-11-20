@@ -16,6 +16,20 @@ public final class ModuleStatusCheck {
         Module.Status upgrade = Module.parseStatus("version=0.2.0\npending=0.0.1\nstate=running\nenabled=1\n");
         require(upgrade.installed() && upgrade.pendingVersion.equals("0.0.1")
             && upgrade.version.equals("0.2.0"), "upgrade preserves active module");
+        String queued = "pending=0.1.6\npending_revision=15\n";
+        Module.Status queuedFirst = Module.parseStatus("state=missing\n" + queued);
+        require(!queuedFirst.installed() && queuedFirst.hasPendingModule() && queuedFirst.pendingUpdateAvailable(16),
+            "first install can replace an older staged revision before reboot");
+        Module.Status queuedOverActive = Module.parseStatus("state=running\nversion=0.1.6\nrevision=15\n" + queued);
+        require(queuedOverActive.pendingUpdateAvailable(16) && !queuedOverActive.pendingUpdateAvailable(15)
+            && !queuedOverActive.pendingUpdateAvailable(14), "only newer bundled revisions replace the staged revision");
+        require(!Module.parseStatus("state=running\nrevision=17\n" + queued).pendingUpdateAvailable(16),
+            "staged upgrade cannot downgrade a newer active revision");
+        require(!Module.parseStatus("state=missing\npending=0.1.6\n").pendingUpdateAvailable(16),
+            "unknown pending revision does not permit an unverified upgrade");
+        require(!staged.pendingUpdateAvailable(1)
+            && Module.parseStatus("state=missing\npending=0.0.2\n").pendingFunctionalRevision() == 1,
+            "legacy staged cosmetic versions share functional revision one");
         Module.Status legacy = Module.parseStatus("state=stopped\nprofile=1\nenabled=0\n");
         require(legacy.installed() && legacy.version.isEmpty() && !legacy.enabled, "disabled legacy module");
         Module.Status cosmetic = Module.parseStatus("version=0.0.2\nstate=running\ncontrol=1\n");
@@ -50,6 +64,24 @@ public final class ModuleStatusCheck {
         Module.Status ready = Module.parseStatus(facts + "notification_recovery=1\nnotification_enabled=1\n");
         require(ready.running() && ready.active() && ready.runtime.notificationRecovery() && ready.runtime.notificationEnabled(),
             "shared ready phase and notification recovery capability");
+        String webRtc = "webrtc_filter=1\n";
+        Module.WebRtcStatus enabling = Module.parseStatus(facts + webRtc + "webrtc_configured=1\n").webRtc;
+        Module.WebRtcStatus disabling = Module.parseStatus(facts + webRtc + "webrtc_active=1\n").webRtc;
+        Module.WebRtcStatus applied = Module.parseStatus(facts + webRtc + "webrtc_configured=1\nwebrtc_active=1\n").webRtc;
+        Module.WebRtcStatus scoped = Module.parseStatus(facts + "webrtc_app_rules=1\nwebrtc_rule_count= 2\n"
+            + "webrtc_configured=1\nwebrtc_active=1\nwebrtc_pending=1\n").webRtc;
+        require(scoped.rules() && scoped.ruleCount() == 2 && scoped.needsRestart(true),
+            "an enabled-to-enabled change in app rules still requires restart");
+        Module.WebRtcStatus scopedEmpty = Module.parseStatus(facts + "webrtc_app_rules=1\nwebrtc_configured=1\n").webRtc;
+        require(scopedEmpty.rules() && !scopedEmpty.active() && !scopedEmpty.needsRestart(true),
+            "enabled with no app rules does not capture traffic or require restart");
+        require(!ready.webRtc.available() && !Module.parseStatus(facts + "webrtc_active=1\n").webRtc.active(),
+            "older modules never report WebRTC filtering");
+        require(enabling.needsRestart(true) && disabling.needsRestart(true) && !enabling.needsRestart(false),
+            "both changes are pending only for an active session");
+        require(applied.active() && !applied.needsRestart(true), "matching session is applied");
+        require(!Module.parseStatus("state=stopped\n" + webRtc + "webrtc_active=1\n").webRtc.active(),
+            "stale session marker is ignored while stopped");
         require(Module.parseStatus(facts.replace("tun4=1\n", "")).phase() == Module.Phase.DEGRADED,
             "state file alone cannot claim routes are ready");
         require(Module.parseStatus(facts.replace("tun6=1\n", "tun6_required=1\n")).phase() == Module.Phase.DEGRADED,
