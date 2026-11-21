@@ -1,7 +1,7 @@
 id=minclash
 name=MinClash Root TUN
-version=0.1.9
-versionCode=29
-revision=19
+version=0.2.0
+versionCode=31
+revision=21
 author=MinClash
-description=Mihomo v1.19.33-minclash.6 ARM64 with per-app WebRTC filtering, Android network recovery and traffic statistics.
+description=Mihomo v1.19.33-minclash.8 ARM64 with Android network handoff, per-app WebRTC filtering and traffic statistics.

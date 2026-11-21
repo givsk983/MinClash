@@ -331,8 +331,9 @@ trim_log() {
 }
 
 run_supervisor() {
-    local boot_uplink= uplink_baseline= uplink_candidate= uplink_samples=0 uplink_missing=0 uplink_restart_after=0
-    local delay=3 handoff child startup_deadline age was_ready mode_restored failure mode
+    local boot_uplink= uplink= delay=3
+    local child startup_deadline age was_ready mode_restored failure mode
+    local ready_uplink current_uplink route_failed rebuild_now
     exec 8>"$DATA/daemon.lock"
     lock_fd 8 || exit 0
     trap 'exec 6>&-; stop_core && clean_routes; write_state stopped; rm -f "$DATA/daemon.pid"' EXIT
@@ -347,9 +348,9 @@ run_supervisor() {
     fi
     export SKIP_SYSTEM_IPV6_CHECK=1
     while enabled; do
-        handoff=0
+        rebuild_now=0
         write_state starting
-        uplink_watch_reset
+        uplink=$(uplink_snapshot)
         if check_routes; then
             printf '%s\n' "$BOOT_ID" > "$DATA/routes-owned" || fail 'Cannot record routing ownership.'
             prepare_tether_dns && prepare_forwarding || fail 'Could not preserve Android tethering routes and DNS.'
@@ -362,17 +363,16 @@ run_supervisor() {
                 age=0
                 was_ready=0
                 mode_restored=0
+                ready_uplink=
                 while enabled && read_pid core >/dev/null; do
-                    if uplink_changed; then
-                        log 'System uplink changed. Rebuilding TUN after stable network recovery.'
-                        rm -f "$DATA/controller-ready"
-                        write_state starting
-                        handoff=1
-                        break
-                    fi
+                    # Mihomo handles uplink changes in place. Rebuild only if routing
+                    # or the controller actually fails its health checks.
+                    uplink=$(uplink_snapshot)
                     failure=
-                    if ! tun_ready_for_uplink "$uplink_baseline"; then
+                    route_failed=0
+                    if ! tun_ready_for_uplink "$uplink"; then
                         failure='required TUN routing is unavailable'
+                        route_failed=1
                     elif ! controller_probe; then
                         failure='Mihomo local controller is unavailable'
                     elif [ "$mode_restored" = 0 ]; then
@@ -390,17 +390,35 @@ run_supervisor() {
                             protection_command mark || break
                         fi
                         : > "$DATA/controller-ready"
-                        if [ "$uplink_missing" = 1 ]; then write_state waiting_network; else write_state running; fi
+                        if [ -z "$uplink" ]; then
+                            write_state waiting_network
+                        else
+                            ready_uplink="$uplink"
+                            write_state running
+                        fi
                         with_hotspot_lock 0 sync_hotspot_status || :
                         sync_notification
                         delay=3
                         age=0
                         was_ready=1
                     else
+                        # Confirm missing local routes quickly on a changed uplink.
+                        if [ "$route_failed" = 1 ] && [ -n "$ready_uplink" ] &&
+                           [ -n "$uplink" ] && [ "$uplink" != "$ready_uplink" ]; then
+                            sleep 0.25
+                            current_uplink=$(uplink_snapshot)
+                            if [ "$current_uplink" = "$uplink" ]; then
+                                if tun_ready_for_uplink "$current_uplink"; then
+                                    age=0
+                                    continue
+                                fi
+                                rebuild_now=1
+                            fi
+                        fi
                         rm -f "$DATA/controller-ready"
                         write_state starting
                         age=$((age + 1))
-                        if [ "$was_ready" = 1 ] && [ "$age" -ge 2 ]; then
+                        if [ "$was_ready" = 1 ] && { [ "$age" -ge 2 ] || [ "$rebuild_now" = 1 ]; }; then
                             log "Rebuilding the connection because $failure."
                             break
                         fi
@@ -410,26 +428,20 @@ run_supervisor() {
                         fi
                     fi
                     trim_log
-                    # Confirm a new uplink quickly while keeping the ordinary cadence
-                    # for steady networks and consecutive TUN route health failures.
-                    if [ "$was_ready" = 0 ] || { [ "$age" = 0 ] && uplink_confirmation_pending; }; then
-                        sleep 1
-                    else
-                        sleep 3
-                    fi
+                    if [ "$was_ready" = 0 ]; then sleep 1; else sleep 3; fi
                 done
             else
                 kill -TERM "$child" 2>/dev/null || :
                 wait "$child" 2>/dev/null || :
             fi
             stop_core && clean_routes || fail 'Could not stop the previous core.'
-            [ "$handoff" = 0 ] || continue
+            [ "$rebuild_now" = 0 ] || continue
         fi
         enabled || break
         write_state retrying
         log "Mihomo TUN inactive. Retrying in ${delay}s."
         trim_log
-        if wait_retry_uplink "$delay" "$uplink_baseline"; then
+        if wait_retry_uplink "$delay" "$uplink"; then
             log 'System uplink changed. Rebuilding TUN before retry delay elapsed.'
             delay=3
             continue

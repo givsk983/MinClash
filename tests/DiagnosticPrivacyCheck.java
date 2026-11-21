@@ -9,8 +9,13 @@ public final class DiagnosticPrivacyCheck {
         String node = "Private node 203.0.113.43";
         Module.Status module = Module.parseStatus("state=running\nprofile=1\nenabled=1\ncontrol=1\n"
             + "version=" + secret + "\nrevision=3\n");
-        Set<DiagnosticReport.Fact> flags = DiagnosticReport.parseFacts("IFACE\r\nROUTE4\nLOG_SAMPLE\nNODE_DNS\nFAKE_DNS_MISSING\nBOOT_UPLINK_RESTART\n"
+        Set<DiagnosticReport.Fact> flags = DiagnosticReport.parseFacts("IFACE\r\nROUTE4\nLOG_SAMPLE\nNODE_DNS\n"
+            + "FAKE_DNS_MISSING\nBOOT_UPLINK_RESTART\nUPLINK_HANDOFF\n"
             + secret + "\n" + node + "\nCORE_TLS " + node + "\n");
+        Set<DiagnosticReport.Fact> handoff = DiagnosticReport.parseFacts("UPLINK_HANDOFF\nBOOT_UPLINK_RESTART " + node + "\n");
+        if (!handoff.equals(Set.of(DiagnosticReport.Fact.UPLINK_HANDOFF))) {
+            throw new AssertionError("An in-place handoff must be distinct from a TUN rebuild");
+        }
         EnumMap<NetworkCheck, NetworkCheck.Result> results = new EnumMap<>(NetworkCheck.class);
         results.put(NetworkCheck.GOOGLE, new NetworkCheck.Result(NetworkCheck.State.TIMEOUT, 0, 0));
         results.put(NetworkCheck.CLOUDFLARE, new NetworkCheck.Result(NetworkCheck.State.DNS_ERROR, 0, 0));
@@ -19,6 +24,7 @@ public final class DiagnosticPrivacyCheck {
             Subscription.NetworkFailure.Kind.CONNECT).text();
         if (report.contains(secret) || report.contains(node) || report.contains("CORE_TLS")
             || !report.contains("NODE_DNS") || !report.contains("FAKE_DNS_MISSING") || !report.contains("BOOT_UPLINK_RESTART")
+            || !report.contains("UPLINK_HANDOFF")
             || !report.contains("SUB_CONNECT") || !report.contains("TIMEOUT")) {
             throw new AssertionError("Diagnostic output was not confined to the public format");
         }

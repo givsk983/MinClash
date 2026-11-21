@@ -229,6 +229,7 @@ final class Module {
                 match 'TUN did not become ready|priorities .* already in use|Interface minclash0 is already in use' TUN_SETUP
                 match 'Waiting for a stable system uplink at boot' BOOT_UPLINK_WAIT
                 match 'System uplink changed( after boot)?[.]' BOOT_UPLINK_RESTART
+                match 'MinClash refreshed Android default network' UPLINK_HANDOFF
                 match 'configuration (file .* )?test failed|parse config error' CONFIG
             fi
             exit 0

@@ -1,5 +1,13 @@
 [
   {
+    "revision": 21,
+    "version": "0.2.0",
+    "changes": [
+      "Wi-Fi、移动数据与双卡切换时，Mihomo 直接跟随系统出口，正常切网保留现有 TUN 会话。",
+      "IPv4 与 IPv6 分别跟随各自的可用出口。切网后 TUN 路由确实故障时，优先尝试恢复。"
+    ]
+  },
+  {
     "revision": 19,
     "version": "0.1.9",
     "changes": [

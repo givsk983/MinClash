@@ -12,7 +12,7 @@ BUILD = ROOT / "build"
 COMMIT = "3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8"
 SOURCE_SHA256 = "ecda5f8c8a8a1d60bc088c2640c85d92c8f002c0686234a26bdf671735afe216"
 VENDOR_SHA256 = "7ac4d4da0e6a29ef6ed18d2cf8f4c58d361d049ae364fd841acc883aa3a9e1cc"
-VERSION = "v1.19.33-minclash.6"
+VERSION = "v1.19.33-minclash.8"
 GO_VERSION = "go1.26.11"
 
 
@@ -78,14 +78,14 @@ def build_mihomo(download, clang):
         host_environment.pop(key, None)
     subprocess.run([go, "test", "-mod=vendor", "./component/keepalive", "-count=1"], cwd=source, env=host_environment, check=True)
     subprocess.run([go, "test", "-mod=vendor", "./component/process", "./component/protection", "./adapter/outbound", "./config",
-                    "./tunnel", "./hub/route", "-run", "MinClash|Protection", "-count=1"],
+                    "./tunnel", "./hub/route", "./listener/sing_tun", "-run", "MinClash|Protection", "-count=1"],
                    cwd=source, env=host_environment, check=True)
     binary = BUILD / "mihomo-arm64"
     environment.update(GOOS="android", GOARCH="arm64", CGO_ENABLED="1",
                        CC=f'"{clang}" --target=aarch64-linux-android28',
                        CGO_LDFLAGS="-Wl,-z,max-page-size=16384")
     flags = (f"-X github.com/metacubex/mihomo/constant.Version={VERSION} "
-             "-X github.com/metacubex/mihomo/constant.BuildTime=2026-11-20T00:00:00Z -w -s -buildid=")
+             "-X github.com/metacubex/mihomo/constant.BuildTime=2026-11-21T00:00:00Z -w -s -buildid=")
     subprocess.run([go, "build", "-mod=vendor", "-tags", "with_gvisor", "-trimpath", "-ldflags", flags,
                     "-o", str(binary), "."], cwd=source, env=environment, check=True)
     # Supply the complete patched core source together with the local artifacts.

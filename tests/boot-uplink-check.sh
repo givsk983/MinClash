@@ -48,38 +48,27 @@ lifetime=16
 [ "$(uplink_routes)" = "$expected" ] || { echo 'RA expiry changed the route signature'; exit 1; }
 
 # Both route tables stay present. Only Android's system-wide lookup changes.
-. "${CONTROL%/*}/runtime.sh"
-clock=100
-runtime_now() { printf '%s\n' "$clock"; }
 default4=1016 default6=rmnet0 uid_table=wlan0 net_id=0x64
-uplink_watch_reset
-[ "$uplink_baseline" = '-4 wlan0 192.0.2.1 1016
+baseline=$(uplink_snapshot)
+[ "$baseline" = '-4 wlan0 192.0.2.1 1016
 default-rule -4 0x0/0xffff 1016 0x64/0x1ffff
 -6 rmnet0 fe80::1 rmnet0
 default-rule -6 0x40000/0x4ffff rmnet0' ] || { echo 'Default rule parsing failed'; exit 1; }
 standby4=0
-if uplink_changed || uplink_changed; then echo 'Standby IPv4 route triggered a restart'; exit 1; fi
+[ "$(uplink_snapshot)" = "$baseline" ] || { echo 'Standby IPv4 route changed the uplink'; exit 1; }
 standby4=1
 uid_table=rmnet0
-if uplink_changed || uplink_changed; then echo 'UID-specific lookup triggered a restart'; exit 1; fi
+[ "$(uplink_snapshot)" = "$baseline" ] || { echo 'UID-specific lookup changed the uplink'; exit 1; }
 default4=1017
-if uplink_changed; then echo 'Transient default rule triggered a restart'; exit 1; fi
-uplink_changed
-if uplink_changed; then echo 'Unchanged network triggered a restart'; exit 1; fi
+[ "$(uplink_snapshot)" != "$baseline" ] || { echo 'Default table switch was missed'; exit 1; }
 [ "$(uplink_routes)" = "$expected" ] || { echo 'Test changed the physical routes'; exit 1; }
-clock=131
 default4=1016
-if uplink_changed; then exit 1; fi
-uplink_changed
-clock=137
+[ "$(uplink_snapshot)" = "$baseline" ] || { echo 'Restored default table was missed'; exit 1; }
 net_id=0x65
-if uplink_changed; then echo 'Transient network ID triggered a restart'; exit 1; fi
-uplink_changed
-if uplink_changed; then echo 'Unchanged network ID triggered a restart'; exit 1; fi
-clock=162
+changed_net_id=$(uplink_snapshot)
+[ "$changed_net_id" != "$baseline" ] || { echo 'Network ID change was missed'; exit 1; }
 default6=wlan0
-if uplink_changed; then exit 1; fi
-uplink_changed
+[ "$(uplink_snapshot)" != "$changed_net_id" ] || { echo 'IPv6 lookup change was missed'; exit 1; }
 default4= default6=
 [ "$(uplink_snapshot)" = "$expected" ] || { echo 'Route-only fallback failed'; exit 1; }
 default4=unknown

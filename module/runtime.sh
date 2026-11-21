@@ -9,45 +9,6 @@ tun_ready_for_uplink() {
     tun_ready && { ! has_ipv6_uplink "$1" || tun6_ready; }
 }
 
-uplink_watch_reset() {
-    uplink_baseline=$(uplink_snapshot)
-    uplink_candidate=
-    uplink_samples=0
-    uplink_missing=0
-    uplink_restart_after=${uplink_restart_after:-0}
-}
-
-uplink_changed() {
-    local next now
-    next=$(uplink_snapshot)
-    if [ -z "$next" ]; then
-        uplink_missing=1
-        uplink_candidate=
-        uplink_samples=0
-        return 1
-    fi
-    if [ "$next" != "$uplink_candidate" ]; then
-        uplink_candidate="$next"
-        uplink_samples=1
-        return 1
-    fi
-    uplink_samples=$((uplink_samples + 1))
-    [ "$uplink_samples" -ge 2 ] || return 1
-    if [ "$next" = "$uplink_baseline" ] && [ "$uplink_missing" = 0 ]; then return 1; fi
-    now=$(runtime_now)
-    [ "$now" -ge "$uplink_restart_after" ] || return 1
-    uplink_baseline="$next"
-    uplink_missing=0
-    uplink_restart_after=$((now + 6))
-    return 0
-}
-
-uplink_confirmation_pending() {
-    [ "$uplink_samples" = 1 ] &&
-        { [ "$uplink_candidate" != "$uplink_baseline" ] || [ "$uplink_missing" = 1 ]; } &&
-        [ "$(runtime_now)" -ge "$uplink_restart_after" ]
-}
-
 wait_retry_uplink() {
     local remaining="$1" failed_uplink="$2" next candidate= interval pause
     while enabled; do

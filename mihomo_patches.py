@@ -90,3 +90,51 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
     replace("tunnel/dns_dialer.go", '\t\t\t} else {\n\t\t\t\topts = append(opts, dialer.WithInterface(proxyName))',
             '\t\t\t} else {\n if strict { return nil, fmt.Errorf("MINCLASH_DNS_PROXY_MISSING") }\n\t\t\t\topts = append(opts, dialer.WithInterface(proxyName))', count=2)
 
+    # Android hands off by changing IP policy rules even when both links stay up.
+    tun = "vendor/github.com/metacubex/sing-tun/"
+    replace(tun + "monitor_linux.go", 'func (m *networkUpdateMonitor) Start() error {', '''func (m *networkUpdateMonitor) Start() error {
+	if runtime.GOOS == "android" {
+		return m.startMinClashAndroidMonitor()
+	}''')
+    replace(tun + "monitor_shared.go", '\t"errors"', '\t"errors"\n\t"runtime"')
+    replace(tun + "monitor_shared.go", '\tnoRoute               atomic.Bool',
+            '\tnoRoute               atomic.Bool\n\tandroidUplink         string\n\tandroidTunTable       int\n\tandroidFamilies       atomic.Pointer[androidUplinkInterfaces]')
+    replace(tun + "monitor_shared.go", 'type defaultInterfaceMonitor struct {', '''type androidUplinkInterfaces struct {
+	ipv4, ipv6 *control.Interface
+	ipv4Blocked, ipv6Blocked bool
+}
+
+type defaultInterfaceMonitor struct {''')
+    replace(tun + "monitor.go", '\tOverrideAndroidVPN    bool',
+            '\tOverrideAndroidVPN    bool\n\tMinClashTunTable      int')
+    replace(tun + "monitor_shared.go", '\t\toverrideAndroidVPN:    options.OverrideAndroidVPN,',
+            '\t\toverrideAndroidVPN:    options.OverrideAndroidVPN,\n\t\tandroidTunTable:       options.MinClashTunTable,')
+    replace("listener/sing_tun/server.go", 'OverrideAndroidVPN: overrideAndroidVPN})',
+            'OverrideAndroidVPN: overrideAndroidVPN, MinClashTunTable: tableIndex})')
+    replace("listener/sing_tun/server.go", '\tif netInterface := d.defaultInterfaceMonitor.DefaultInterface(); netInterface != nil {', '''	if destination.IsValid() && !destination.IsUnspecified() {
+		if monitor, ok := d.defaultInterfaceMonitor.(interface {
+			DefaultInterfaceForFamily(bool) (*control.Interface, bool)
+		}); ok {
+			netInterface, blocked := monitor.DefaultInterfaceForFamily(destination.Unmap().Is6())
+			if blocked {
+				return "<invalid>"
+			}
+			if netInterface != nil {
+				return netInterface.Name
+			}
+		}
+	}
+	if netInterface := d.defaultInterfaceMonitor.DefaultInterface(); netInterface != nil {''')
+    replace(tun + "monitor_shared.go", '\tm.element = m.networkMonitor.RegisterCallback(m.delayCheckUpdate)', '''	check := m.delayCheckUpdate
+	if runtime.GOOS == "android" {
+		check = m.postCheckUpdate
+	}
+	m.element = m.networkMonitor.RegisterCallback(check)''')
+    replace(tun + "monitor_shared.go", '\t\t\tm.defaultInterface.Store(nil)\n\t\t\tm.emit(nil, 0)', '''			// Android may remove the old default rule before installing its replacement.
+			if runtime.GOOS != "android" {
+				m.defaultInterface.Store(nil)
+				m.emit(nil, 0)
+			}''')
+    replace(tun + "monitor_android.go", 'func (m *defaultInterfaceMonitor) checkUpdate() error {',
+            'func (m *defaultInterfaceMonitor) upstreamAndroidCheckUpdate() error {')
+
