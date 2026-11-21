@@ -130,6 +130,11 @@ sync_notification() {
 }
 
 notification_heartbeat() {
-    printf '%s %s\n' "$BOOT_ID" "$(runtime_now)" > "$DATA/notification-heartbeat.new" &&
-        mv -f "$DATA/notification-heartbeat.new" "$DATA/notification-heartbeat"
+    local candidate
+    candidate=$(mktemp "$DATA/notification-heartbeat.XXXXXX") || return 1
+    if ! printf '%s %s\n' "$BOOT_ID" "$(runtime_now)" > "$candidate" ||
+       ! mv -f "$candidate" "$DATA/notification-heartbeat"; then
+        rm -f "$candidate"
+        return 1
+    fi
 }

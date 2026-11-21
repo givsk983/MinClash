@@ -58,6 +58,7 @@ public final class LiveRoutingCheck {
             && Arrays.equals(Arrays.copyOfRange(packet, end + merged.length, packet.length), live), "packet frames UTF-8 YAML exactly");
         Files.createDirectories(Path.of("build/checks-0.2.3"));
         Files.writeString(Path.of("build/checks-0.2.3/live-script.sh"), LiveProfile.SCRIPT);
+        Files.writeString(Path.of("build/checks-0.2.3/live-recovery.sh"), LiveProfile.RECOVERY_SCRIPT);
 
         Fake success = new Fake(""); RoutingStore.applyLive(success);
         require(success.steps.equals(List.of("reload", "verify", "selections", "commit")), "successful hot reload preserves existing connections");

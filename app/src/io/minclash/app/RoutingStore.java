@@ -60,11 +60,13 @@ final class RoutingStore {
     }
 
     private final AtomicFile file;
+    private final ProfileApplyJournal journal;
     private final Context context;
 
     RoutingStore(Context context) {
         this.context = context;
         file = new AtomicFile(new File(context.getFilesDir(), "app-routing.json"));
+        journal = new ProfileApplyJournal(context.getFilesDir());
     }
 
     State load() throws Exception {
@@ -87,17 +89,23 @@ final class RoutingStore {
     }
 
     void importProfile(byte[] source, String subscription) throws Exception {
-        State saved = read();
-        apply(saved == null ? new State(source, Collections.emptyMap(), subscription) : saved.withSource(source, subscription));
+        RoutingMutations.run(context, () -> {
+            recoverPending();
+            State saved = read();
+            return apply(saved == null ? new State(source, Collections.emptyMap(), subscription) : saved.withSource(source, subscription));
+        });
     }
 
     boolean repairDns() throws Exception {
-        BackupStore.requireResolved(context);
-        byte[] installed = Module.readProfile();
-        byte[] repaired = Profile.repairDns(installed);
-        if (installed == repaired) return false;
-        apply(repaired, null);
-        return true;
+        return RoutingMutations.run(context, () -> {
+            BackupStore.requireResolved(context);
+            recoverPending();
+            byte[] installed = Module.readProfile();
+            byte[] repaired = Profile.repairDns(installed);
+            if (installed == repaired) return false;
+            apply(repaired, null, false, false);
+            return true;
+        });
     }
 
     String savedSubscription(String legacyAddress) throws Exception {
@@ -160,6 +168,52 @@ final class RoutingStore {
         restoreSnapshot(encodeState(state).toString().getBytes(StandardCharsets.UTF_8));
     }
 
+    static final class RecoveryPending extends IOException {
+        final boolean conflict;
+        RecoveryPending(String message, boolean conflict, Throwable cause) {
+            super(message, cause);
+            this.conflict = conflict;
+        }
+    }
+
+    boolean recoverPending() throws Exception {
+        return RoutingMutations.run(context, () -> {
+            try {
+                ProfileApplyJournal.Pending pending = journal.read();
+                if (pending == null) return false;
+                switch (resolution(pending)) {
+                    case COMMIT -> restoreSnapshot(pending.newRouting());
+                    case STOP_REQUIRED -> throw new RecoveryPending(
+                        "上次分流应用中断。请先停止 TUN，再重新检测环境。", false, null);
+                    case CONFLICT -> throw new RecoveryPending(
+                        "上次分流应用中断，检测到配置已被其他操作修改。现有配置已保留。", true, null);
+                    case CLEAR -> { }
+                }
+                journal.clear();
+                return true;
+            } catch (RecoveryPending pending) {
+                throw pending;
+            } catch (Exception error) {
+                throw new RecoveryPending("暂时无法核对上次配置变更，请稍后重新检测环境。", false, error);
+            }
+        });
+    }
+
+    boolean discardConflictedPending() throws Exception {
+        return RoutingMutations.run(context, () -> {
+            ProfileApplyJournal.Pending pending = journal.read();
+            if (pending == null) return false;
+            if (resolution(pending) != ProfileApplyJournal.Resolution.CONFLICT) return recoverPending();
+            journal.clear();
+            generation++;
+            return true;
+        });
+    }
+
+    private ProfileApplyJournal.Resolution resolution(ProfileApplyJournal.Pending pending) throws Exception {
+        return pending.resolve(LiveProfile.recoveryState(pending.liveToken()), snapshot());
+    }
+
     byte[] snapshot() throws Exception {
         try (InputStream input = file.openRead()) { return BackupArchive.read(input); }
         catch (FileNotFoundException missing) {
@@ -196,10 +250,13 @@ final class RoutingStore {
     }
 
     ApplyMethod apply(State state, boolean recreateTun) throws Exception {
-        BackupStore.requireResolved(context);
-        checkExperimentalAccess(state);
-        byte[] merged = Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps());
-        return apply(merged, state, recreateTun);
+        return RoutingMutations.run(context, () -> {
+            BackupStore.requireResolved(context);
+            recoverPending();
+            checkExperimentalAccess(state);
+            byte[] merged = Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps());
+            return apply(merged, state, recreateTun, false);
+        });
     }
 
     void applyBackup(State state) throws Exception {
@@ -210,14 +267,6 @@ final class RoutingStore {
 
     void checkExperimentalAccess(State state) throws Exception {
         ExperimentalFeatures.checkBypass(ExperimentalFeatures.enabled(context), state.bypassedApps());
-    }
-
-    private void apply(byte[] merged, State state) throws Exception {
-        apply(merged, state, false);
-    }
-
-    private ApplyMethod apply(byte[] merged, State state, boolean recreateTun) throws Exception {
-        return apply(merged, state, recreateTun, false);
     }
 
     private ApplyMethod apply(byte[] merged, State state, boolean recreateTun, boolean restoringBackup) throws Exception {
@@ -238,20 +287,47 @@ final class RoutingStore {
         List<Controller.Group> selections = before.state.equals("running") && before.control
             ? Controller.groups().values() : Collections.emptyList();
         State saved = state == null ? null : read();
-        if (canReload(before, saved, state, previous, recreateTun)) {
+        boolean reload = canReload(before, saved, state, previous, recreateTun);
+        ProfileApplyJournal.Pending pending = state == null || restoringBackup ? null : new ProfileApplyJournal.Pending(
+            ProfileApplyJournal.digest(previous), ProfileApplyJournal.digest(merged), ProfileApplyJournal.digest(snapshot()),
+            encodeState(state).toString().getBytes(StandardCharsets.UTF_8), java.util.UUID.randomUUID().toString().replace("-", ""));
+        try {
+            if (pending != null) {
+                journal.write(pending);
+                LiveProfile.authorize(pending.liveToken());
+            }
+            ApplyMethod method = applyPrepared(before, state, merged, previous, reconnect, selections, reload, pending);
+            if (pending != null) journal.clear();
+            return method;
+        } catch (Exception error) {
+            if (pending != null) {
+                try {
+                    if (error instanceof LiveProfile.UnchangedFailure || error instanceof Module.ProfileUnchanged) journal.clear();
+                    else recoverPending();
+                } catch (Exception unresolved) { error.addSuppressed(unresolved); }
+            }
+            throw error;
+        }
+    }
+
+    private ApplyMethod applyPrepared(Module.Status before, State state, byte[] merged, byte[] previous, boolean reconnect,
+                                      List<Controller.Group> selections, boolean reload, ProfileApplyJournal.Pending pending) throws Exception {
+        String token = pending == null ? "" : pending.liveToken();
+        if (reload) {
             JSONObject runtime = Controller.runtimeSettings();
             byte[] live = Profile.forLiveReload(merged, runtime.getString("mode").toLowerCase(java.util.Locale.ROOT),
                 runtime.optString("find-process-mode").equalsIgnoreCase("always"));
-            byte[] packet = LiveProfile.packet(merged, live, previous);
+            byte[] packet = LiveProfile.packet(merged, live, previous, token);
             applyLive(new LiveChange() {
                 public void reload() throws Exception { LiveProfile.apply(packet); }
                 public void verify() throws Exception {
                     if (!Module.status().running()) throw new IOException("TUN 未就绪。");
                     Controller.mode();
                 }
-                public void commit() throws Exception { save(state); }
+                public void commit() throws Exception { restoreSnapshot(pending.newRouting()); }
                 public void restoreSelections() throws Exception { Controller.restoreSelections(selections); }
                 public void rollback() throws Exception {
+                    requireSafeRollback(pending);
                     Module.run(Module.Command.STOP, null);
                     Module.run(Module.Command.IMPORT, previous);
                     restart(before.control);
@@ -263,26 +339,29 @@ final class RoutingStore {
         boolean staged = reconnect && before.replaceProfile && previous != null;
         if (!staged) {
             if (reconnect && before.validate) Module.run(Module.Command.VALIDATE, merged);
-            if (reconnect) Module.run(Module.Command.STOP, null);
+            if (reconnect) profileCommand(Module.Command.STOP, null, token);
         }
         boolean imported = false;
         try {
-            if (staged) Module.replaceProfile(merged, previous);
-            else Module.run(Module.Command.IMPORT, merged);
+            if (staged) profileCommand(Module.Command.REPLACE_PROFILE, Module.replacementPacket(merged, previous), token);
+            else profileCommand(Module.Command.IMPORT, merged, token);
             imported = true;
             if (reconnect) restart(before.control);
-            if (state != null) save(state);
+            if (pending != null) restoreSnapshot(pending.newRouting());
+            else if (state != null) save(state);
         } catch (Exception error) {
             if (staged && !imported) {
                 if (error instanceof Module.ProfileFailure || error instanceof Module.ProfileUnchanged) throw error;
                 // A lost Root reply can leave the candidate committed or the original
                 // config stopped. A preflight failure with TUN still running needs no rollback.
+                if (pending != null) requireSafeRollback(pending);
                 Module.Status current = Module.status();
                 byte[] installed = current.profile ? Module.readProfile() : null;
                 imported = Arrays.equals(installed, merged);
                 if (!imported && (!Arrays.equals(installed, previous) || current.active())) throw error;
             }
             try {
+                if ((imported || reconnect) && pending != null) requireSafeRollback(pending);
                 if (imported && reconnect) Module.run(Module.Command.STOP, null);
                 if (imported && previous != null) Module.run(Module.Command.IMPORT, previous);
                 if (reconnect && previous != null) {
@@ -305,6 +384,18 @@ final class RoutingStore {
             }
         }
         return reconnect ? ApplyMethod.RESTARTED : ApplyMethod.SAVED;
+    }
+
+    private static void profileCommand(Module.Command command, byte[] payload, String token) throws Exception {
+        if (token.isEmpty()) Module.run(command, payload);
+        else LiveProfile.cold(command, payload, token);
+    }
+
+    private static void requireSafeRollback(ProfileApplyJournal.Pending pending) throws Exception {
+        String installed = LiveProfile.recoveryState(pending.liveToken()).profile();
+        if (!installed.equals(pending.oldProfile()) && !installed.equals(pending.newProfile())) {
+            throw new RecoveryPending("模块配置已变化，保留当前配置。", true, null);
+        }
     }
 
     static boolean canReload(Module.Status status, State saved, State changed, byte[] installed) throws Exception {

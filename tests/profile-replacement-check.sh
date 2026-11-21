@@ -24,8 +24,23 @@ chmod +x "$CORE"
 
 enabled() { :; }
 fail() { printf '%s\n' "$*" >&2; exit 1; }
-read_pid() { [ "$session" = running ] && [ "$1" = daemon ]; }
+read_pid() { [ "$observed_session" = running ] && [ "$1" = daemon ]; }
 has_applet() { [ "$1" = timeout ]; }
+has_timeout() { :; }
+lock_fd() { [ "$1" = 7 ]; }
+wait_lock_fd() { [ "$1" = 9 ]; }
+run_with_timeout() {
+    shift
+    "$@"
+    result=$?
+    if [ "${change_during_validation:-}" = protection ]; then
+        printf '{}\n' > "$DATA/protection.json"
+    fi
+    if [ "${change_during_validation:-}" = stop ]; then
+        observed_session=stopped
+    fi
+    return "$result"
+}
 mock_busybox() {
     [ "$1" = timeout ] || exit 1
     shift 4
@@ -41,7 +56,7 @@ eval "$(awk '/^check_profile\(\)/ { copy=1 } /^case "\$\{1:-\}"/ { copy=0 } copy
 
 packet() { printf '%s\n%s\n%s' "${#1}" "$2" "$1"; }
 
-session=running
+observed_session=running
 stop_ok=yes
 if packet 'new config' wrong | (check_profile replace-profile) 2>/dev/null; then
     fail 'stale installed profile accepted'
@@ -53,12 +68,12 @@ if packet invalid "$previous" | (check_profile replace-profile) 2>/dev/null; the
 fi
 [ "$(cat "$events")" = 'validate invalid' ] || fail 'invalid candidate stopped TUN'
 
-session=stopped
+observed_session=stopped
 if packet 'new config' "$previous" | (check_profile replace-profile) 2>/dev/null; then
     fail 'staged replace accepted after an explicit stop'
 fi
 
-session=running
+observed_session=running
 stop_ok=no
 if packet 'new config' "$previous" | (check_profile replace-profile) 2>/dev/null; then
     fail 'staged replace accepted after stop failed'
@@ -66,6 +81,15 @@ fi
 [ "$(cat "$PROFILE")" = 'old config' ] || fail 'failed stop replaced current configuration'
 
 stop_ok=yes
+for change_during_validation in protection stop; do
+    : > "$events"
+    if packet 'new config' "$previous" | (check_profile replace-profile) 2>/dev/null; then
+        fail "staged replace accepted after $change_during_validation changed during validation"
+    fi
+    [ "$(cat "$PROFILE")" = 'old config' ] || fail 'stale validation replaced the config'
+    [ "$(cat "$events")" = 'validate new config' ] || fail 'stale validation stopped the core'
+done
+unset change_during_validation
 : > "$events"
 packet 'new config' "$previous" | (check_profile replace-profile)
 actual=$(cat "$events")

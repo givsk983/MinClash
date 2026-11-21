@@ -21,7 +21,8 @@ final class Module {
         KEEPALIVE_BALANCED("keepalive-balanced"), KEEPALIVE_AGGRESSIVE("keepalive-aggressive"),
         WEBRTC_ON("webrtc-on"), WEBRTC_OFF("webrtc-off"),
         WEBRTC_GET("webrtc-get"), WEBRTC_SET_APPS("webrtc-set-apps"),
-        STATUS_NOTIFICATION("status-notification"), NOTIFICATION_ON("notification-on"), NOTIFICATION_OFF("notification-off"),
+        STATUS_NOTIFICATION("status-notification"), NOTIFICATION_HEARTBEAT("notification-heartbeat"),
+        NOTIFICATION_ON("notification-on"), NOTIFICATION_OFF("notification-off"),
         MODE_RULE("mode-rule"), MODE_GLOBAL("mode-global"), MODE_DIRECT("mode-direct");
 
         final String argument;
@@ -39,7 +40,8 @@ final class Module {
 
     record RuntimeStatus(boolean reported, boolean core, boolean tun4, boolean tun6, boolean tun6Required, boolean controller,
                          boolean notificationRecovery, boolean notificationEnabled, String hotspotReason,
-                         long hotspotSent, long hotspotReceived, boolean trafficSummary, boolean protectionDegraded) {}
+                         long hotspotSent, long hotspotReceived, boolean trafficSummary, boolean protectionDegraded,
+                         String coreSession, boolean notificationHeartbeat) {}
 
     record WebRtcStatus(boolean available, boolean rules, boolean configured, boolean active,
                         boolean pending, boolean legacy, int ruleCount) {
@@ -170,13 +172,6 @@ final class Module {
         return parseStatus(run(Command.STATUS, null));
     }
 
-    private static boolean notificationStatusSupported;
-    static Status notificationStatus() throws Exception {
-        Status status = parseStatus(run(notificationStatusSupported ? Command.STATUS_NOTIFICATION : Command.STATUS, null));
-        notificationStatusSupported = status.runtime.notificationRecovery();
-        return status;
-    }
-
     static byte[] readProfile() throws Exception {
         String source = runRoot("exec /system/bin/cat /data/adb/minclash/config.yaml", Command.API, null, 15);
         byte[] bytes = source.getBytes(StandardCharsets.UTF_8);
@@ -262,7 +257,8 @@ final class Module {
         String hotspotState = "off";
         boolean health = false, core = false, tun4 = false, tun6 = false, tun6Required = false, controller = false;
         boolean trafficSummary = false, protectionDegraded = false;
-        boolean notificationRecovery = false, notificationEnabled = false;
+        boolean notificationRecovery = false, notificationEnabled = false, notificationHeartbeat = false;
+        String coreSession = "";
         String hotspotReason = "none";
         long hotspotSent = 0, hotspotReceived = 0;
         for (String line : output.split("\\r?\\n")) {
@@ -294,8 +290,13 @@ final class Module {
             if (line.equals("tun6=1")) tun6 = true;
             if (line.equals("tun6_required=1")) tun6Required = true;
             if (line.equals("controller_ready=1")) controller = true;
+            if (line.startsWith("core_session=")) {
+                String session = line.substring("core_session=".length());
+                if (session.matches("[0-9a-f-]{36}:[0-9]+:[0-9]+")) coreSession = session;
+            }
             if (line.equals("notification_recovery=1")) notificationRecovery = true;
             if (line.equals("notification_enabled=1")) notificationEnabled = true;
+            if (line.equals("notification_heartbeat=1")) notificationHeartbeat = true;
             if (line.startsWith("hotspot_sent=")) hotspotSent = nonnegativeLong(line.substring(13));
             if (line.startsWith("hotspot_received=")) hotspotReceived = nonnegativeLong(line.substring(17));
             if (line.startsWith("hotspot_reason=")) hotspotReason = switch (line.substring(15)) {
@@ -325,7 +326,8 @@ final class Module {
         }
         return new Status(state, profile, boot, enabled, control, validate, replaceProfile, version, pendingVersion, revision, pendingRevision,
             hotspot, hotspotEnabled, hotspotState, new RuntimeStatus(health, core, tun4, tun6, tun6Required, controller,
-                notificationRecovery, notificationEnabled, hotspotReason, hotspotSent, hotspotReceived, trafficSummary, protectionDegraded),
+                notificationRecovery, notificationEnabled, hotspotReason, hotspotSent, hotspotReceived, trafficSummary, protectionDegraded,
+                core ? coreSession : "", notificationRecovery && notificationHeartbeat),
             TcpKeepAlive.parse(output), new WebRtcStatus(webRtcAvailable || webRtcRules, webRtcRules,
                 (webRtcAvailable || webRtcRules) && webRtcConfigured,
                 (webRtcAvailable || webRtcRules) && core && webRtcActive, core && webRtcPending,
@@ -348,17 +350,22 @@ final class Module {
             : "if [ ! -f " + script + " ]; then echo MINCLASH_NO_MODULE; exit 72; fi; ";
         String action = metadata
             + "exec /system/bin/sh " + script + " " + command.argument;
-        return runRoot(action, command, payload, command == Command.REPLACE_PROFILE ? 150
-            : command == Command.IMPORT || command == Command.VALIDATE ? 135 : 65);
+        int timeout = switch (command) {
+            case NOTIFICATION_HEARTBEAT -> 8;
+            case REPLACE_PROFILE -> 150;
+            case IMPORT, VALIDATE -> 135;
+            default -> 65;
+        };
+        return runRoot(action, command, payload, timeout);
     }
 
-    static void replaceProfile(byte[] next, byte[] previous) throws Exception {
+    static byte[] replacementPacket(byte[] next, byte[] previous) throws Exception {
         if (next.length == 0 || next.length > Profile.MAX_BYTES) throw new Profile.TooLarge();
         byte[] header = (next.length + "\n" + profileDigest(previous) + "\n").getBytes(StandardCharsets.US_ASCII);
         ByteArrayOutputStream packet = new ByteArrayOutputStream(header.length + next.length);
         packet.write(header);
         packet.write(next);
-        run(Command.REPLACE_PROFILE, packet.toByteArray());
+        return packet.toByteArray();
     }
 
     static String profileDigest(byte[] content) throws NoSuchAlgorithmException {

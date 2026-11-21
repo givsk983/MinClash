@@ -5,6 +5,20 @@ HOTSPOT_TUN=8798
 HOTSPOT_FWD=MINCLASH_HOTSPOT
 HOTSPOT_DNS=MINCLASH_DNS
 
+# The supervisor and CLI share this lock for settings, ownership, and cleanup.
+with_hotspot_lock() {
+    local attempts=$1 result=0
+    shift
+    exec 6>"$DATA/hotspot.lock" || return 1
+    if wait_lock_fd 6 "$attempts"; then
+        "$@" || result=$?
+    else
+        result=75
+    fi
+    exec 6>&-
+    return "$result"
+}
+
 hotspot_state() {
     [ "$(cat "$DATA/hotspot-state" 2>/dev/null)" = "$1" ] ||
         printf '%s\n' "$1" > "$DATA/hotspot-state"
@@ -293,6 +307,14 @@ sync_hotspot() {
     hotspot_active_state
 }
 
+sync_hotspot_status() {
+    if ! sync_hotspot; then
+        [ "$(cat "$DATA/hotspot-state" 2>/dev/null)" = error ] ||
+            log 'Hotspot proxy setup failed. Check tethering and firewall support.'
+        hotspot_state error
+    fi
+}
+
 hotspot_ensure_offload() {
     local now
     now=$(hotspot_now)
@@ -377,10 +399,8 @@ set_hotspot() {
         rm -f "$DATA/hotspot-on"
         rm -f "$DATA/hotspot-bpf-check"
         rm -f "$DATA/hotspot-offload-applied"
+        clean_hotspot || fail 'Could not remove hotspot sharing rules.'
         restore_hotspot_offload || fail 'Could not restore tethering acceleration settings.'
-        if ! read_pid daemon >/dev/null; then
-            clean_hotspot || fail 'Could not remove hotspot sharing rules.'
-        fi
         hotspot_state off
     fi
 }

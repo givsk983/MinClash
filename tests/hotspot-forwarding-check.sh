@@ -49,6 +49,7 @@ mock_ip() {
 }
 log() { :; }
 . "${CONTROL%/*}/hotspot.sh"
+wait_lock_fd() { [ "$1" = 6 ]; }
 eval "$(awk '/^owned_priorities\(\)/ { copy=1 } /^stop_core\(\)/ { copy=0 } copy' "$CONTROL")"
 
 fail_ipv6=0

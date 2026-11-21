@@ -55,7 +55,7 @@ public final class TunTileService extends TileService {
         int currentOperation = operation;
         statusWorker.execute(() -> {
             Module.Status current;
-            try { current = Module.status(); }
+            try { current = RuntimeStatusCache.read(this); }
             catch (Exception error) { current = null; }
             Module.Status result = current;
             main.post(() -> {
@@ -75,21 +75,23 @@ public final class TunTileService extends TileService {
         render(Tile.STATE_UNAVAILABLE, start ? "正在启动" : "正在停止");
         RoutingStore.WORKER.execute(() -> {
             try {
-                Module.Status current = Module.status();
-                if (start != active(current)) {
+                Module.Status result = RoutingMutations.run(this, () -> {
+                    Module.Status current = Module.status();
+                    if (start == active(current)) return current;
                     if (!canToggle(current)) throw new IOException("TUN prerequisites unavailable");
-                    BackupStore backup = new BackupStore(this);
                     if (start) {
-                        if (backup.recoverPending()) current = Module.status();
+                        if (RoutingMutations.recoverPending(this)) current = Module.status();
                         ExperimentalFeatures.reconcile(this, current);
                     }
                     Module.run(start ? Module.Command.START : Module.Command.STOP, null);
-                    if (!start) backup.recoverPending();
-                    current = Module.status();
-                }
+                    if (!start) {
+                        try { RoutingMutations.recoverPending(this); }
+                        catch (Exception ignored) { /* The overview can show pending recovery. */ }
+                    }
+                    return Module.status();
+                });
                 SharedPreferences preferences = getSharedPreferences("MainActivity", MODE_PRIVATE);
                 preferences.edit().putBoolean("connected", true).apply();
-                Module.Status result = current;
                 main.post(() -> {
                     ProxyNotificationService.sync(this, ProxyNotificationService.enabled(this)
                         && result.enabled && active(result));

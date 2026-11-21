@@ -9,7 +9,10 @@ done
 # The protection policy also applies while the user has stopped TUN.
 while [ ! -e "$MODDIR/disable" ] && [ ! -e "$MODDIR/remove" ] && [ -f "$MODDIR/control.sh" ]; do
     if [ -f /data/adb/minclash/protection-owned ]; then
-        /system/bin/sh "$MODDIR/control.sh" protection-watch >/dev/null 2>&1
+        if ! /system/bin/sh "$MODDIR/control.sh" protection-watch >/dev/null 2>&1; then
+            sleep 3
+            continue
+        fi
     fi
     sleep 15
 done

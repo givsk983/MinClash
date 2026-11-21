@@ -90,13 +90,18 @@ if os.environ.get('TEST_RESPONSE')=='lost-reply':sys.exit(1)
 sys.stdout.buffer.write(('HTTP/1.1 '+str(reply.status)+' '+reply.reason+'\\r\\nContent-Length: '+str(len(data))+'\\r\\n\\r\\n').encode()+data)
 ''', encoding='utf-8')
 (MOD / 'bin/socket-request').write_text(f'#!/usr/bin/bash\nexec "{Path(sys.executable).as_posix()}" "{helper.as_posix()}"\n', newline='\n')
-script = (ROOT / 'build/checks-0.2.3/live-script.sh').read_text()
-script = script.replace('/data/adb/modules/minclash', MOD.as_posix()).replace('/data/adb/minclash', DATA.as_posix())
-script = script.replace('[ -S "$DATA/control.sock" ]', '[ -f "$DATA/control.sock" ]')
-script = script.replace('/system/bin/flock', '/nonexistent/android-flock')
-SCRIPT = WORK / 'reload.sh'
-SCRIPT.write_text(script, newline='\n')
-subprocess.run([str(BASH), '-n', str(SCRIPT)], check=True)
+def prepare_script(name):
+    script = (ROOT / 'build/checks-0.2.3' / name).read_text(encoding='utf-8')
+    script = script.replace('/data/adb/modules/minclash', MOD.as_posix()).replace('/data/adb/minclash', DATA.as_posix())
+    script = script.replace('[ -S "$DATA/control.sock" ]', '[ -f "$DATA/control.sock" ]')
+    script = script.replace('/system/bin/flock', '/nonexistent/android-flock')
+    output = WORK / name
+    output.write_text(script, encoding='utf-8', newline='\n')
+    subprocess.run([str(BASH), '-n', str(output)], check=True)
+    return output
+
+SCRIPT = prepare_script('live-script.sh')
+RECOVERY = prepare_script('live-recovery.sh')
 CALLS = WORK / 'calls.txt'
 CALLS.write_text('')
 process = None
@@ -125,13 +130,14 @@ def stop():
         process.terminate()
         process.wait(timeout=10)
 
-def packet(new=saved, live=runtime, old=None):
+def packet(new=saved, live=runtime, old=None, token=''):
     old = PROFILE.read_bytes() if old is None else old
-    return (str(len(new))+'\n'+str(len(live))+'\n'+hashlib.sha256(old).hexdigest()+'\n').encode()+new+live
+    digest = hashlib.sha256(old).hexdigest()
+    return (str(len(new))+'\n'+str(len(live))+'\n'+digest+(':'+token if token else '')+'\n').encode()+new+live
 
-def invoke(data=None, **extra):
+def invoke(data=None, script=SCRIPT, **extra):
     env = dict(os.environ, TEST_PORT=str(PORT), TEST_CALLS=str(CALLS), MSYS_NO_PATHCONV='1', **extra)
-    return subprocess.run([str(BASH), str(SCRIPT)], input=packet() if data is None else data,
+    return subprocess.run([str(BASH), str(script)], input=packet() if data is None else data,
                           capture_output=True, timeout=20, env=env)
 
 def failed(result, marker):
@@ -198,6 +204,23 @@ try:
         assert api('/configs')['mode'] == 'global', 'fixture did not reach ambiguous state'
         stop(); start()
         assert api('/configs')['mode'] == 'rule', 'cold recovery did not restore old persistent config'
+    token = '00000000000000000000000000000001'
+    authorization = DATA / 'routing-apply.token'
+    authorization.write_text(token+'\n', newline='\n')
+    pid_file = DATA / 'core.pid'
+    pid_file.write_text(str(process.pid)+' 1 fixture\n', newline='\n')
+    data = packet(token=token)
+    failed(invoke(data, TEST_RESPONSE='lost-reply'), 'MINCLASH_LIVE_UNCERTAIN')
+    assert api('/configs')['mode'] == 'global'
+    state = invoke((token+'\n').encode(), script=RECOVERY)
+    assert state.returncode == 0 and state.stdout.splitlines() == [hashlib.sha256(source).hexdigest().encode(), b'1'], state
+    assert not authorization.exists(), 'recovery left a stale writer authorized'
+    failed(invoke(data), 'MINCLASH_LIVE_UNCHANGED')
+    stop(); pid_file.unlink(); start()
+    state = invoke((token+'\n').encode(), script=RECOVERY)
+    assert state.returncode == 0 and state.stdout.splitlines()[-1] == b'0', state
+    assert api('/configs')['mode'] == 'rule'
+    print('PASS: lost live reply, token revocation, and uncertain runtime detection until the core exits.')
     # Large UTF-8 payloads also check that the two head commands don't consume each other's bytes.
     padded = saved + ('# 中文分流配置\n' * 8000).encode()
     live_padded = padded.replace(b'mode: rule', b'mode: global')

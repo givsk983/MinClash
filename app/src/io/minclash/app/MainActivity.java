@@ -401,13 +401,16 @@ public final class MainActivity extends ThemedActivity {
         experimentalSwitch.setOnCheckedChangeListener((button, checked) -> {
             if (updatingSwitch || checked == ExperimentalFeatures.enabled(this)) return;
             if (checked) {
-                execute("已开启开发中功能。", () -> {
+                mutate("已开启开发中功能。", () -> {
                     ExperimentalFeatures.enable(this);
                     return null;
                 });
             } else {
                 showMessage("正在关闭开发中功能…");
-                execute("已关闭开发中功能。", true, () -> ExperimentalFeatures.disable(this, Module.status()));
+                mutate("已关闭开发中功能。", true, () -> {
+                    RoutingMutations.recoverPending(this);
+                    return ExperimentalFeatures.disable(this, Module.status());
+                });
             }
         });
         add(experimentalPage, experimentalSwitch, 0);
@@ -428,7 +431,7 @@ public final class MainActivity extends ThemedActivity {
             new int[] {AppUi.tone(0xff325f54, 0xff9dcbbb), BORDER}));
         bootSwitch.setOnCheckedChangeListener((button, checked) -> {
             if (updatingSwitch) return;
-            execute(checked ? "已开启开机自启。" : "已关闭开机自启。", () -> {
+            mutate(checked ? "已开启开机自启。" : "已关闭开机自启。", () -> {
                 Module.run(checked ? Module.Command.BOOT_ON : Module.Command.BOOT_OFF, null);
                 return Module.status();
             });
@@ -445,7 +448,7 @@ public final class MainActivity extends ThemedActivity {
         hotspotSwitch.setTrackTintList(bootSwitch.getTrackTintList());
         hotspotSwitch.setOnCheckedChangeListener((button, checked) -> {
             if (updatingSwitch) return;
-            execute(checked ? "已开启热点共享代理，请重新开启系统热点；若下方提示需重启手机，请重启后使用。" : "已关闭热点共享代理。", () -> {
+            mutate(checked ? "已开启热点共享代理，请重新开启系统热点；若下方提示需重启手机，请重启后使用。" : "已关闭热点共享代理。", () -> {
                 Module.run(checked ? Module.Command.HOTSPOT_ON : Module.Command.HOTSPOT_OFF, null);
                 return Module.status();
             });
@@ -545,7 +548,7 @@ public final class MainActivity extends ThemedActivity {
         keepAliveApplyButton.setOnClickListener(view -> new AlertDialog.Builder(this).setTitle("重连以应用保活设置")
             .setMessage("将短暂断开当前连接，并尝试恢复原来的节点选择。下载、通话等可能受到影响。")
             .setNegativeButton("稍后", null).setPositiveButton("立即重连", (dialog, which) ->
-                execute("保活设置已应用。", true, TcpKeepAlive::reconnect)).show());
+                mutate("保活设置已应用。", true, TcpKeepAlive::reconnect)).show());
         add(keepAlive, keepAliveApplyButton, 10);
 
         LinearLayout backups = card(backupPage, 0);
@@ -653,7 +656,7 @@ public final class MainActivity extends ThemedActivity {
             .setTitle("修复本机 DNS 配置")
             .setMessage("如果配置的 DNS 上游全部指向本机，将改用直连的公共加密 DNS。订阅、节点和分流规则会保留，运行中的 TUN 会短暂重连。")
             .setNegativeButton("取消", null).setPositiveButton("修复", (dialog, which) ->
-                execute("DNS 配置已修复。", true, () -> {
+                mutate("DNS 配置已修复。", true, () -> {
                     if (!new RoutingStore(this).repairDns()) throw new IOException("当前配置没有需要修复的纯本机 DNS 上游。");
                     return Module.status();
                 })).show());
@@ -983,14 +986,15 @@ public final class MainActivity extends ThemedActivity {
         if (status == null) { refresh(); return; }
         if (!status.installed()) { selectPage(2); return; }
         boolean stop = isActive();
-        execute("", true, () -> {
-            BackupStore backup = new BackupStore(this);
+        mutate("", true, () -> {
+            Module.Status current = Module.status();
+            if (stop != current.active()) return current;
             if (!stop) {
-                if (backup.recoverPending()) refreshSubscriptionCatalog();
+                if (RoutingMutations.recoverPending(this)) refreshSubscriptionCatalog();
                 ExperimentalFeatures.reconcile(this, Module.status());
             }
             Module.run(stop ? Module.Command.STOP : Module.Command.START, null);
-            if (stop && backup.recoverPending()) refreshSubscriptionCatalog();
+            if (stop) refreshSubscriptionCatalog();
             return Module.status();
         });
     }
@@ -1164,12 +1168,21 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void refresh() {
-        execute("", () -> {
+        mutate("", () -> {
             Module.Status current = Module.status();
-            try { return ExperimentalFeatures.reconcile(this, current); }
+            try {
+                if (RoutingMutations.recoverPending(this)) current = Module.status();
+                return ExperimentalFeatures.reconcile(this, current);
+            }
             catch (Exception error) {
                 main.post(() -> {
-                    if (!isDestroyed()) showMessage("关闭开发中功能时遇到问题，请在检测环境后重试。\n" + error.getMessage());
+                    if (isDestroyed()) return;
+                    if (error instanceof RoutingStore.RecoveryPending || error instanceof BackupStore.RecoveryPending) {
+                        showMessage(error.getMessage());
+                        if (error instanceof RoutingStore.RecoveryPending pending && pending.conflict) showRoutingRecoveryConflict();
+                    } else {
+                        showMessage("关闭开发中功能时遇到问题，请在检测环境后重试。\n" + error.getMessage());
+                    }
                 });
                 return Module.status();
             }
@@ -1184,9 +1197,10 @@ public final class MainActivity extends ThemedActivity {
         }
         // A background status check must not change the controls' enabled state.
         polling = true;
+        boolean fastRefresh = SystemClock.elapsedRealtime() < fastStatusUntil;
         worker.execute(() -> {
             try {
-                Module.Status updated = Module.status();
+                Module.Status updated = fastRefresh ? Module.status() : RuntimeStatusCache.read(this);
                 Controller.Overview summary = readProxySummary(updated);
                 main.post(() -> {
                     if (isDestroyed()) return;
@@ -1230,8 +1244,10 @@ public final class MainActivity extends ThemedActivity {
 
     private void refreshSubscriptionCatalog() {
         try {
-            new BackupStore(this).recoverPending();
-            SubscriptionCatalog.Snapshot loaded = subscriptionCatalog.load();
+            SubscriptionCatalog.Snapshot loaded = RoutingMutations.run(this, () -> {
+                RoutingMutations.recoverPending(this);
+                return subscriptionCatalog.load();
+            });
             SubscriptionReminders.reconcile(getApplicationContext(), loaded);
             main.post(() -> {
                 if (isDestroyed()) return;
@@ -1243,9 +1259,28 @@ public final class MainActivity extends ThemedActivity {
             main.post(() -> {
                 if (isDestroyed()) return;
                 if (subscriptions == null) subscriptionSummary.setText("无法读取订阅列表");
-                showMessage(error instanceof BackupStore.RecoveryPending ? error.getMessage() : "无法读取订阅列表。");
+                showMessage(error instanceof BackupStore.RecoveryPending || error instanceof RoutingStore.RecoveryPending
+                    ? error.getMessage() : "无法读取订阅列表。");
+                if (error instanceof RoutingStore.RecoveryPending pending && pending.conflict) showRoutingRecoveryConflict();
             });
         }
+    }
+
+    private boolean recoveryConflictShown;
+
+    private void showRoutingRecoveryConflict() {
+        if (!visible || recoveryConflictShown) return;
+        recoveryConflictShown = true;
+        new AlertDialog.Builder(this).setTitle("配置已被其他操作修改")
+            .setMessage("可以结束上次配置变更的恢复，保留手机上的现有配置。App 里的规则可能和模块不同，后续导入或订阅更新将按 App 规则重新生成配置。")
+            .setNegativeButton("稍后", null)
+            .setPositiveButton("保留现有配置", (dialog, which) ->
+                mutate("已结束上次配置恢复。", () -> {
+                    new RoutingStore(this).discardConflictedPending();
+                    refreshSubscriptionCatalog();
+                    return Module.status();
+                }))
+            .show();
     }
 
     private String appVersion() {
@@ -1413,7 +1448,7 @@ public final class MainActivity extends ThemedActivity {
             .setMessage(installExplanation + "\n\n" + moduleReleaseNotes.message(bundledModule, status))
             .setNegativeButton("取消", null).setPositiveButton(update ? "更新" : "安装", (dialog, which) -> {
                 showMessage("正在安装内置模块，请稍候…");
-                execute("模块安装完成，重启手机后生效。", () -> {
+                mutate("模块安装完成，重启手机后生效。", () -> {
                     Module.Status before = Module.status();
                     if (before.functionalRevision() > bundledModule.revision()) {
                         throw new IOException("检测到更新的模块，请刷新模块状态。");
@@ -1644,8 +1679,8 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void saveSubscriptions(List<SubscriptionCatalog.Entry> entries, String success) {
-        execute(success, () -> {
-            BackupStore.requireResolved(this);
+        mutate(success, () -> {
+            RoutingMutations.recoverPending(this);
             subscriptionCatalog.save(entries);
             refreshSubscriptionCatalog();
             return null;
@@ -1674,7 +1709,8 @@ public final class MainActivity extends ThemedActivity {
                 }
                 // Snapshot and configuration writes share the same queue; downloading does not.
                 try {
-                    return worker.submit(() -> {
+                    return worker.submit(() -> RoutingMutations.run(context, () -> {
+                        RoutingMutations.recoverPending(context);
                         request.seal();
                         RoutingStore routing = new RoutingStore(context);
                         if (adding || new SubscriptionCatalog(prefs, routing).load().entries().stream()
@@ -1693,7 +1729,7 @@ public final class MainActivity extends ThemedActivity {
                             SubscriptionUpdateStatus.complete(prefs, entry.address(), attempt, "订阅缺少分流规则需要的代理组");
                         }
                         return preview;
-                    }).get();
+                    })).get();
                 } catch (ExecutionException error) {
                     Exception cause = error.getCause() instanceof Exception known ? known : error;
                     if (!adding && !(cause instanceof DownloadRequest.Cancelled)) {
@@ -1725,7 +1761,7 @@ public final class MainActivity extends ThemedActivity {
             }
             dismissBackgroundResult(background.preview);
             shown.dismiss();
-            execute("订阅配置已应用。", true, () -> applySubscription(preview));
+            mutate("订阅配置已应用。", true, () -> applySubscription(preview));
         });
     }
 
@@ -1734,6 +1770,7 @@ public final class MainActivity extends ThemedActivity {
         long attempt = SubscriptionUpdateStatus.begin();
         boolean listed = !preview.adding();
         try {
+            RoutingMutations.recoverPending(this);
             if (preview.generation() != RoutingStore.generation()) {
                 throw new IOException("当前配置已变化，请重新预览订阅。");
             }
@@ -1828,7 +1865,7 @@ public final class MainActivity extends ThemedActivity {
         if (request != PICK_PROFILE || result != RESULT_OK || data == null) return;
         Uri uri = data.getData();
         if (uri == null) return;
-        execute("配置已通过 Mihomo 校验并保存。", () -> {
+        mutate("配置已通过 Mihomo 校验并保存。", () -> {
             try (InputStream input = getContentResolver().openInputStream(uri)) {
                 if (input == null) throw new IOException("无法打开所选文件。");
                 new RoutingStore(this).importProfile(Profile.normalize(input), "");
@@ -1893,7 +1930,10 @@ public final class MainActivity extends ThemedActivity {
             String version = appVersion();
             if (!background.backup.start(BackgroundWork.DOWNLOADS, () -> {
                 try {
-                    BackupArchive.Data snapshot = worker.submit(() -> new BackupStore(context).capture(version)).get();
+                    BackupArchive.Data snapshot = worker.submit(() -> RoutingMutations.run(context, () -> {
+                        RoutingMutations.recoverPending(context);
+                        return new BackupStore(context).capture(version);
+                    })).get();
                     byte[] bytes = BackupArchive.encode(snapshot, secret);
                     // Exercise the same validation path before offering the file for export.
                     BackupArchive.decode(bytes, secret);
@@ -1908,7 +1948,10 @@ public final class MainActivity extends ThemedActivity {
     private static Object decodeBackup(Context context, byte[] bytes, char[] password) throws Exception {
         try {
             BackupArchive.Data data = BackupArchive.decode(bytes, password);
-            String stamp = worker.submit(() -> new BackupStore(context).stamp()).get();
+            String stamp = worker.submit(() -> RoutingMutations.run(context, () -> {
+                RoutingMutations.recoverPending(context);
+                return new BackupStore(context).stamp();
+            })).get();
             return new BackgroundWork.BackupPreview(data, stamp);
         } catch (BackupArchive.PasswordFailure incorrect) {
             return new BackgroundWork.BackupLocked(bytes, true);
@@ -1974,7 +2017,7 @@ public final class MainActivity extends ThemedActivity {
             backgroundDialog = dialog;
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
                 if (busy || status == null || !status.active()) return;
-                execute("TUN 已停止，可确认恢复备份。", () -> {
+                mutate("TUN 已停止，可确认恢复备份。", () -> {
                     Module.run(Module.Command.STOP, null);
                     return Module.status();
                 });
@@ -1991,7 +2034,8 @@ public final class MainActivity extends ThemedActivity {
                 background.backupRestoring = true;
                 busy = true;
                 Context context = getApplicationContext();
-                background.backup.start(worker, () -> {
+                background.backup.start(worker, () -> RoutingMutations.run(context, () -> {
+                    RoutingMutations.recoverPending(context);
                     new BackupStore(context).restore(data, preview.stamp());
                     SharedPreferences prefs = context.getSharedPreferences("MainActivity", MODE_PRIVATE);
                     String warning = "";
@@ -2006,7 +2050,7 @@ public final class MainActivity extends ThemedActivity {
                     try { restored = Module.status(); }
                     catch (Exception unavailable) { warning += "请重新检测环境以刷新状态。"; }
                     return new BackgroundWork.BackupDone(true, restored, warning);
-                });
+                }));
                 render();
             });
         } else if (result instanceof BackgroundWork.BackupDone done) {
@@ -2031,7 +2075,7 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void saveKeepAlive(TcpKeepAlive.Mode mode) {
-        execute("保活设置已保存，下次启动 TUN 生效。", () -> {
+        mutate("保活设置已保存，下次启动 TUN 生效。", () -> {
             if (!Module.status().keepAlive.available()) throw new IOException("当前模块不支持此功能，请先更新内置模块。");
             Module.run(mode.command, null);
             if (mode != TcpKeepAlive.Mode.OFF) appPreferences().edit().putString(TcpKeepAlive.LEVEL_PREFERENCE, mode.value).apply();
@@ -2040,7 +2084,7 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void saveWebRtc(boolean enabled) {
-        execute("WebRTC 设置已保存，下次启动 TUN 时应用。", () -> {
+        mutate("WebRTC 设置已保存，下次启动 TUN 时应用。", () -> {
             Module.Status current = Module.status();
             if (!current.enabled || !current.webRtc.available() || enabled && !current.webRtc.rules()) {
                 throw new IOException("请启用支持 WebRTC 应用规则的 MinClash 模块。");
@@ -2137,7 +2181,7 @@ public final class MainActivity extends ThemedActivity {
             if (busy) return;
             byte[] payload = String.join("\n", selected).getBytes(java.nio.charset.StandardCharsets.US_ASCII);
             save.setEnabled(false);
-            execute("WebRTC 应用规则已保存。", false, () -> {
+            mutate("WebRTC 应用规则已保存。", false, () -> {
                 requireWebRtcRules();
                 Module.run(Module.Command.WEBRTC_SET_APPS, payload);
                 return Module.status();
@@ -2153,7 +2197,7 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void applyWebRtc() {
-        execute("WebRTC 设置已应用。", true, () -> {
+        mutate("WebRTC 设置已应用。", true, () -> {
             Module.Status before = Module.status();
             if (!before.webRtc.available() || !before.running()) {
                 throw new IOException("请等待 TUN 就绪，或在下次启动时应用设置。");
@@ -2241,7 +2285,7 @@ public final class MainActivity extends ThemedActivity {
 
     private void changeProxyMode(Controller.Mode mode) {
         if (!hasProxyControl(status)) return;
-        execute("已切换到" + mode.label + "模式。", true, () -> {
+        mutate("已切换到" + mode.label + "模式。", true, () -> {
             Module.run(mode.command, null);
             return Module.status();
         });
@@ -2570,7 +2614,7 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void selectNode(String group, String node) {
-        execute(node == null ? "已恢复自动选点。" : "已切换到 " + node + "。", true, () -> {
+        mutate(node == null ? "已恢复自动选点。" : "已切换到 " + node + "。", true, () -> {
             Controller.select(group, node);
             return Module.status();
         });
@@ -2883,7 +2927,8 @@ public final class MainActivity extends ThemedActivity {
             title.setEnabled(false);
             categoryButton.setEnabled(false);
             manageCategories.setEnabled(false);
-            execute("", true, () -> {
+            mutate("", true, () -> {
+                RoutingMutations.recoverPending(this);
                 RoutingStore routing = new RoutingStore(this);
                 RoutingStore.State latest = routing.load();
                 Map<String, String> rules = new TreeMap<>(latest.applications());
@@ -3334,7 +3379,8 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void savePersonalRules(RulesScreen screen, List<PersonalRules.Rule> rules) {
-        execute("", true, () -> {
+        mutate("", true, () -> {
+            RoutingMutations.recoverPending(this);
             if (screen.generation() != RoutingStore.generation()) throw new IOException("配置已变化，请重新打开自定义分流。");
             RoutingStore store = new RoutingStore(this);
             RoutingStore.State latest = store.load();
@@ -3383,7 +3429,7 @@ public final class MainActivity extends ThemedActivity {
         new AlertDialog.Builder(this).setTitle("断开 " + app.label() + " 的旧连接？")
             .setMessage(app.packageName() + "\n只处理保存前建立、能确认属于此应用的连接。应用可能会自动重连。")
             .setNegativeButton("取消", null).setPositiveButton("断开", (confirm, which) ->
-                execute("", () -> {
+                mutate("", () -> {
                     int count = LiveConnections.disconnectBefore(app.packageName(), getPackageManager(), cutoff);
                     ProxyNotificationService.connectionChanged(this);
                     return new AppConnectionsClosed(count);
@@ -3429,7 +3475,10 @@ public final class MainActivity extends ThemedActivity {
                 worker.execute(() -> {
                     boolean enabled;
                     try {
-                        Controller.identifyProcessesForSession();
+                        RoutingMutations.run(this, () -> {
+                            Controller.identifyProcessesForSession();
+                            return null;
+                        });
                         enabled = true;
                     } catch (Exception error) { enabled = false; }
                     boolean success = enabled;
@@ -3457,6 +3506,19 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private interface Operation { Object run() throws Exception; }
+
+    private void mutate(String success, Operation operation) {
+        mutate(success, false, operation);
+    }
+
+    private void mutate(String success, boolean checkConnection, Operation operation) {
+        mutate(success, checkConnection, operation, null);
+    }
+
+    private void mutate(String success, boolean checkConnection, Operation operation,
+                        java.util.function.Consumer<Exception> completion) {
+        execute(success, checkConnection, () -> RoutingMutations.run(this, operation::run), completion);
+    }
 
     private void execute(String success, Operation operation) {
         execute(success, false, operation);

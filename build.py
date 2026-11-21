@@ -1,7 +1,10 @@
 import argparse
+from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 import hashlib
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -17,6 +20,55 @@ DIST = ROOT / "dist"
 SNAKEYAML = "2.5"
 YAML_JAR = f"snakeyaml-{SNAKEYAML}.jar"
 RELEASE_CERT_SHA256 = "8c7b06c0539fc7cab859a13f82836465de2359d2a4dd45ccac5804c35e5f5ef1"
+
+
+@dataclass(frozen=True)
+class ModuleArchive:
+    data: bytes
+    digest: str
+    properties: str
+
+    def add_to(self, apk):
+        apk.writestr("assets/minclash-module.zip", self.data, zipfile.ZIP_STORED)
+        apk.writestr("assets/minclash-module.sha256", self.digest + "\n")
+        apk.writestr("assets/minclash-module.properties", self.properties)
+
+
+def read_module_archive(path, expected_sha256=None):
+    # Keep the verified bytes so packaging cannot read a different archive later.
+    data = path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256.lower():
+        raise RuntimeError(f"SHA-256 mismatch for {path}: expected {expected_sha256.lower()}, got {digest}")
+
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            if archive.namelist().count("module.prop") != 1:
+                raise RuntimeError(f"Expected exactly one module.prop in {path}.")
+            properties_text = archive.read("module.prop").decode("utf-8")
+    except (zipfile.BadZipFile, UnicodeDecodeError) as error:
+        raise RuntimeError(f"Invalid module ZIP or module.prop: {path}") from error
+
+    metadata_keys = ("version", "versionCode", "revision")
+    properties = {}
+    for line in properties_text.splitlines():
+        key, _, value = line.partition("=")
+        if key in ("id", *metadata_keys):
+            if key in properties:
+                raise RuntimeError(f"Duplicate {key} in {path} module.prop.")
+            properties[key] = value
+    if properties.get("id") != "minclash":
+        raise RuntimeError(f"Expected a MinClash module ZIP: {path}")
+    version = properties.get("version", "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+\-]*", version):
+        raise RuntimeError(f"Invalid module version in {path}.")
+    if version in ("0.0.1", "0.0.2"):
+        properties.setdefault("revision", "1")
+    for key in ("versionCode", "revision"):
+        value = properties.get(key, "")
+        if not re.fullmatch(r"[0-9]{1,10}", value) or not 0 < int(value) <= 2_147_483_647:
+            raise RuntimeError(f"Invalid module {key} in {path}.")
+    return ModuleArchive(data, digest, "".join(f"{key}={properties[key]}\n" for key in metadata_keys))
 
 
 def sha256(path):
@@ -64,10 +116,6 @@ def reset_compilation_directory(name):
 
 
 def build_apk(yaml_jar, apache_license, module_archive, keystore, release):
-    properties = dict(line.split("=", 1) for line in
-                      (ROOT / "module/module.prop").read_text(encoding="utf-8").splitlines() if "=" in line)
-    if not properties.get("version") or int(properties.get("versionCode", "0")) <= 0 or int(properties.get("revision", "0")) <= 0:
-        raise RuntimeError("Module version, versionCode and functional revision must be configured.")
     sdk_path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
     if not sdk_path and os.name == "nt":
         sdk_path = Path(os.environ["LOCALAPPDATA"]) / "Android" / "Sdk"
@@ -111,10 +159,7 @@ def build_apk(yaml_jar, apache_license, module_archive, keystore, release):
         for name in compiled.namelist():
             target.writestr(name, compiled.read(name))
         target.write(apache_license, "assets/licenses/snakeyaml-LICENSE.txt", zipfile.ZIP_DEFLATED)
-        target.write(module_archive, "assets/minclash-module.zip", zipfile.ZIP_STORED)
-        target.writestr("assets/minclash-module.sha256", sha256(module_archive) + "\n")
-        target.writestr("assets/minclash-module.properties", "".join(
-            key + "=" + properties[key] + "\n" for key in ("version", "versionCode", "revision")))
+        module_archive.add_to(target)
 
     aligned = BUILD / "aligned.apk"
     execute(sdk_tool("zipalign"), "-f", "4", base, aligned)
@@ -193,21 +238,34 @@ def build_module(core, license_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--release", action="store_true", help="Require the published APK signing certificate.")
+    parser.add_argument("--module-zip", type=Path, help="Build only the APK using an existing MinClash module ZIP.")
+    parser.add_argument("--module-sha256", help="Expected SHA-256 of the ZIP supplied with --module-zip.")
     options = parser.parse_args()
+    if (options.module_zip is None) != (options.module_sha256 is None):
+        parser.error("--module-zip and --module-sha256 must be supplied together.")
+    if options.module_sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", options.module_sha256):
+        parser.error("--module-sha256 must contain 64 hexadecimal digits.")
     keystore = Path(os.environ.get("MINCLASH_KEYSTORE", BUILD / "debug.keystore")).resolve()
     if options.release and not keystore.is_file():
         raise RuntimeError("Restore the MinClash signing keystore or set MINCLASH_KEYSTORE before building a release.")
+    module_archive = None
+    if options.module_zip is not None:
+        module_archive = read_module_archive(options.module_zip, options.module_sha256)
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
     DIST.mkdir(exist_ok=True)
     yaml_jar = download(YAML_JAR, f"https://repo.maven.apache.org/maven2/org/yaml/snakeyaml/{SNAKEYAML}/{YAML_JAR}",
                         "e6682acf1ace77508ef13649cbf4f8d09d2cf5457bdb61d25ffb6ac0233d78dd")
     apache_license = download("apache-2.0-LICENSE", "https://www.apache.org/licenses/LICENSE-2.0.txt",
                               "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30")
-    core, mihomo_license, core_source = build_mihomo(download, ndk_clang())
-    module_archive = build_module(core, mihomo_license)
+    module_path = None
+    if module_archive is None:
+        core, mihomo_license, core_source = build_mihomo(download, ndk_clang())
+        module_path = build_module(core, mihomo_license)
+        module_archive = read_module_archive(module_path)
     build_apk(yaml_jar, apache_license, module_archive, keystore, options.release)
-    shutil.copyfile(module_archive, DIST / module_archive.name)
-    shutil.copyfile(core_source, DIST / core_source.name)
+    if module_path is not None:
+        (DIST / module_path.name).write_bytes(module_archive.data)
+        shutil.copyfile(core_source, DIST / core_source.name)
     apk = DIST / "MinClash.apk"
     print(f"APK (module included): {apk}\nSHA-256: {sha256(apk)}")
 

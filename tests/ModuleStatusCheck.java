@@ -64,6 +64,12 @@ public final class ModuleStatusCheck {
         Module.Status ready = Module.parseStatus(facts + "notification_recovery=1\nnotification_enabled=1\n");
         require(ready.running() && ready.active() && ready.runtime.notificationRecovery() && ready.runtime.notificationEnabled(),
             "shared ready phase and notification recovery capability");
+        String session = "00000000-0000-0000-0000-000000000001:123:456";
+        Module.Status identified = Module.parseStatus(facts + "notification_recovery=1\nnotification_heartbeat=1\ncore_session=" + session + "\n");
+        require(identified.runtime.coreSession().equals(session) && identified.runtime.notificationHeartbeat(),
+            "verified runtime snapshots include the session and independent heartbeat capability");
+        require(ready.runtime.coreSession().isEmpty() && !ready.runtime.notificationHeartbeat(),
+            "older modules keep legacy snapshots and heartbeats");
         String webRtc = "webrtc_filter=1\n";
         Module.WebRtcStatus enabling = Module.parseStatus(facts + webRtc + "webrtc_configured=1\n").webRtc;
         Module.WebRtcStatus disabling = Module.parseStatus(facts + webRtc + "webrtc_active=1\n").webRtc;

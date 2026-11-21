@@ -66,6 +66,7 @@ public final class ProxyNotificationService extends Service {
     private record Sample(Connection connection, String app, String node, Speed speed, boolean overlayAllowed) {}
     private record CounterSample(Module.TunCounters counters, long time) {}
     private record AppOutletSample(String packageName, String node, long time) {}
+    private String coreSession = "";
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -336,7 +337,12 @@ public final class ProxyNotificationService extends Service {
 
     private Connection readConnection() {
         try {
-            Module.Status status = Module.notificationStatus();
+            Module.Status status = RuntimeStatusCache.notification(this);
+            if (!coreSession.equals(status.runtime.coreSession())) {
+                coreSession = status.runtime.coreSession();
+                sampledOutlet = null;
+                previousCounters = null;
+            }
             NotificationRecovery.sync(this, status);
             if (status.runtime.protectionDegraded()) {
                 return new Connection("防泄漏规则待恢复", "请检查保护设置", status.running(), false, false);
@@ -349,9 +355,9 @@ public final class ProxyNotificationService extends Service {
             }
             if (status.control) {
                 try {
-                    Controller.Mode mode = Controller.mode();
-                    String node = mode == Controller.Mode.DIRECT ? "直接连接" : Controller.primaryNode(mode);
-                    return new Connection(mode.label + "模式", node, true, false, true);
+                    Controller.Overview overview = Controller.overview();
+                    String node = overview.mode() == Controller.Mode.DIRECT ? "直接连接" : overview.node();
+                    return new Connection(overview.mode().label + "模式", node, true, false, true);
                 } catch (Exception ignored) { }
             }
             return new Connection("TUN 运行中", "控制暂不可用", true, false, false);

@@ -100,7 +100,7 @@ if tun_ready_for_uplink '-6 wlan0 default'; then echo 'Missing IPv4 TUN route re
     CORE=mock_core PROFILE=unused SOCKET="$DATA/test.sock" LOG="$DATA/core.log"
     events="$DATA/supervisor-events"
     state= clock=0 launches=0
-    route_check_failure=0
+    route_check_failure=0 controller_check_failure=0
     mock_core() { :; }
     fail() { echo "$*" >&2; exit 1; }
     log() { :; }
@@ -111,7 +111,8 @@ if tun_ready_for_uplink '-6 wlan0 default'; then echo 'Missing IPv4 TUN route re
     prepare_forwarding() { :; }
     prepare_keepalive() { :; }
     protection_command() { :; }
-    sync_hotspot() { :; }
+    with_hotspot_lock() { :; }
+    controller_probe() { [ "$controller_check_failure" = 0 ] || [ "$clock" -lt 4 ]; }
     sync_notification() { :; }
     enabled() { [ "$launches" -lt 3 ]; }
     uplink_snapshot() { if [ "$clock" -lt 4 ]; then echo mobile; else echo wifi; fi; }
@@ -188,6 +189,18 @@ launch 3'
         printf 'Unexpected route recovery timeline:\n%s\n' "$actual" >&2
         exit 1
     fi
+    : > "$events"
+    state= clock=0 launches=0 route_check_failure=0 controller_check_failure=1
+    uplink_snapshot() { echo mobile; }
+    run_supervisor
+    [ "$(grep -c '^running$' "$events")" = 1 ] || {
+        printf 'Unexpected controller recovery timeline:\n%s\n' "$(cat "$events")" >&2
+        exit 1
+    }
+    [ "$(grep -c '^stop starting$' "$events")" -ge 1 ] || {
+        echo 'Unresponsive local API did not rebuild the core while the TUN routes remained ready.'
+        exit 1
+    }
 )
 
 notification_user() { printf '0\n'; }

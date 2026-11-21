@@ -99,7 +99,7 @@ public final class SubscriptionUpdateJob extends JobService {
         SharedPreferences preferences = preferences();
         try {
             if (!isActive(params, request) || !preferences.getBoolean(ENABLED, false)) { finish(params, null, request); return; }
-            if (new BackupStore(this).recoverPending()) { finish(params, null, request); return; }
+            if (RoutingMutations.recoverPending(this)) { finish(params, null, request); return; }
             RoutingStore routing = new RoutingStore(this);
             SubscriptionCatalog.Entry current = new SubscriptionCatalog(preferences, routing).load().active();
             if (current == null) { finish(params, null, request); return; }
@@ -142,28 +142,9 @@ public final class SubscriptionUpdateJob extends JobService {
         String failure = null;
         boolean retryable = false;
         try {
-            if (!isActive(params, request) || !preferences.getBoolean(ENABLED, false)) return;
-            BackupStore.requireResolved(this);
-            request.seal();
-            RoutingStore routing = new RoutingStore(this);
-            SubscriptionCatalog.Entry latest = new SubscriptionCatalog(preferences, routing).load().active();
-            if (latest != null && latest.address().equals(attempt.address())) {
-                downloaded.usage().cache(preferences, attempt.address());
-                SubscriptionReminders.reconcile(this, new SubscriptionCatalog(preferences, routing).load());
-            }
-            if (latest == null || !attempt.stillCurrent(latest.address(), RoutingStore.generation())) {
-                outcome = "跳过，下载期间配置或当前订阅已变化";
-                return;
-            }
-            Module.Status status = Module.status();
-            if (!canRefresh(status)) {
-                outcome = "跳过，模块或配置未就绪";
-                retryable = recovering(status);
-                return;
-            }
-            routing.importProfile(downloaded.source(), attempt.address());
-            SubscriptionUpdateStatus.complete(preferences, attempt.address(), attempt.id(), "");
-            outcome = "更新成功";
+            ApplyResult result = RoutingMutations.run(this, () -> applyDownloaded(params, attempt, downloaded, request, preferences));
+            outcome = result.message();
+            retryable = result.retryable();
         } catch (RoutingStore.SelectionRestoreFailure warning) {
             SubscriptionUpdateStatus.complete(preferences, attempt.address(), attempt.id(), "");
             outcome = "已更新，请检查节点选择";
@@ -176,6 +157,30 @@ public final class SubscriptionUpdateJob extends JobService {
         } finally {
             finish(params, outcome, request, attempt, failure, retryable);
         }
+    }
+
+    private record ApplyResult(String message, boolean retryable) {}
+
+    private ApplyResult applyDownloaded(JobParameters params, Attempt attempt, Subscription.Download downloaded,
+                                        DownloadRequest request, SharedPreferences preferences) throws Exception {
+        if (!isActive(params, request) || !preferences.getBoolean(ENABLED, false)) return new ApplyResult(null, false);
+        RoutingMutations.recoverPending(this);
+        request.seal();
+        RoutingStore routing = new RoutingStore(this);
+        SubscriptionCatalog catalog = new SubscriptionCatalog(preferences, routing);
+        SubscriptionCatalog.Entry latest = catalog.load().active();
+        if (latest != null && latest.address().equals(attempt.address())) {
+            downloaded.usage().cache(preferences, attempt.address());
+            SubscriptionReminders.reconcile(this, catalog.load());
+        }
+        if (latest == null || !attempt.stillCurrent(latest.address(), RoutingStore.generation())) {
+            return new ApplyResult("跳过，下载期间配置或当前订阅已变化", false);
+        }
+        Module.Status status = Module.status();
+        if (!canRefresh(status)) return new ApplyResult("跳过，模块或配置未就绪", recovering(status));
+        routing.importProfile(downloaded.source(), attempt.address());
+        SubscriptionUpdateStatus.complete(preferences, attempt.address(), attempt.id(), "");
+        return new ApplyResult("更新成功", false);
     }
 
     private static boolean canRefresh(Module.Status status) {

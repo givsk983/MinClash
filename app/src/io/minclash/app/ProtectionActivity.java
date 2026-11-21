@@ -258,28 +258,10 @@ public final class ProtectionActivity extends ThemedActivity {
         RoutingStore.WORKER.execute(()->{
             String failure="";
             boolean persisted = false;
-            try{
-                if (!off && !ExperimentalFeatures.enabled(context)) throw new java.io.IOException("请先在「设置 → 开发中功能」开启总开关。");
-                List<Controller.Group> selections=List.of();
-                if(m.status.running())try{selections=Controller.groups().values();}catch(Exception ignored){ }
-                if (!off) {
-                    RoutingStore.State routing = new RoutingStore(context).loadIfAvailable(m.status);
-                    if (routing != null) TunBypass.checkCurrent(context, routing.bypassedApps(), attempted);
-                }
-                Module.run(off?Module.Command.PROTECTION_OFF:Module.Command.PROTECTION_SET,request);
+            try {
+                failure = RoutingMutations.run(context, () -> applyToModule(context, off, request, attempted));
                 persisted = true;
-                if(m.status.running()){
-                    long deadline=android.os.SystemClock.elapsedRealtime()+45000;
-                    Module.Status current;
-                    do {
-                        current = Module.status();
-                        if (current.running() || android.os.SystemClock.elapsedRealtime() >= deadline) break;
-                        Thread.sleep(500);
-                    } while (true);
-                    if(!current.running())throw new java.io.IOException(off?"保护已关闭，代理尚未恢复，请回到概览检查。":"设置已保存，代理尚未恢复；受保护应用将继续暂停联网。");
-                    Controller.restoreSelections(selections);
-                }
-            }catch(Exception e){failure=e.getMessage();}
+            } catch (Exception error) { failure = error.getMessage(); }
             final boolean saved = persisted;
             final String error = failure == null ? "应用失败，请刷新状态后重试。" : failure;
             m.main.post(() -> {
@@ -290,6 +272,38 @@ public final class ProtectionActivity extends ThemedActivity {
                 if (m.activity != null) m.activity.refresh(saved);
             });
         });
+    }
+
+    private static String applyToModule(Context context, boolean off, byte[] request, ProtectionPolicy attempted) throws Exception {
+        if (!off && !ExperimentalFeatures.enabled(context)) {
+            throw new java.io.IOException("请先在「设置 → 开发中功能」开启总开关。");
+        }
+        if (!off) RoutingMutations.recoverPending(context);
+        Module.Status before = Module.status();
+        List<Controller.Group> selections = List.of();
+        if (before.running()) {
+            try { selections = Controller.groups().values(); }
+            catch (Exception ignored) { }
+        }
+        if (!off) {
+            RoutingStore.State routing = new RoutingStore(context).loadIfAvailable(before);
+            if (routing != null) TunBypass.checkCurrent(context, routing.bypassedApps(), attempted);
+        }
+        Module.run(off ? Module.Command.PROTECTION_OFF : Module.Command.PROTECTION_SET, request);
+        if (!before.running()) return "";
+        try {
+            long deadline = android.os.SystemClock.elapsedRealtime() + 45000;
+            while (!Module.status().running()) {
+                if (android.os.SystemClock.elapsedRealtime() >= deadline) {
+                    return off ? "保护已关闭，代理尚未恢复，请回到概览检查。" : "受保护应用将继续暂停联网，等待代理恢复。";
+                }
+                Thread.sleep(500);
+            }
+            Controller.restoreSelections(selections);
+            return "";
+        } catch (Exception error) {
+            return error.getMessage() == null ? "请检查当前代理状态和节点选择。" : error.getMessage();
+        }
     }
     private void refresh(boolean replace){
         if(model.busy)return;final Model m=model;final android.content.Context context=getApplicationContext();m.busy=true;render();

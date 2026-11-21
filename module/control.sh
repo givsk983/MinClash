@@ -71,7 +71,11 @@ read_pid() {
     case "$stamp" in ''|*[!0-9]*) return 1 ;; esac
     [ "$boot" = "$BOOT_ID" ] || return 1
     [ "$(process_stamp "$pid")" = "$stamp" ] || return 1
-    printf '%s\n' "$pid"
+    if [ "${2:-}" = session ]; then
+        printf '%s:%s:%s\n' "$boot" "$pid" "$stamp"
+    else
+        printf '%s\n' "$pid"
+    fi
     # BusyBox ash can retain a stale failure status on the first standalone printf.
     return 0
 }
@@ -133,7 +137,7 @@ clean_forwarding() {
 
 clean_routes() {
     local family priority rules
-    clean_hotspot || return 1
+    with_hotspot_lock 20 clean_hotspot || return 1
     clean_tether_dns || return 1
     clean_forwarding || return 1
     [ -f "$DATA/routes-owned" ] || return 0
@@ -177,6 +181,7 @@ check_routes() {
 
 stop_core() {
     local pid count=0
+    rm -f "$DATA/controller-ready"
     pid=$(read_pid core) || { rm -f "$DATA/core.pid" "$SOCKET" "$DATA/protection-core"; return; }
     kill -TERM "$pid" 2>/dev/null || :
     while [ "$(read_pid core)" = "$pid" ] && [ "$count" -lt 8 ]; do
@@ -200,12 +205,20 @@ api() {
     "$SOCKET_REQUEST" "$SOCKET"
 }
 
+controller_probe() {
+    local response
+    [ -S "$SOCKET" ] && [ -x "$SOCKET_REQUEST" ] && has_timeout || return 1
+    response=$(printf 'GET /version HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n' |
+        run_with_timeout 2 "$SOCKET_REQUEST" "$SOCKET" 8>&- 2>/dev/null) || return 1
+    case "$response" in 'HTTP/1.0 200 '*|'HTTP/1.1 200 '*) return 0 ;; *) return 1 ;; esac
+}
+
 apply_mode() {
     local payload response
     case "$1" in rule|global|direct) ;; *) return 1 ;; esac
     payload=$(printf '{"mode":"%s"}' "$1")
     response=$(printf 'PATCH /configs HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' "${#payload}" "$payload" |
-        "$SOCKET_REQUEST" "$SOCKET") || return 1
+        run_with_timeout 2 "$SOCKET_REQUEST" "$SOCKET" 8>&- 9>&-) || return 1
     case "$response" in 'HTTP/1.0 204 '*|'HTTP/1.1 204 '*) return 0 ;; *) return 1 ;; esac
 }
 
@@ -319,17 +332,17 @@ trim_log() {
 
 run_supervisor() {
     local boot_uplink= uplink_baseline= uplink_candidate= uplink_samples=0 uplink_missing=0 uplink_restart_after=0
-    local delay=3 handoff child startup_deadline age was_ready mode_restored
+    local delay=3 handoff child startup_deadline age was_ready mode_restored failure mode
     exec 8>"$DATA/daemon.lock"
     lock_fd 8 || exit 0
-    trap 'stop_core && clean_routes; write_state stopped; rm -f "$DATA/daemon.pid"' EXIT
+    trap 'exec 6>&-; stop_core && clean_routes; write_state stopped; rm -f "$DATA/daemon.pid"' EXIT
     trap 'exit 0' TERM INT
     save_pid daemon "$$" || fail 'Could not record supervisor PID.'
 
     # Recover an orphaned core after an abrupt supervisor exit.
     stop_core && clean_routes || fail 'Could not recover the previous core.'
     if [ "${1:-manual}" = boot ]; then
-        write_state starting
+        write_state waiting_network
         wait_boot_uplink || return 0
     fi
     export SKIP_SYSTEM_IPV6_CHECK=1
@@ -352,39 +365,47 @@ run_supervisor() {
                 while enabled && read_pid core >/dev/null; do
                     if uplink_changed; then
                         log 'System uplink changed. Rebuilding TUN after stable network recovery.'
+                        rm -f "$DATA/controller-ready"
                         write_state starting
                         handoff=1
                         break
                     fi
-                    if tun_ready_for_uplink "$uplink_baseline"; then
+                    failure=
+                    if ! tun_ready_for_uplink "$uplink_baseline"; then
+                        failure='required TUN routing is unavailable'
+                    elif ! controller_probe; then
+                        failure='Mihomo local controller is unavailable'
+                    elif [ "$mode_restored" = 0 ]; then
+                        mode=$(cat "$DATA/mode" 2>/dev/null) || mode=
+                        case "$mode" in
+                            rule|global|direct)
+                                apply_mode "$mode" || failure='Mihomo could not restore the selected mode' ;;
+                            '') ;;
+                            *) log 'Ignoring an invalid saved proxy mode.' ;;
+                        esac
+                        [ -n "$failure" ] || mode_restored=1
+                    fi
+                    if [ -z "$failure" ]; then
                         if [ ! -f "$DATA/protection-core" ]; then
                             protection_command mark || break
                         fi
-                        if ! sync_hotspot; then
-                            [ "$(cat "$DATA/hotspot-state" 2>/dev/null)" = error ] ||
-                                log 'Hotspot proxy setup failed. Check tethering and firewall support.'
-                            hotspot_state error
-                        fi
-                        if [ "$mode_restored" = 0 ] && [ -S "$SOCKET" ]; then
-                            if [ -s "$DATA/mode" ] && ! apply_mode "$(cat "$DATA/mode")"; then
-                                log 'Could not restore the selected mode.'
-                            fi
-                            mode_restored=1
-                        fi
+                        : > "$DATA/controller-ready"
                         if [ "$uplink_missing" = 1 ]; then write_state waiting_network; else write_state running; fi
+                        with_hotspot_lock 0 sync_hotspot_status || :
                         sync_notification
                         delay=3
                         age=0
                         was_ready=1
                     else
+                        rm -f "$DATA/controller-ready"
                         write_state starting
                         age=$((age + 1))
                         if [ "$was_ready" = 1 ] && [ "$age" -ge 2 ]; then
-                            log 'Required TUN routing disappeared. Rebuilding the connection.'
+                            log "Rebuilding the connection because $failure."
                             break
                         fi
                         if [ "$was_ready" = 0 ] && [ "$(runtime_now)" -ge "$startup_deadline" ]; then
-                            log 'TUN IPv4 or required IPv6 routes did not become ready within 45 seconds.'
+                            log "Connection did not become ready within 45 seconds because $failure."
                             break
                         fi
                     fi
@@ -453,17 +474,24 @@ stop() {
 
 check_profile() {
     enabled || fail 'Enable the MinClash module in Magisk first.'
-    if [ "$1" = import ] && { read_pid daemon >/dev/null || read_pid core >/dev/null; }; then
-        fail 'Stop TUN before replacing the profile.'
+    local operation="$1" candidate expected requested validation result=0 profile_hash session policy
+    if [ "$operation" != validate ]; then
+        session=$(profile_session) || fail 'MINCLASH_PROFILE_REPLACE_STATE'
+        if [ "$operation" = import ] && [ "$session" != stopped ]; then
+            fail 'Stop TUN before replacing the profile.'
+        fi
+        if [ "$operation" = replace-profile ] && [ "$session" = stopped ]; then
+            fail 'MINCLASH_PROFILE_REPLACE_STATE'
+        fi
+        profile_hash=$(profile_stamp "$PROFILE") || fail 'MINCLASH_PROFILE_REPLACE_STALE'
+        policy=$(profile_stamp "$DATA/protection.json") || fail 'MINCLASH_PROFILE_REPLACE_STALE'
     fi
-    local operation="$1" candidate expected validation result profile_hash current
     read -r expected || fail 'No profile length was received.'
     case "$expected" in ''|*[!0-9]*) fail 'Invalid profile length.' ;; esac
     [ "$expected" -gt 0 ] && [ "$expected" -le "$LIMIT" ] || fail 'Profile must be 1 byte to 2 MiB.'
     if [ "$operation" = replace-profile ]; then
-        read -r profile_hash || fail 'MINCLASH_PROFILE_REPLACE_STALE'
-        current=$(sha256sum "$PROFILE" 2>/dev/null) || fail 'MINCLASH_PROFILE_REPLACE_STALE'
-        [ "${current%% *}" = "$profile_hash" ] || fail 'MINCLASH_PROFILE_REPLACE_STALE'
+        read -r requested || fail 'MINCLASH_PROFILE_REPLACE_STALE'
+        [ "$requested" = "$profile_hash" ] && [ "$profile_hash" != absent ] || fail 'MINCLASH_PROFILE_REPLACE_STALE'
     fi
     candidate=$(mktemp "$DATA/import.XXXXXX") || fail 'Cannot create temporary profile.'
     validation="$candidate.log"
@@ -471,15 +499,12 @@ check_profile() {
     head -c "$((LIMIT + 1))" > "$candidate" || fail 'Could not read profile.'
     [ "$(stat -c %s "$candidate")" -eq "$expected" ] || fail 'Profile transfer was incomplete or oversized.'
     [ -x "$CORE" ] || fail 'The Root module is missing its Mihomo binary.'
-    if [ -x /system/bin/timeout ]; then
-        set -- /system/bin/timeout
-    elif has_applet timeout; then
-        set -- "$BB" timeout
-    else
-        fail 'MINCLASH_PROFILE_NO_TIMEOUT'
-    fi
-    "$@" -s KILL 120 "$CORE" -t -d "$DATA" -f "$candidate" > "$validation" 2>&1
-    result=$?
+    has_timeout || fail 'MINCLASH_PROFILE_NO_TIMEOUT'
+    # Validation may download shared geodata. Serialize validators without blocking
+    # service commands, and use the action lock only to compare and install.
+    exec 7>"$DATA/profile-validation.lock" || fail 'Cannot lock MinClash validation.'
+    lock_fd 7 || fail 'Another MinClash profile is being validated.'
+    run_with_timeout 120 "$CORE" -t -d "$DATA" -f "$candidate" > "$validation" 2>&1 7>&- || result=$?
     trim_log
     tail -c 12000 "$validation" >> "$LOG"
     case "$result" in
@@ -491,26 +516,51 @@ check_profile() {
             fi
             fail 'MINCLASH_PROFILE_REJECTED' ;;
     esac
-    case "$operation" in
-        replace-profile)
-            # Validate the root-owned file while TUN is running. Keep the action
-            # lock across shutdown and atomic replacement with those exact bytes.
-            if ! { read_pid daemon >/dev/null || read_pid core >/dev/null ||
-                [ "$(cat "$DATA/routes-owned" 2>/dev/null)" = "$BOOT_ID" ] ||
-                [ "$(cat "$DATA/forwarding-owned" 2>/dev/null)" = "$BOOT_ID" ]; }; then
-                fail 'MINCLASH_PROFILE_REPLACE_STATE'
-            fi
+    if [ "$operation" != validate ]; then
+        exec 9>"$DATA/action.lock" || fail 'Cannot lock MinClash actions.'
+        wait_lock_fd 9 20 || fail 'MINCLASH_PROFILE_REPLACE_STATE'
+        enabled && [ "$(profile_session)" = "$session" ] || fail 'MINCLASH_PROFILE_REPLACE_STATE'
+        [ "$(profile_stamp "$PROFILE")" = "$profile_hash" ] &&
+            [ "$(profile_stamp "$DATA/protection.json")" = "$policy" ] || fail 'MINCLASH_PROFILE_REPLACE_STALE'
+        if [ "$operation" = replace-profile ]; then
             stop || fail 'Could not stop TUN before replacing the profile.'
-            mv -f "$candidate" "$PROFILE" || fail 'Could not save profile.' ;;
-        import)
-            mv -f "$candidate" "$PROFILE" || fail 'Could not save profile.' ;;
-    esac
+        fi
+        mv -f "$candidate" "$PROFILE" || fail 'Could not save profile.'
+        exec 9>&-
+    fi
+    exec 7>&-
     rm -f "$candidate" "$validation"
     trap - EXIT
 }
 
+profile_stamp() {
+    local digest
+    if [ -f "$1" ]; then
+        digest=$(sha256sum "$1") || return 1
+        printf '%s\n' "${digest%% *}"
+    else
+        printf 'absent\n'
+    fi
+}
+
+profile_session() {
+    local identity
+    if identity=$(read_pid daemon session); then
+        printf 'daemon:%s\n' "$identity"
+    elif identity=$(read_pid core session); then
+        printf 'core:%s\n' "$identity"
+    elif [ "$(cat "$DATA/routes-owned" 2>/dev/null)" = "$BOOT_ID" ] ||
+         [ "$(cat "$DATA/forwarding-owned" 2>/dev/null)" = "$BOOT_ID" ]; then
+        printf 'orphaned\n'
+    else
+        printf 'stopped\n'
+    fi
+}
+
 case "${1:-}" in
     run) run_supervisor "${2:-manual}"; exit ;;
+    import|validate|replace-profile) check_profile "$1"; exit ;;
+    notification-heartbeat) notification_heartbeat; exit ;;
     status|status-notification)
         [ "$1" != status-notification ] || notification_heartbeat
         if read_pid daemon >/dev/null; then
@@ -524,14 +574,20 @@ case "${1:-}" in
         printf 'state=%s\n' "$state"
         echo health=1
         core_up=0
-        if read_pid core >/dev/null; then echo core_running=1; core_up=1; fi
+        if core_session=$(read_pid core session); then
+            echo core_running=1
+            printf 'core_session=%s\n' "$core_session"
+            core_up=1
+        fi
         if tun_ready; then echo tun4=1; fi
         if tun6_ready; then
             echo tun6=1
         elif [ "$core_up" = 1 ] && has_ipv6_uplink "$(uplink_routes)"; then
             echo tun6_required=1
         fi
-        if [ -S "$SOCKET" ] && read_pid core >/dev/null; then echo controller_ready=1; fi
+        if [ "$core_up" = 1 ] && [ -S "$SOCKET" ] && [ -f "$DATA/controller-ready" ]; then
+            echo controller_ready=1
+        fi
         if [ -s "$PROFILE" ]; then echo profile=1; else echo profile=0; fi
         if [ -e "$DATA/boot-off" ]; then echo boot=0; else echo boot=1; fi
         if enabled; then echo enabled=1; else echo enabled=0; fi
@@ -545,6 +601,7 @@ case "${1:-}" in
             printf 'hotspot_sent=%s\nhotspot_received=%s\n' "$sent" "$received"
         fi
         echo notification_recovery=1
+        echo notification_heartbeat=1
         if [ -f "$DATA/notification-on" ]; then echo notification_enabled=1; fi
         echo validate=1
         echo replace_profile=1
@@ -576,7 +633,11 @@ case "${1:-}" in
 esac
 
 exec 9>"$DATA/action.lock"
-lock_fd 9 || fail 'Another MinClash operation is in progress or flock is unavailable.'
+if [ "${1:-}" = protection-watch ]; then
+    wait_lock_fd 9 20 || exit 1
+else
+    lock_fd 9 || fail 'Another MinClash operation is in progress or flock is unavailable.'
+fi
 case "${1:-}" in
     protection-early) protection_command hold ;;
     protection-restore) protection_command hold && protection_command activate ;;
@@ -597,7 +658,6 @@ case "${1:-}" in
     boot) protection_command hold && protection_command activate || fail '无法恢复防泄漏规则。'; if [ ! -e "$DATA/boot-off" ] && [ -s "$PROFILE" ]; then start boot; fi ;;
     start) start ;;
     stop) stop ;;
-    import|validate|replace-profile) check_profile "$1" ;;
     clear-profile)
         enabled || fail 'Enable the MinClash module before restoring a profile.'
         if read_pid daemon >/dev/null || read_pid core >/dev/null; then
@@ -608,8 +668,9 @@ case "${1:-}" in
     mode-rule|mode-global|mode-direct) set_mode "${1#mode-}" ;;
     boot-on) rm -f "$DATA/boot-off" ;;
     boot-off) : > "$DATA/boot-off" ;;
-    hotspot-on) protection_command check-hotspot && set_hotspot on ;;
-    hotspot-off) set_hotspot off ;;
+    hotspot-on) protection_command check-hotspot &&
+        { with_hotspot_lock 20 set_hotspot on || fail 'Hotspot proxy is busy. Try again.'; } ;;
+    hotspot-off) with_hotspot_lock 20 set_hotspot off || fail 'Hotspot proxy is busy. Try again.' ;;
     keepalive-off|keepalive-conservative|keepalive-balanced|keepalive-aggressive)
         set_keepalive "${1#keepalive-}" || fail 'Cannot save TCP keepalive setting.' ;;
     webrtc-on|webrtc-off)
