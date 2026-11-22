@@ -619,10 +619,10 @@ case "${1:-}" in
         echo replace_profile=1
         echo protection=1
         if [ -f "$DATA/protection-owned" ]; then
-            if [ -f "$DATA/protection-degraded" ]; then
-                echo protection_degraded=1
-            else
+            if [ ! -f "$DATA/protection-degraded" ] && protection_command status >/dev/null 2>&1; then
                 echo protection_armed=1
+            else
+                echo protection_degraded=1
             fi
         fi
         echo traffic_summary=1
@@ -641,7 +641,11 @@ case "${1:-}" in
         exit ;;
     protection-watch)
         [ -f "$DATA/protection-owned" ] || exit 0
-        if [ ! -f "$DATA/protection-degraded" ] && protection_command check; then exit 0; fi ;;
+        if [ ! -f "$DATA/protection-degraded" ] && protection_command check; then exit 0; fi
+        if [ ! -f "$DATA/protection-degraded" ]; then
+            log 'Rechecking the application protection policy after a failed health check.'
+            : > "$DATA/protection-degraded"
+        fi ;;
 esac
 
 exec 9>"$DATA/action.lock"
@@ -657,11 +661,11 @@ case "${1:-}" in
         if [ -f "$DATA/protection-owned" ]; then
             repair=repair
             if read_pid core >/dev/null; then repair=repair-running; fi
-            if protection_command "$repair"; then
+            if result=$(protection_command "$repair"); then
                 rm -f "$DATA/protection-degraded"
             else
-                [ -f "$DATA/protection-degraded" ] || log 'Could not verify or restore the application protection firewall.'
                 : > "$DATA/protection-degraded"
+                if printf '%s\n' "$result" | grep -qx 'protection_held=1'; then exit 0; fi
                 exit 1
             fi
         fi ;;

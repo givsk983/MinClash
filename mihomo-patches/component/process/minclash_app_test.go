@@ -19,13 +19,16 @@ func TestMinClashSocketAttribution(t *testing.T) {
 	if owner.found {
 		t.Fatal("same port on an unrelated endpoint claimed the packet")
 	}
-	owner.consider(&metadata, netip.MustParseAddrPort("[::ffff:192.0.2.10]:34567"), dst, 10121)
 	owner.consider(&metadata, netip.MustParseAddrPort("[::]:34567"), wildcard, 10121)
-	if !owner.found || owner.ambiguous || owner.uid != 10121 {
+	if owner.uniqueUID() != 10121 || owner.verifiedUID() != 0 {
+		t.Fatal("wildcard owner is suitable for app display only")
+	}
+	owner.consider(&metadata, netip.MustParseAddrPort("[::ffff:192.0.2.10]:34567"), dst, 10121)
+	if owner.verifiedUID() != 10121 {
 		t.Fatal("multiple matching sockets for one UID should identify the same app")
 	}
 	owner.consider(&metadata, netip.MustParseAddrPort("0.0.0.0:34567"), wildcard, 10122)
-	if !owner.ambiguous {
+	if owner.uniqueUID() != 0 || owner.verifiedUID() != 0 {
 		t.Fatal("another UID on a wildcard socket must prevent attribution")
 	}
 
@@ -34,5 +37,13 @@ func TestMinClashSocketAttribution(t *testing.T) {
 	owner.consider(&metadata, src, wildcard, 10120)
 	if owner.found {
 		t.Fatal("an unconnected TCP socket claimed the packet")
+	}
+
+	src = netip.MustParseAddrPort("[2001:db8::12]:34567")
+	dst = netip.MustParseAddrPort("[2001:db8::34]:443")
+	metadata = C.Metadata{NetWork: C.TCP, SrcIP: src.Addr(), SrcPort: src.Port(), DstIP: dst.Addr(), DstPort: dst.Port()}
+	owner.consider(&metadata, src, dst, 10121)
+	if owner.verifiedUID() != 10121 {
+		t.Fatal("exact IPv6 TCP socket did not identify its owner")
 	}
 }

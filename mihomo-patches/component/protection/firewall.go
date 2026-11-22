@@ -21,6 +21,8 @@ const anchor = "MC_PRIVACY"
 const hold = "MC_PRIVACY_HOLD"
 const active = "MC_PRIVACY_RUN"
 
+var firewallFamilies = [...]string{"iptables", "ip6tables"}
+
 type Firewall struct {
 	Run func(string, ...string) (string, error)
 }
@@ -72,15 +74,27 @@ func (f Firewall) appendMissing(family, chain string, rule ...string) error {
 	return f.append(family, chain, rule...)
 }
 
+func (f Firewall) listRules(family, chain string) ([]string, error) {
+	output, err := f.call(family, "-S", chain)
+	if err != nil {
+		return nil, err
+	}
+	var rules []string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "-A "+chain+" ") {
+			rules = append(rules, line)
+		}
+	}
+	return rules, nil
+}
+
 func (f Firewall) firstOutputRule(family string) (string, error) {
-	output, err := f.call(family, "-S", "OUTPUT")
+	rules, err := f.listRules(family, "OUTPUT")
 	if err != nil {
 		return "", err
 	}
-	for _, line := range strings.Split(output, "\n") {
-		if strings.HasPrefix(line, "-A OUTPUT ") {
-			return line, nil
-		}
+	if len(rules) > 0 {
+		return rules[0], nil
 	}
 	return "", nil
 }
@@ -90,36 +104,33 @@ func (f Firewall) attachFirst(family, chain string) error {
 	if err != nil || first == "-A OUTPUT -j "+chain {
 		return err
 	}
-	if _, err := f.call(family, "-C", "OUTPUT", "-j", chain); err == nil {
-		if _, err = f.call(family, "-D", "OUTPUT", "-j", chain); err != nil {
-			return err
-		}
-	}
+	// Keep an existing jump in place until there is a replacement. Duplicate
+	// jumps are harmless and can be removed with the owned policy.
 	_, err = f.call(family, "-I", "OUTPUT", "1", "-j", chain)
 	return err
 }
 
 // Fingerprint only the owned policy and its entry points. Unrelated OUTPUT
 // rules can change without requiring a firewall rebuild.
-func (f Firewall) fingerprint() (string, error) {
+func (f Firewall) fingerprint(allowHold bool) (string, error) {
 	hash := sha256.New()
-	for _, family := range []string{"iptables", "ip6tables"} {
-		output, err := f.call(family, "-S", "OUTPUT")
+	for _, family := range firewallFamilies {
+		output, err := f.listRules(family, "OUTPUT")
 		if err != nil {
 			return "", err
 		}
-		first := ""
-		for _, line := range strings.Split(output, "\n") {
-			if strings.HasPrefix(line, "-A OUTPUT ") {
-				if first == "" {
-					first = line
-				}
-				if line == "-A OUTPUT -j "+hold {
-					return "", errors.New("protection HOLD is active")
-				}
+		if allowHold {
+			if len(output) == 0 || output[0] != "-A OUTPUT -j "+hold {
+				return "", errors.New("protection HOLD has lost priority")
+			}
+			output = output[1:]
+		}
+		for _, rule := range output {
+			if !allowHold && rule == "-A OUTPUT -j "+hold {
+				return "", errors.New("protection HOLD is active")
 			}
 		}
-		if first != "-A OUTPUT -j "+anchor {
+		if len(output) == 0 || output[0] != "-A OUTPUT -j "+anchor {
 			return "", errors.New("protection anchor is missing or has lost priority")
 		}
 		for _, chain := range []string{anchor, active} {
@@ -133,38 +144,87 @@ func (f Firewall) fingerprint() (string, error) {
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
+func ownerReject(uid uint32, tunOnly bool) []string {
+	rule := []string{"-m", "owner", "--uid-owner", strconv.FormatUint(uint64(uid), 10)}
+	if tunOnly {
+		rule = append(rule, "!", "-o", "minclash0")
+	}
+	return append(rule, "-j", "REJECT")
+}
+
+func activeRules(p Policy) [][]string {
+	var rules [][]string
+	if p.StrictDNS {
+		for _, proto := range []string{"tcp", "udp"} {
+			rules = append(rules,
+				[]string{"-p", proto, "--dport", "853", "-m", "owner", "!", "--uid-owner", "0", "-j", "REJECT"},
+				[]string{"!", "-o", "minclash0", "-p", proto, "--dport", "53", "-j", "REJECT"},
+			)
+		}
+	}
+	for _, uid := range unionUIDs(p) {
+		rules = append(rules, ownerReject(uid, true))
+	}
+	return rules
+}
+
 // Hold is installed BEFORE stopping a core or replacing policy. On a partial
 // failure the old rules and successfully installed blocks stay in place.
 func (f Firewall) Hold(old, next Policy) error {
-	for _, family := range []string{"iptables", "ip6tables"} {
-		if err := f.ensure(family, hold); err != nil {
-			return err
-		}
-		// Append blocks while an existing HOLD may still be attached. Never flush it.
-		for _, uid := range unionUIDs(old, next) {
-			rule := []string{"-m", "owner", "--uid-owner", strconv.FormatUint(uint64(uid), 10), "-j", "REJECT"}
-			if err := f.appendMissing(family, hold, rule...); err != nil {
-				return err
+	var rules [][]string
+	for _, uid := range unionUIDs(old, next) {
+		rules = append(rules, ownerReject(uid, false))
+	}
+	if old.StrictDNS || next.StrictDNS {
+		for _, proto := range []string{"tcp", "udp"} {
+			for _, port := range []string{"53", "853"} {
+				rules = append(rules, []string{"-p", proto, "--dport", port, "-j", "REJECT"})
 			}
-		}
-		if old.StrictDNS || next.StrictDNS {
-			for _, proto := range []string{"tcp", "udp"} {
-				for _, port := range []string{"53", "853"} {
-					if err := f.appendMissing(family, hold, "-p", proto, "--dport", port, "-j", "REJECT"); err != nil {
-						return err
-					}
-				}
-			}
-		}
-		if err := f.attachFirst(family, hold); err != nil {
-			return err
 		}
 	}
-	return nil
+	var result error
+	for _, family := range firewallFamilies {
+		result = errors.Join(result, f.holdFamily(family, rules))
+	}
+	return result
+}
+
+func (f Firewall) holdFamily(family string, rules [][]string) error {
+	if err := f.ensure(family, hold); err != nil {
+		return err
+	}
+	installed, err := f.listRules(family, hold)
+	if err != nil {
+		return err
+	}
+	// Only REJECT rules are created here. If the chain was changed, put
+	// required blocks ahead of any rules that could short-circuit them.
+	var result error
+	for _, rule := range installed {
+		jump := strings.LastIndex(rule, " -j ")
+		if jump < 0 || !strings.HasPrefix(rule[jump+4:]+" ", "REJECT ") {
+			for _, reject := range rules {
+				if _, err := f.call(family, "-I", append([]string{hold, "1"}, reject...)...); err != nil {
+					result = err
+					break
+				}
+			}
+			return errors.Join(result, f.attachFirst(family, hold))
+		}
+	}
+	// Never flush an existing HOLD; prior blocks must survive a failed write.
+	for _, rule := range rules {
+		if err := f.appendMissing(family, hold, rule...); err != nil {
+			result = err
+			break
+		}
+	}
+	return errors.Join(result, f.attachFirst(family, hold))
 }
 func (f Firewall) Activate(p Policy) error {
-	// Caller must have stopped the old core. HOLD remains until BOTH families work.
-	for _, family := range []string{"iptables", "ip6tables"} {
+	// The caller must have installed HOLD before reaching this point.
+	rules := activeRules(p)
+	for _, family := range firewallFamilies {
 		if err := f.ensure(family, anchor); err != nil {
 			return err
 		}
@@ -174,20 +234,8 @@ func (f Firewall) Activate(p Policy) error {
 		if _, err := f.call(family, "-F", active); err != nil {
 			return err
 		}
-		if p.StrictDNS {
-			for _, proto := range []string{"tcp", "udp"} {
-				// Android Private DNS is intentionally incompatible with strict mode.
-				if err := f.append(family, active, "-p", proto, "--dport", "853", "-m", "owner", "!", "--uid-owner", "0", "-j", "REJECT"); err != nil {
-					return err
-				}
-				if err := f.append(family, active, "!", "-o", "minclash0", "-p", proto, "--dport", "53", "-j", "REJECT"); err != nil {
-					return err
-				}
-			}
-		}
-		for _, uid := range unionUIDs(p) {
-			base := []string{"-m", "owner", "--uid-owner", strconv.FormatUint(uint64(uid), 10)}
-			if err := f.append(family, active, append(append([]string{}, base...), "!", "-o", "minclash0", "-j", "REJECT")...); err != nil {
+		for _, rule := range rules {
+			if err := f.append(family, active, rule...); err != nil {
 				return err
 			}
 		}
@@ -197,15 +245,28 @@ func (f Firewall) Activate(p Policy) error {
 		if err := f.append(family, anchor, "-j", active); err != nil {
 			return err
 		}
-		if err := f.attachFirst(family, anchor); err != nil {
+		output, err := f.listRules(family, "OUTPUT")
+		if err != nil {
 			return err
 		}
-	}
-	for _, family := range []string{"iptables", "ip6tables"} {
-		if _, err := f.call(family, "-C", "OUTPUT", "-j", hold); err == nil {
-			if _, err = f.call(family, "-D", "OUTPUT", "-j", hold); err != nil {
+		if len(output) == 0 || output[0] != "-A OUTPUT -j "+hold {
+			return errors.New("protection HOLD must precede activation")
+		}
+		if len(output) < 2 || output[1] != "-A OUTPUT -j "+anchor {
+			if _, err := f.call(family, "-I", "OUTPUT", "2", "-j", anchor); err != nil {
 				return err
 			}
+		}
+	}
+	if err := f.verifyActiveRules(p); err != nil {
+		return err
+	}
+	if _, err := f.fingerprint(true); err != nil {
+		return err
+	}
+	for _, family := range firewallFamilies {
+		if err := f.detach(family, hold); err != nil {
+			return err
 		}
 		if _, err := f.call(family, "-F", hold); err != nil {
 			return err
@@ -213,8 +274,24 @@ func (f Firewall) Activate(p Policy) error {
 	}
 	return nil
 }
+
+func (f Firewall) detach(family, chain string) error {
+	output, err := f.listRules(family, "OUTPUT")
+	if err != nil {
+		return err
+	}
+	for _, rule := range output {
+		if rule == "-A OUTPUT -j "+chain {
+			if _, err := f.call(family, "-D", "OUTPUT", "-j", chain); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (f Firewall) Remove() error {
-	for _, family := range []string{"iptables", "ip6tables"} {
+	for _, family := range firewallFamilies {
 		if out, err := f.call(family, "-S", "OUTPUT"); err != nil {
 			if errors.Is(err, os.ErrNotExist) || strings.Contains(strings.ToLower(out), "table does not exist") || strings.Contains(strings.ToLower(out), "protocol not available") {
 				continue
@@ -222,13 +299,8 @@ func (f Firewall) Remove() error {
 			return err
 		}
 		for _, chain := range []string{hold, anchor} {
-			for {
-				if _, err := f.call(family, "-C", "OUTPUT", "-j", chain); err != nil {
-					break
-				}
-				if _, err := f.call(family, "-D", "OUTPUT", "-j", chain); err != nil {
-					return err
-				}
+			if err := f.detach(family, chain); err != nil {
+				return err
 			}
 		}
 		for _, chain := range []string{anchor, active, hold} {
@@ -245,40 +317,35 @@ func (f Firewall) Remove() error {
 	}
 	return nil
 }
-func (f Firewall) Healthy(p Policy) bool {
-	if !p.Enabled() {
-		return false
-	}
-	for _, family := range []string{"iptables", "ip6tables"} {
-		if _, err := f.call(family, "-C", "OUTPUT", "-j", hold); err == nil {
-			return false
+
+func (f Firewall) verifyActiveRules(p Policy) error {
+	rules := activeRules(p)
+	for _, family := range firewallFamilies {
+		jump, err := f.listRules(family, anchor)
+		if err != nil {
+			return err
 		}
-		first, err := f.firstOutputRule(family)
-		if err != nil || first != "-A OUTPUT -j "+anchor {
-			return false
+		if len(jump) != 1 || jump[0] != "-A "+anchor+" -j "+active {
+			return errors.New("unexpected protection anchor rules")
 		}
-		if _, err := f.call(family, "-C", anchor, "-j", active); err != nil {
-			return false
+		actual, err := f.listRules(family, active)
+		if err != nil {
+			return err
 		}
-		for _, uid := range unionUIDs(p) {
-			if _, err := f.call(family, "-C", active, "-m", "owner", "--uid-owner", strconv.FormatUint(uint64(uid), 10), "!", "-o", "minclash0", "-j", "REJECT"); err != nil {
-				return false
-			}
+		if len(actual) != len(rules) {
+			return errors.New("unexpected protection firewall rules")
 		}
-		if p.StrictDNS {
-			for _, proto := range []string{"tcp", "udp"} {
-				if _, err := f.call(family, "-C", active, "!", "-o", "minclash0", "-p", proto, "--dport", "53", "-j", "REJECT"); err != nil {
-					return false
-				}
-				if _, err := f.call(family, "-C", active, "-p", proto, "--dport", "853", "-m", "owner", "!", "--uid-owner", "0", "-j", "REJECT"); err != nil {
-					return false
-				}
+		// Each expected rule is a distinct reject, so the count and exact
+		// matches exclude earlier rules that could bypass those rejects.
+		for _, rule := range rules {
+			if _, err := f.call(family, "-C", append([]string{active}, rule...)...); err != nil {
+				return err
 			}
 		}
 	}
-	return true
+	return nil
 }
-func VerifyPackages(p Policy) error {
+func verifySystemPackages(p Policy) (Policy, error) {
 	return verifyPackages(p, func(user uint32) ([]byte, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -287,27 +354,48 @@ func VerifyPackages(p Policy) error {
 }
 
 // Read each Android user's inventory once, without caching across operations.
-func verifyPackages(p Policy, list func(uint32) ([]byte, error)) error {
-	inventories := make(map[uint32]map[string]bool)
+func verifyPackages(p Policy, list func(uint32) ([]byte, error)) (Policy, error) {
+	inventories := make(map[uint32]map[string][]uint32)
+	var replacements Policy
+	var result error
 	for _, a := range p.Apps {
 		user := a.UID / 100000
 		installed, ok := inventories[user]
 		if !ok {
 			out, err := list(user)
+			inventories[user] = nil
 			if err != nil {
-				return errors.New("cannot verify installed applications")
+				result = errors.Join(result, errors.New("cannot verify installed applications"))
+				continue
 			}
-			installed = make(map[string]bool)
+			installed = make(map[string][]uint32)
 			for _, line := range strings.Split(string(out), "\n") {
-				installed[strings.TrimSpace(line)] = true
+				record, ok := strings.CutPrefix(strings.TrimSpace(line), "package:")
+				if !ok {
+					continue
+				}
+				pkg, uidText, ok := strings.Cut(record, " uid:")
+				uid, err := strconv.ParseUint(uidText, 10, 32)
+				if ok && err == nil && uint32(uid)/100000 == user {
+					installed[pkg] = append(installed[pkg], uint32(uid))
+				}
 			}
 			inventories[user] = installed
 		}
-		if !installed[fmt.Sprintf("package:%s uid:%d", a.Package, a.UID)] {
-			return fmt.Errorf("application UID changed or application unavailable: %s; reselect it", a.Package)
+		uids := installed[a.Package]
+		if len(uids) == 1 && uids[0] == a.UID {
+			continue
+		}
+		result = errors.Join(result, fmt.Errorf("application UID changed or application unavailable: %s; reselect it", a.Package))
+		for _, uid := range uids {
+			if uid != a.UID && uid%100000 >= 10000 && uid%100000 < 20000 {
+				// A new UID can be blocked immediately; only a newly saved
+				// policy can grant it use of the selected proxy.
+				replacements.Apps = append(replacements.Apps, App{Package: a.Package, UID: uid})
+			}
 		}
 	}
-	return nil
+	return replacements, result
 }
 func writePolicy(path string, p Policy) error {
 	data, err := json.Marshal(p)
@@ -333,9 +421,9 @@ func writePolicy(path string, p Policy) error {
 
 // Manage is called only by the root control script under its action lock.
 func Manage(command string) error {
-	return manage(command, PolicyPath, os.Stdin, os.Stdout, SystemFirewall(), VerifyPackages)
+	return manage(command, PolicyPath, os.Stdin, os.Stdout, SystemFirewall(), verifySystemPackages, systemPrivateDNSOff)
 }
-func manage(command, path string, input io.Reader, output io.Writer, f Firewall, verify func(Policy) error) error {
+func manage(command, path string, input io.Reader, output io.Writer, f Firewall, verify func(Policy) (Policy, error), privateDNSOff ...func() bool) error {
 	owned := filepath.Join(filepath.Dir(path), "protection-owned")
 	_, ownershipErr := os.Stat(owned)
 	if ownershipErr != nil && !os.IsNotExist(ownershipErr) {
@@ -354,14 +442,35 @@ func manage(command, path string, input io.Reader, output io.Writer, f Firewall,
 		return os.Remove(owned)
 	}
 	if command == "disable" {
-		if err := remove(); err != nil {
+		// Commit the user's intent before removing any existing blocks.
+		if err := writePolicy(path, Policy{Version: 1}); err != nil {
 			return err
 		}
-		return writePolicy(path, Policy{Version: 1})
+		return remove()
 	}
 	p, err := Read(path)
 	if err != nil {
 		return err
+	}
+	dnsConflict := func(policy Policy) bool {
+		return policy.StrictDNS && len(privateDNSOff) != 0 && !privateDNSOff[0]()
+	}
+	checkPrivateDNS := func(policy Policy) error {
+		if dnsConflict(policy) {
+			return errors.New("严格 DNS 需要先在系统设置中关闭私人 DNS。")
+		}
+		return nil
+	}
+	verifiedRules := func() bool {
+		if !p.Enabled() || !hasOwnership {
+			return false
+		}
+		stamp, err := os.ReadFile(stampPath)
+		if err != nil {
+			return false
+		}
+		actual, err := f.fingerprint(false)
+		return err == nil && string(stamp) == p.Digest()+" "+actual+"\n"
 	}
 	switch command {
 	case "policy":
@@ -396,7 +505,10 @@ func manage(command, path string, input io.Reader, output io.Writer, f Firewall,
 		if err != nil {
 			return err
 		}
-		if err = verify(next); err != nil {
+		if err = checkPrivateDNS(next); err != nil {
+			return err
+		}
+		if _, err = verify(next); err != nil {
 			return err
 		}
 		if p.Enabled() || next.Enabled() {
@@ -420,10 +532,16 @@ func manage(command, path string, input io.Reader, output io.Writer, f Firewall,
 		if !p.Enabled() {
 			return remove()
 		}
-		if err = verify(p); err != nil {
-			return err
+		replacements, bindingErr := verify(p)
+		if err = errors.Join(bindingErr, checkPrivateDNS(p)); err != nil {
+			return errors.Join(err, f.Hold(p, replacements))
 		}
 		return activateAndRecord(f, p, stampPath)
+	case "status":
+		if !verifiedRules() {
+			return errors.New("protection firewall needs recovery")
+		}
+		return nil
 	case "check", "repair", "repair-running":
 		if !hasOwnership {
 			return nil
@@ -436,32 +554,31 @@ func manage(command, path string, input io.Reader, output io.Writer, f Firewall,
 			marker, _ := os.ReadFile(filepath.Join(filepath.Dir(path), "protection-core"))
 			coreMatches = strings.TrimSpace(string(marker)) == p.Digest()
 		}
-		if coreMatches {
-			stamp, stampErr := os.ReadFile(stampPath)
-			if stampErr == nil {
-				actual, fingerprintErr := f.fingerprint()
-				if fingerprintErr == nil && string(stamp) == p.Digest()+" "+actual+"\n" {
-					return nil
-				}
-			}
+		replacements, bindingErr := verify(p)
+		policyErr := errors.Join(bindingErr, checkPrivateDNS(p))
+		if coreMatches && policyErr == nil && verifiedRules() {
+			return nil
 		}
 		if command == "check" {
-			return errors.New("protection firewall needs recovery")
+			return errors.Join(policyErr, errors.New("protection firewall needs recovery"))
 		}
-		if err = f.Hold(p, p); err != nil {
-			return err
+		if err = f.Hold(p, replacements); err != nil {
+			return errors.Join(policyErr, err)
+		}
+		if policyErr != nil {
+			// The watcher can keep its normal cadence for a verified HOLD.
+			// Command failure still indicates this policy cannot be activated.
+			fmt.Fprintln(output, "protection_held=1")
+			return policyErr
 		}
 		if !coreMatches {
 			return errors.New("running core policy differs; restart required")
 		}
-		if err = verify(p); err != nil {
-			return err
-		}
 		return activateAndRecord(f, p, stampPath)
 	case "get":
-		binding := verify(p) == nil
+		_, bindingErr := verify(p)
 		residual := false
-		for _, family := range []string{"iptables", "ip6tables"} {
+		for _, family := range firewallFamilies {
 			for _, chain := range []string{hold, anchor} {
 				if _, err := f.call(family, "-C", "OUTPUT", "-j", chain); err == nil {
 					residual = true
@@ -469,13 +586,14 @@ func manage(command, path string, input io.Reader, output io.Writer, f Firewall,
 			}
 		}
 		state := struct {
-			Policy     Policy `json:"policy"`
-			Firewall   bool   `json:"firewall"`
-			Binding    bool   `json:"binding"`
-			CorePolicy bool   `json:"corePolicy"`
-			Digest     string `json:"digest"`
-			Residual   bool   `json:"residual"`
-		}{p, f.Healthy(p), binding, false, p.Digest(), residual}
+			Policy             Policy `json:"policy"`
+			Firewall           bool   `json:"firewall"`
+			Binding            bool   `json:"binding"`
+			CorePolicy         bool   `json:"corePolicy"`
+			Digest             string `json:"digest"`
+			Residual           bool   `json:"residual"`
+			PrivateDNSConflict bool   `json:"privateDNSConflict"`
+		}{Policy: p, Firewall: verifiedRules(), Binding: bindingErr == nil, Digest: p.Digest(), Residual: residual, PrivateDNSConflict: dnsConflict(p)}
 		marker, _ := os.ReadFile(filepath.Join(filepath.Dir(path), "protection-core"))
 		state.CorePolicy = strings.TrimSpace(string(marker)) == p.Digest()
 		return json.NewEncoder(output).Encode(state)
@@ -497,7 +615,7 @@ func activateAndRecord(f Firewall, p Policy, path string) error {
 	if err := f.Activate(p); err != nil {
 		return err
 	}
-	fingerprint, err := f.fingerprint()
+	fingerprint, err := f.fingerprint(false)
 	if err != nil {
 		return err
 	}

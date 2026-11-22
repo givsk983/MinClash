@@ -46,6 +46,15 @@ final class SubscriptionCatalog {
         return new Snapshot(Collections.unmodifiableList(entries), active);
     }
 
+    void add(Entry entry) throws Exception {
+        List<Entry> entries = new ArrayList<>(load().entries());
+        if (entries.stream().anyMatch(saved -> saved.address().equals(entry.address()))) {
+            throw new IOException("此订阅已在列表中。");
+        }
+        entries.add(entry);
+        save(entries);
+    }
+
     void save(List<Entry> entries) throws Exception {
         JSONArray array = new JSONArray();
         for (Entry entry : entries) {

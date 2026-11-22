@@ -37,6 +37,8 @@ import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
+import android.window.OnBackInvokedCallback;
+import android.window.OnBackInvokedDispatcher;
 import android.widget.Button;
 import android.widget.BaseAdapter;
 import android.widget.ArrayAdapter;
@@ -1374,8 +1376,14 @@ public final class MainActivity extends ThemedActivity {
         }
         render();
         if (busy || backgroundDialog != null || managementDialog != null && managementDialog.isShowing()) return;
+        var saved = background.subscriptionSave.outcome();
+        if (saved != null && saved.error() == null) {
+            background.subscriptionSave.clearResult();
+            worker.execute(this::refreshSubscriptionCatalog);
+            showMessage("订阅已保存。");
+        }
         if (showBackgroundError(background.usage) || showBackgroundError(background.backup) || showBackgroundError(background.updateDownload) || showBackgroundError(background.preview)
-            || showBackgroundError(background.updateCheck)) {
+            || showBackgroundError(background.subscriptionSave) || showBackgroundError(background.updateCheck)) {
             render();
             return;
         }
@@ -1477,7 +1485,7 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void showSubscriptions() {
-        if (subscriptions == null || busy) return;
+        if (subscriptions == null || busy || savingSubscription()) return;
         List<SubscriptionCatalog.Entry> entries = subscriptions.entries();
         if (entries.isEmpty()) {
             promptSubscription();
@@ -1615,13 +1623,23 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void promptSubscription() {
-        EditText nameInput = subscriptionInput("订阅名称（选填）", InputType.TYPE_CLASS_TEXT);
+        EditText nameInput = subscriptionInput("订阅名称（留空自动识别）", InputType.TYPE_CLASS_TEXT);
         EditText input = subscriptionInput("https://", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        input.setMinHeight(dp(50));
+        Button paste = button("粘贴", false);
+        paste.setContentDescription("粘贴订阅链接");
+        paste.setOnClickListener(view -> pasteSubscriptionLink(input));
+        LinearLayout linkRow = new LinearLayout(this);
+        linkRow.setGravity(Gravity.CENTER_VERTICAL);
+        linkRow.addView(input, new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout.LayoutParams pasteLayout = new LinearLayout.LayoutParams(-2, -2);
+        pasteLayout.setMarginStart(dp(8));
+        linkRow.addView(paste, pasteLayout);
         LinearLayout content = column();
         content.setPadding(dp(20), dp(4), dp(20), 0);
-        add(content, nameInput, 0);
-        add(content, input, 10);
-        boolean canActivate = canApplySubscription();
+        add(content, linkRow, 0);
+        add(content, nameInput, 10);
+        boolean canActivate = canPreviewSubscription();
         AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle("添加订阅")
             .setMessage("粘贴机场提供的 HTTPS 格式 Clash / Mihomo 订阅链接。\n" + Subscription.PROXY_HINT)
             .setView(content).setNegativeButton("取消", null).setPositiveButton(canActivate ? "保存并启用" : "保存", null);
@@ -1633,8 +1651,30 @@ public final class MainActivity extends ThemedActivity {
             .setOnClickListener(view -> addSubscription(dialog, nameInput, input, false));
     }
 
+    private void pasteSubscriptionLink(EditText input) {
+        ClipboardManager clipboard = getSystemService(ClipboardManager.class);
+        ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
+        if (clip != null && clip.getItemCount() > 0) {
+            ClipData.Item item = clip.getItemAt(0);
+            CharSequence value = item.getText();
+            Uri uri = item.getUri();
+            if (value == null && uri != null
+                && ("https".equalsIgnoreCase(uri.getScheme()) || "http".equalsIgnoreCase(uri.getScheme()))) {
+                value = uri.toString();
+            }
+            String text = value == null ? "" : value.toString().trim();
+            if (!text.isEmpty()) {
+                input.setText(text);
+                input.setSelection(input.length());
+                input.setError(null);
+                return;
+            }
+        }
+        input.setError("剪贴板没有可粘贴的内容。");
+    }
+
     private void addSubscription(AlertDialog dialog, EditText nameInput, EditText input, boolean activate) {
-        if (busy) return;
+        if (busy || savingSubscription()) return;
         String address = input.getText().toString().trim();
         String host;
         try { host = Subscription.secureHost(address); }
@@ -1647,14 +1687,39 @@ public final class MainActivity extends ThemedActivity {
             return;
         }
         String name = nameInput.getText().toString().trim();
-        SubscriptionCatalog.Entry entry = new SubscriptionCatalog.Entry(name.isEmpty() ? host : name, address);
-        List<SubscriptionCatalog.Entry> entries = new ArrayList<>(subscriptions.entries());
-        entries.add(entry);
+        SubscriptionCatalog.Entry entry = new SubscriptionCatalog.Entry(name, address);
         dialog.dismiss();
-        if (activate && canApplySubscription()) {
+        if (activate && canPreviewSubscription()) {
             previewSubscription(entry, true);
+        } else if (name.isEmpty()) {
+            saveSubscriptionWithAutoName(address, host);
         } else {
-            saveSubscriptions(entries, "订阅已保存。");
+            mutate("订阅已保存。", () -> {
+                RoutingMutations.recoverPending(this);
+                subscriptionCatalog.add(entry);
+                refreshSubscriptionCatalog();
+                return null;
+            });
+        }
+    }
+
+    private boolean savingSubscription() {
+        return background.subscriptionSave.running() || background.subscriptionSave.outcome() != null;
+    }
+
+    private void saveSubscriptionWithAutoName(String address, String host) {
+        Context context = getApplicationContext();
+        SharedPreferences prefs = appPreferences();
+        if (background.subscriptionSave.start(BackgroundWork.DOWNLOADS, () -> {
+            String name = Subscription.lookupName(address, host);
+            return worker.<Void>submit(() -> RoutingMutations.run(context, () -> {
+                RoutingMutations.recoverPending(context);
+                new SubscriptionCatalog(prefs, new RoutingStore(context)).add(new SubscriptionCatalog.Entry(name, address));
+                return null;
+            })).get();
+        })) {
+            showMessage("正在识别订阅名称…");
+            render();
         }
     }
 
@@ -1723,7 +1788,9 @@ public final class MainActivity extends ThemedActivity {
                             try { selections = Controller.groups().values(); }
                             catch (Exception unavailable) { selections = null; }
                         }
-                        SubscriptionPreview preview = SubscriptionPreview.compare(entry, downloaded.source(),
+                        SubscriptionCatalog.Entry named = adding && entry.name().isEmpty()
+                            ? new SubscriptionCatalog.Entry(downloaded.name(), entry.address()) : entry;
+                        SubscriptionPreview preview = SubscriptionPreview.compare(named, downloaded.source(),
                             RoutingStore.generation(), adding, routing.loadIfAvailable(current), selections);
                         if (!adding && preview.conflicts()) {
                             SubscriptionUpdateStatus.complete(prefs, entry.address(), attempt, "订阅缺少分流规则需要的代理组");
@@ -2900,14 +2967,13 @@ public final class MainActivity extends ThemedActivity {
             @Override public void afterTextChanged(Editable text) {}
         });
         AlertDialog dialog = new AlertDialog.Builder(this).setCustomTitle(content)
-            .setAdapter(adapter, null).setNegativeButton("关闭", null).setPositiveButton("保存并应用", null)
+            .setCancelable(false).setAdapter(adapter, null).setNegativeButton("关闭", null).setPositiveButton("保存并应用", null)
             .setNeutralButton("重新应用绕过", null).create();
         listDialog[0] = dialog;
         routingIcons.observe(() -> {
             iconHint.setText(iconSummary(screen));
             adapter.notifyDataSetChanged();
         });
-        dialog.setOnDismissListener(ignored -> routingIcons.stopObserving());
         filter.run();
         dialog.show();
         dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setVisibility(ExperimentalFeatures.enabled(this) ? View.VISIBLE : View.GONE);
@@ -2964,12 +3030,14 @@ public final class MainActivity extends ThemedActivity {
                 }
             });
         });
-        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
-            if (busy) return;
+        Runnable closeRouting = () -> {
+            if (busy || !dialog.isShowing()) return;
             if (pending.isEmpty() && !reapply[0]) dialog.dismiss();
             else new AlertDialog.Builder(this).setTitle("放弃未应用的分流修改？")
                 .setNegativeButton("继续编辑", null).setPositiveButton("放弃", (d,w) -> dialog.dismiss()).show();
-        });
+        };
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> closeRouting.run());
+        bindAppRoutingBack(dialog, closeRouting);
         title.setOnClickListener(view -> {
             if (busy) return;
             if (pending.isEmpty() && !reapply[0]) openPersonalRules(dialog);
@@ -2981,12 +3049,6 @@ public final class MainActivity extends ThemedActivity {
             if (busy) return;
             reapply[0] = true;
             count.setText("已安排重新核对绕过应用，点击保存并应用后统一重连。");
-        });
-        dialog.setCancelable(false);
-        dialog.setOnKeyListener((d, key, event) -> {
-            if (key != android.view.KeyEvent.KEYCODE_BACK) return false;
-            if (event.getAction() == android.view.KeyEvent.ACTION_UP) dialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick();
-            return true;
         });
         dialog.getListView().setDivider(null);
         dialog.getListView().setPadding(dp(10), dp(4), dp(10), dp(6));
@@ -3001,6 +3063,25 @@ public final class MainActivity extends ThemedActivity {
             });
         });
         enableSearchKeyboard(dialog);
+    }
+
+    private void bindAppRoutingBack(AlertDialog dialog, Runnable closeRouting) {
+        dialog.setOnKeyListener((ignored, key, event) -> {
+            if (key != android.view.KeyEvent.KEYCODE_BACK) return false;
+            if (event.getAction() == android.view.KeyEvent.ACTION_UP && !event.isCanceled()) closeRouting.run();
+            return true;
+        });
+        if (Build.VERSION.SDK_INT >= 33) {
+            OnBackInvokedDispatcher dispatcher = dialog.getOnBackInvokedDispatcher();
+            OnBackInvokedCallback callback = closeRouting::run;
+            dispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback);
+            dialog.setOnDismissListener(ignored -> {
+                dispatcher.unregisterOnBackInvokedCallback(callback);
+                routingIcons.stopObserving();
+            });
+        } else {
+            dialog.setOnDismissListener(ignored -> routingIcons.stopObserving());
+        }
     }
 
     private void showCategoryManager(AppRouting.Screen screen, List<AppCategories.Category> custom, Runnable refresh) {
@@ -3663,7 +3744,7 @@ public final class MainActivity extends ThemedActivity {
         else refreshButton.setText(installed ? "刷新状态" : "检测环境");
         boolean canImport = !busy && enabled && !isActive();
         importButton.setEnabled(canImport);
-        subscriptionButton.setEnabled(!busy && subscriptions != null);
+        subscriptionButton.setEnabled(!busy && subscriptions != null && !savingSubscription());
         subscriptionButton.setText(noSubscriptions ? "添加订阅" : "管理订阅");
         boolean subscribed = active != null && installed && status.profile;
         updateButton.setVisibility(subscribed ? View.VISIBLE : View.GONE);

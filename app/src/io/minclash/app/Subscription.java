@@ -59,7 +59,7 @@ final class Subscription {
         return download(address).source();
     }
 
-    record Download(byte[] source, SubscriptionUsage usage) {}
+    record Download(byte[] source, SubscriptionUsage usage, String name) {}
 
     static Download download(String address) throws IOException {
         try (DownloadRequest request = new DownloadRequest()) { return download(address, request); }
@@ -77,8 +77,17 @@ final class Subscription {
         return request.call(() -> response(address, false, request)).usage();
     }
 
+    static String lookupName(String address, String host) {
+        try (DownloadRequest request = new DownloadRequest(5_000)) {
+            return request.call(() -> response(address, false, request)).name();
+        } catch (IOException unavailable) {
+            return host;
+        }
+    }
+
     private static Download response(String address, boolean includeConfig, DownloadRequest request) throws IOException {
         URL url = requireSecure(parse(null, address));
+        String host = url.getHost();
         Set<String> visited = new HashSet<>();
         for (int redirects = 0; redirects <= 5; redirects++) {
             request.check();
@@ -112,7 +121,9 @@ final class Subscription {
                 }
                 if (status != 200) throw new HttpFailure(status);
                 SubscriptionUsage usage = SubscriptionUsage.parse(connection.getHeaderField("Subscription-Userinfo"), System.currentTimeMillis());
-                if (!includeConfig) return new Download(null, usage);
+                String name = SubscriptionName.fromHeaders(connection.getHeaderField("Profile-Title"),
+                    connection.getHeaderField("Content-Disposition"), host);
+                if (!includeConfig) return new Download(null, usage, name);
                 if (connection.getContentLengthLong() > Profile.MAX_BYTES) {
                     throw new IOException("订阅配置最大为 2 MiB。");
                 }
@@ -140,7 +151,7 @@ final class Subscription {
                 try {
                     byte[] source = Profile.normalize(content);
                     request.check();
-                    return new Download(source, usage);
+                    return new Download(source, usage, name);
                 } catch (IOException error) {
                     if (error instanceof DownloadRequest.Cancelled || error instanceof DownloadRequest.Expired) throw error;
                     throw new ConfigFailure(error);

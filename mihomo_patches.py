@@ -62,33 +62,84 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
     replace("tunnel/tunnel.go", 'func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {', '''func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
  if protected, handled, protectErr := minclashResolve(metadata); handled { return protected, nil, protectErr }
 ''')
-    replace("tunnel/tunnel.go", '\tkey := packet.Key()', '''
- if err := minclashIdentify(metadata); err != nil { packet.Drop(); return }
- key := packet.Key()
- if metadata.MinClashIdentified { key = fmt.Sprintf("%s|uid:%d", key, metadata.Uid) }
-''')
+    replace("tunnel/tunnel.go", '\tpacketAdapter := C.NewPacketAdapter(packet, metadata)', '''	packetAdapter := minclashIsolatePacket(C.NewPacketAdapter(packet, metadata))
+	if err := minclashIdentify(packetAdapter.Metadata()); err != nil {
+		packet.Drop()
+		return
+	}''')
+    replace("tunnel/tunnel.go", '\tkey := packet.Key()', '''	key := packet.Key()
+	if metadata.MinClashIdentified {
+		key = fmt.Sprintf("%s|uid:%d", key, metadata.Uid)
+	}''')
+    replace("tunnel/tunnel.go", '''	metadata := connCtx.Metadata()
+	if !metadata.Valid() {''', '''	metadata := connCtx.Metadata()
+	if err := minclashIdentify(metadata); err != nil {
+		return
+	}
+	if !metadata.Valid() {''')
+    replace("tunnel/tunnel.go", '''					} else {
+						metadata.Process = filepath.Base(path)''', '''					} else if !metadata.MinClashIdentified || metadata.Uid == uid {
+						metadata.Process = filepath.Base(path)''')
     replace("tunnel/tunnel.go", 'func handleUDPConn(packet C.PacketAdapter) {', '''func handleUDPConn(packet C.PacketAdapter) {
  if minclashRejectWebRTCUDP(packet) {
    packet.Drop()
    return
- }
- packet = minclashIsolatePacket(packet)''')
+ }''')
     replace("tunnel/tunnel.go", 'if !isHandle(connCtx.Metadata().Type) {',
             'if !isHandle(connCtx.Metadata().Type) || minclashRejectWebRTCTCP(connCtx.Metadata()) {')
+    replace("listener/sing_tun/prepare.go", '"github.com/metacubex/mihomo/component/dialer"',
+            '"github.com/metacubex/mihomo/component/dialer"\n\t"github.com/metacubex/mihomo/component/protection"')
+    replace("listener/sing_tun/prepare.go", '\t\tlog.Infoln("[ICMP] %s %s --> %s using DIRECT", network, source, destination)', '''		// TUN ICMP has no verified socket owner and this path dials directly.
+		if len(protection.Runtime.Apps) != 0 {
+			return nil, tun.ErrDrop
+		}
+		log.Infoln("[ICMP] %s %s --> %s using DIRECT", network, source, destination)''')
     replace("config/config.go", 'func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {', '''func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
  minclashDNS(rawCfg)
 ''')
     replace("config/config.go", '\tconfig.Proxies = proxies', '\tif err := minclashValidateProxies(proxies); err != nil { return nil, err }\n\tconfig.Proxies = proxies')
-    replace("tunnel/dns_dialer.go", '"github.com/metacubex/mihomo/component/dialer"',
-            '"github.com/metacubex/mihomo/component/dialer"\n "github.com/metacubex/mihomo/component/protection"')
-    replace("tunnel/dns_dialer.go", '\tproxyName := d.proxyName', ''' proxyName := d.proxyName
- strict := protection.Runtime.StrictDNS && proxyName == protection.DNSProxy
- if strict { proxyName = protection.Runtime.DNSProxy }
-''', count=2)
-    replace("tunnel/dns_dialer.go", '\terr := metadata.SetRemoteAddress(addr)',
-            ' metadata.MinClashProtected = strict\n\terr := metadata.SetRemoteAddress(addr)', count=2)
-    replace("tunnel/dns_dialer.go", '\t\t\t} else {\n\t\t\t\topts = append(opts, dialer.WithInterface(proxyName))',
-            '\t\t\t} else {\n if strict { return nil, fmt.Errorf("MINCLASH_DNS_PROXY_MISSING") }\n\t\t\t\topts = append(opts, dialer.WithInterface(proxyName))', count=2)
+    replace("config/config.go", '\tconfig.DNS = dnsCfg', '\tminclashBindDNS(dnsCfg, proxies)\n\tconfig.DNS = dnsCfg')
+    replace("dns/resolver.go", 'type NameServer struct {', 'type NameServer struct {\n\tMinClashDoHMode MinClashDoHMode')
+    replace("dns/resolver.go", '\t\tns.ProxyName == ns2.ProxyName &&',
+            '\t\tns.ProxyName == ns2.ProxyName &&\n\t\tns.MinClashDoHMode == ns2.MinClashDoHMode &&', count=2)
+    replace("dns/util.go", 'newDoHClient(s.Addr, resolver, s.PreferH3, s.Params, s.ProxyAdapter, s.ProxyName)',
+            'newDoHClient(s, resolver)')
+    replace("dns/doh.go", '\t"context"\n', '\t"context"\n\t"crypto/x509"\n')
+    replace("dns/doh.go", '\tskipCertVerify bool', '\tminclashDoHMode MinClashDoHMode\n\tskipCertVerify bool')
+    replace("dns/doh.go", '''func newDoHClient(urlString string, r resolver.Resolver, preferH3 bool, params map[string]string, proxyAdapter C.ProxyAdapter, proxyName string) dnsClient {
+\tu, _ := url.Parse(urlString)
+\thttpVersions := DefaultHTTPVersions
+\tif preferH3 {''', '''func newDoHClient(ns NameServer, r resolver.Resolver) dnsClient {
+\tu, _ := url.Parse(ns.Addr)
+\tparams := ns.Params
+\thttpVersions := DefaultHTTPVersions
+\tif ns.PreferH3 {''')
+    replace("dns/doh.go", 'newDNSDialer(r, proxyAdapter, proxyName)', 'newDNSDialer(r, ns.ProxyAdapter, ns.ProxyName)')
+    replace("dns/doh.go", '\t\thttpVersions: httpVersions,',
+            '\t\thttpVersions: httpVersions,\n\t\tminclashDoHMode: ns.MinClashDoHMode,')
+    replace("dns/doh.go", '\tif params["skip-cert-verify"] == "true" {\n\t\tdoh.skipCertVerify = true\n\t}\n\tdoh.nameCertVerify = params["name-cert-verify"]',
+            '\tif ns.MinClashDoHMode == MinClashDoHOrdinary {\n\t\tdoh.skipCertVerify = params["skip-cert-verify"] == "true"\n\t\tdoh.nameCertVerify = params["name-cert-verify"]\n\t}')
+    replace("dns/doh.go", '\tdoh.client = client', '''\tif doh.minclashDoHMode != MinClashDoHOrdinary {
+\t\tclient.CheckRedirect = func(*http.Request, []*http.Request) error {
+\t\t\treturn http.ErrUseLastResponse
+\t\t}
+\t}
+\tdoh.client = client''')
+    replace("dns/doh.go", '\t\t\treturn doh.dialer.DialContext(ctx, network, addr)', '''\t\t\tif doh.minclashDoHMode == MinClashDoHBootstrap {
+\t\t\t\treturn minclashDialDNSBootstrap(ctx, network, addr)
+\t\t\t}
+\t\t\treturn doh.dialer.DialContext(ctx, network, addr)''')
+    replace("dns/doh.go", '\t\tNameCertVerify: doh.nameCertVerify,',
+            '\t\tNameCertVerify: doh.nameCertVerify,\n\t\tZeroTrust: doh.minclashDoHMode != MinClashDoHOrdinary,')
+    replace("dns/doh.go", '\tvar nextProtos []string', '''\tif doh.minclashDoHMode != MinClashDoHOrdinary && tlsConfig.RootCAs == nil {
+\t\t// Pinned source builds may lack the optional embedded CA bundle.
+\t\t// Load system trust directly, separate from subscription additions.
+\t\ttlsConfig.RootCAs, err = x509.SystemCertPool()
+\t\tif err != nil {
+\t\t\treturn nil, fmt.Errorf("load strict DNS system trust: %w", err)
+\t\t}
+\t}
+\tvar nextProtos []string''')
 
     # Android hands off by changing IP policy rules even when both links stay up.
     tun = "vendor/github.com/metacubex/sing-tun/"

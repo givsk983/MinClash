@@ -1,8 +1,12 @@
 #!/system/bin/sh
 MODDIR=${0%/*}
-/system/bin/sh "$MODDIR/control.sh" protection-early
+early_guard=0
+/system/bin/sh "$MODDIR/control.sh" protection-early && early_guard=1
 while [ "$(/system/bin/getprop sys.boot_completed)" != 1 ]; do
     sleep 5
+    if [ "$early_guard" = 0 ]; then
+        /system/bin/sh "$MODDIR/control.sh" protection-early && early_guard=1
+    fi
 done
 /system/bin/sh "$MODDIR/control.sh" boot
 

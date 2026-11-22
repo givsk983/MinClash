@@ -122,6 +122,9 @@ public final class ProtectionActivity extends ThemedActivity {
             note("请先在「设置 → 内置模块」更新模块并重启手机，再使用此功能。暂不更新也可继续使用原有代理功能。");
             action("返回设置",this::finish);return;
         }
+        if (model.status.functionalRevision() < 22) {
+            note("当前模块缺少新版防泄漏修复。可在「设置 → 内置模块」更新。");
+        }
         if (model.remote==null || model.draft==null) {
             note("暂时无法读取保护设置，请重试。之前开启的保护可能仍在限制联网；需要恢复正常使用时，可选择关闭全部保护。");
             action("重新读取",()->refresh(false));
@@ -129,14 +132,17 @@ public final class ProtectionActivity extends ThemedActivity {
         }
         JSONObject remote=model.remote; boolean enabled=remote.optJSONObject("policy")!=null &&
             (remote.optJSONObject("policy").optBoolean("strictDns") || remote.optJSONObject("policy").optJSONArray("apps")!=null && remote.optJSONObject("policy").optJSONArray("apps").length()>0);
+        boolean privateDnsConflict = remote.optBoolean("privateDNSConflict");
         String status=!enabled ? remote.optBoolean("residual") ? "部分联网限制尚未解除，请关闭保护后重试" : "保护未开启"
+            : privateDnsConflict ? "严格 DNS 未就绪 · 请关闭系统「私人 DNS」"
             : !remote.optBoolean("binding") ? "应用安装信息已变化，请移除后重新添加保护"
-            : !remote.optBoolean("firewall") ? "保护尚未完成，部分应用可能无法联网。请重新应用或关闭保护"
+            : !remote.optBoolean("firewall") ? "保护规则尚未确认 · 请检查或重新应用"
             : !model.status.running() ? "已暂停联网 · 等待代理恢复"
             : !remote.optBoolean("corePolicy") ? "保护设置尚未确认生效，请重新应用"
             : "保护已就绪 · 代理不可用时暂停联网";
-        boolean ready=enabled&&remote.optBoolean("binding")&&remote.optBoolean("firewall")&&(!model.status.running()||remote.optBoolean("corePolicy"));
+        boolean ready=enabled&&!privateDnsConflict&&remote.optBoolean("binding")&&remote.optBoolean("firewall")&&(!model.status.running()||remote.optBoolean("corePolicy"));
         ui.add(content,ui.label(status,15,ready?AppUi.MINT:enabled||remote.optBoolean("residual")?AppUi.AMBER:AppUi.MUTED,true),14);
+        if (privateDnsConflict) action("打开系统私人 DNS 设置", this::openPrivateDnsSettings);
         if (model.dirty) ui.add(content,ui.label("有未应用的修改 · 当前保护仍按原设置运行",13,AppUi.AMBER,true),8);
         if (!model.inventoryError.isEmpty()) note(model.inventoryError);
         action(model.draft.apps.isEmpty() ? "选择要保护的应用" : "添加应用 · 可多选",this::chooseApp);
@@ -174,12 +180,20 @@ public final class ProtectionActivity extends ThemedActivity {
             toggle("允许先查询代理服务器地址",model.draft.bootstrap,on->model.draft.bootstrap=on);
             note(model.draft.bootstrap ? "已允许启动所需的例外：连接代理前，可直接向 Cloudflare 查询代理服务器地址。Cloudflare 能看到你的真实网络地址和所查询的服务器名称；应用访问网站时的常规查询仍通过代理。"
                 : "默认关闭。如果节点只提供服务器名称，且未配置对应的网络地址，可能无法连接。遇到这种情况，可按需开启上方选项；未开启时会继续暂停联网。");
-            action("打开系统私人 DNS 设置",()->{try{startActivity(new Intent("android.settings.PRIVATE_DNS_SETTINGS"));}catch(Exception e){message("请到系统网络设置手动关闭私人 DNS。");}});
+            if (!privateDnsConflict) action("打开系统私人 DNS 设置", this::openPrivateDnsSettings);
         }
         }
         action("刷新状态",()->{model.inventory.invalidate();refresh(false);});
         action("使用说明与联网排查",this::showHelp);
         scroll.post(()->scroll.scrollTo(0,y));
+    }
+
+    private void openPrivateDnsSettings() {
+        try {
+            startActivity(new Intent("android.settings.PRIVATE_DNS_SETTINGS"));
+        } catch (android.content.ActivityNotFoundException | SecurityException error) {
+            message("请到系统网络设置手动关闭私人 DNS。");
+        }
     }
     private void message(String text){new AlertDialog.Builder(this).setMessage(text).setPositiveButton("知道了",null).show();}
     private void chooseTarget(String current,java.util.function.Consumer<String> selected){

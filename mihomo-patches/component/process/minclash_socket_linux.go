@@ -10,14 +10,25 @@ import (
 	"unsafe"
 
 	C "github.com/metacubex/mihomo/constant"
+	"golang.org/x/sys/unix"
 )
 
 // MinClashSocketUID accepts only plausible endpoints with a unique UID. It
 // does not use the process lookup's port-only fallback.
 func MinClashSocketUID(m *C.Metadata) uint32 {
+	return minclashSocketOwner(m).uniqueUID()
+}
+
+func init() {
+	MinClashVerifiedSocketUID = func(m *C.Metadata) uint32 {
+		return minclashSocketOwner(m).verifiedUID()
+	}
+}
+
+func minclashSocketOwner(m *C.Metadata) socketOwner {
 	ip := m.SrcIP.Unmap()
-	if !ip.IsValid() || !m.DstIP.IsValid() || m.SrcPort == 0 {
-		return 0
+	if !ip.IsValid() || ip.IsUnspecified() || !m.DstIP.IsValid() || m.DstIP.IsUnspecified() || m.SrcPort == 0 || m.DstPort == 0 {
+		return socketOwner{}
 	}
 	addresses := []netip.Addr{ip}
 	if ip.Is4() {
@@ -28,7 +39,7 @@ func MinClashSocketUID(m *C.Metadata) uint32 {
 		messages, err := querySocketByNetlink(m.NetWork.String(), address, int(m.SrcPort))
 		if err != nil {
 			if !owner.considerProcSockets(m, address.Is6()) {
-				return 0
+				return socketOwner{}
 			}
 			continue
 		}
@@ -38,21 +49,21 @@ func MinClashSocketUID(m *C.Metadata) uint32 {
 			}
 			socket := (*inetDiagResponse)(unsafe.Pointer(&message.Data[0]))
 			var src, dst netip.Addr
-			if address.Is4() {
+			switch socket.Family {
+			case unix.AF_INET:
 				src = netip.AddrFrom4([4]byte(socket.Src[:4]))
 				dst = netip.AddrFrom4([4]byte(socket.Dst[:4]))
-			} else {
+			case unix.AF_INET6:
 				src = netip.AddrFrom16(socket.Src)
 				dst = netip.AddrFrom16(socket.Dst)
+			default:
+				continue
 			}
 			owner.consider(m, netip.AddrPortFrom(src, binary.BigEndian.Uint16(socket.SrcPort[:])),
 				netip.AddrPortFrom(dst, binary.BigEndian.Uint16(socket.DstPort[:])), socket.UID)
 		}
 	}
-	if owner.ambiguous {
-		return 0
-	}
-	return owner.uid
+	return owner
 }
 
 func (owner *socketOwner) considerProcSockets(m *C.Metadata, ipv6 bool) bool {

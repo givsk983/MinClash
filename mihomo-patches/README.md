@@ -57,7 +57,7 @@ GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
   CC='clang --target=aarch64-linux-android28' \
   CGO_LDFLAGS='-Wl,-z,max-page-size=16384' \
   go build -mod=vendor -tags with_gvisor -trimpath \
-  -ldflags '-X github.com/metacubex/mihomo/constant.Version=v1.19.33-minclash.8 -X github.com/metacubex/mihomo/constant.BuildTime=2026-11-21T00:00:00Z -w -s -buildid=' \
+  -ldflags '-X github.com/metacubex/mihomo/constant.Version=v1.19.33-minclash.9 -X github.com/metacubex/mihomo/constant.BuildTime=2026-11-22T00:00:00Z -w -s -buildid=' \
   -o mihomo .
 ```
 

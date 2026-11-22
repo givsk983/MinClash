@@ -2,13 +2,14 @@ package tunnel
 
 import (
 	"errors"
+
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/protection"
 	C "github.com/metacubex/mihomo/constant"
-	"path/filepath"
 )
 
-var minclashFindProcess = process.FindProcessName
+var minclashVerifySocketUID = process.MinClashVerifiedSocketUID
+var errMinClashOriginUnknown = errors.New("MINCLASH_ORIGIN_UNKNOWN")
 
 type minclashPacket struct {
 	C.PacketAdapter
@@ -27,36 +28,42 @@ func minclashIsolatePacket(p C.PacketAdapter) C.PacketAdapter {
 }
 
 func minclashIdentify(m *C.Metadata) error {
-	if len(protection.Runtime.Apps) == 0 || m.Type != C.TUN || m.MinClashIdentified {
+	if len(protection.Runtime.Apps) == 0 || m.Type != C.TUN {
 		return nil
 	}
-	uid, path, err := minclashFindProcess(m.NetWork.String(), m.SrcIP, int(m.SrcPort))
-	if err != nil || uid == 0 {
-		return errors.New("MINCLASH_ORIGIN_UNKNOWN")
+	uid := minclashVerifySocketUID(m)
+	if uid == 0 {
+		return errMinClashOriginUnknown
 	}
 	m.Uid = uid
-	m.Process = filepath.Base(path)
-	m.ProcessPath = path
 	m.MinClashIdentified = true
-	_, m.MinClashProtected = protection.Runtime.Target(uid)
+	m.MinClashProtected = false
+	for _, app := range protection.Runtime.Apps {
+		if app.UID == uid {
+			m.MinClashProtected = true
+			m.Process = app.Package
+			break
+		}
+	}
 	return nil
 }
 
-// Run before SpecialProxy and global/direct modes. Never trust a user-switchable
-// find-process-mode for a security decision. Unknown TUN origins fail closed.
+// Only trust an identity verified at ingress, before metadata rewriting.
 func minclashResolve(m *C.Metadata) (C.Proxy, bool, error) {
-	if err := minclashIdentify(m); err != nil {
-		return nil, true, err
+	if len(protection.Runtime.Apps) == 0 || m.Type != C.TUN {
+		return nil, false, nil
 	}
-	if m.MinClashIdentified {
-		if target, ok := protection.Runtime.Target(m.Uid); ok {
-			m.MinClashProtected = true
-			p, exists := proxies[target]
-			if !exists {
-				return nil, true, errors.New("MINCLASH_PROXY_MISSING")
-			}
-			return p, true, nil
-		}
+	if !m.MinClashIdentified {
+		return nil, true, errMinClashOriginUnknown
 	}
-	return nil, false, nil
+	target, protected := protection.Runtime.Target(m.Uid)
+	if !protected {
+		return nil, false, nil
+	}
+	m.MinClashProtected = true
+	p, exists := proxies[target]
+	if !exists {
+		return nil, true, errors.New("MINCLASH_PROXY_MISSING")
+	}
+	return p, true, nil
 }

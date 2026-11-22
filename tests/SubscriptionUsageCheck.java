@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpServer;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.io.ByteArrayOutputStream;
+import java.util.Base64;
 import java.util.zip.GZIPOutputStream;
 
 public final class SubscriptionUsageCheck {
@@ -28,15 +29,18 @@ public final class SubscriptionUsageCheck {
             SubscriptionUsageCheck.class.getClassLoader(), new Class<?>[] {android.content.SharedPreferences.class},
             (proxy, method, arguments) -> { throw new IllegalStateException("preference storage unavailable"); });
         require(!full.cache(broken, "https://example.test/private"), "optional usage caching never blocks configuration import");
+        checkNames();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         byte[] yaml = "rules: ['MATCH,DIRECT']\n".getBytes(StandardCharsets.UTF_8);
         server.createContext("/redirect", exchange -> {
             exchange.getResponseHeaders().add("Location", "/final");
             exchange.getResponseHeaders().add("Subscription-Userinfo", "upload=99;download=99;total=999");
+            exchange.getResponseHeaders().add("Profile-Title", "Redirect title");
             exchange.sendResponseHeaders(302, -1); exchange.close();
         });
         server.createContext("/final", exchange -> {
             exchange.getResponseHeaders().add("subscription-userinfo", "upload=1024;download=2048;total=4096;expire=1893456000");
+            exchange.getResponseHeaders().add("content-disposition", "attachment; filename*=UTF-8''%E4%BA%91%E8%88%AA.yaml");
             exchange.sendResponseHeaders(200, yaml.length); exchange.getResponseBody().write(yaml); exchange.close();
         });
         server.createContext("/missing", exchange -> {
@@ -51,6 +55,7 @@ public final class SubscriptionUsageCheck {
         });
         server.createContext("/headers-only", exchange -> {
             exchange.getResponseHeaders().add("Subscription-Userinfo", "upload=1;download=2;total=10");
+            exchange.getResponseHeaders().add("Profile-Title", "Header title");
             byte[] body = "this is not YAML".getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, body.length); exchange.getResponseBody().write(body); exchange.close();
         });
@@ -71,11 +76,18 @@ public final class SubscriptionUsageCheck {
             String address = "http://127.0.0.1:" + server.getAddress().getPort();
             Subscription.Download downloaded = Subscription.download(address + "/redirect");
             require(downloaded.usage().used() == 3072 && downloaded.usage().total() == 4096, "only final response metadata is used");
+            require(downloaded.name().equals("云航"), "only the final response supplies the subscription name");
             require(new String(downloaded.source(), StandardCharsets.UTF_8).contains("MATCH,DIRECT"), "normal configuration download preserved");
             require(Subscription.download(address + "/missing").usage().checkedAt() > 0
                 && Subscription.download(address + "/missing").usage().used() == -1, "missing final header yields fresh unavailable result");
             require(new String(Subscription.download(address + "/gzip").source(), StandardCharsets.UTF_8).contains("MATCH,DIRECT"), "gzip config decompressed before validation");
             require(Subscription.usage(address + "/headers-only").used() == 3, "usage refresh independent of YAML validity");
+            require(Subscription.lookupName(address + "/headers-only", "127.0.0.1").equals("Header title"),
+                "save-only name lookup does not validate the body");
+            require(Subscription.lookupName(address + "/missing?token=secret", "127.0.0.1").equals("127.0.0.1"),
+                "missing metadata falls back to the host");
+            require(Subscription.lookupName(address + "/no-location", "127.0.0.1").equals("127.0.0.1"),
+                "failed lookup still gives a name for offline saving");
             for (String path : new String[] {"/loop", "/no-location", "/bomb"}) {
                 try { Subscription.download(address + path); throw new AssertionError("accepted " + path); }
                 catch (java.io.IOException expected) { }
@@ -85,7 +97,25 @@ public final class SubscriptionUsageCheck {
             require(new String(Profile.normalize(bom), StandardCharsets.UTF_8).contains("MATCH,DIRECT"), "UTF-8 BOM configuration");
             require(new SubscriptionUsage(-2, -3, -4, Long.MAX_VALUE, -1).expire() == -1, "corrupt cached expiration clamped");
         } finally { server.stop(0); }
-        System.out.println("PASS: partial/malformed/missing usage, overflow, expiration, and HTTP redirect/final-header integration.");
+        System.out.println("PASS: subscription usage, title and filename parsing, host fallback, and final response metadata.");
     }
+
+    private static void checkNames() {
+        String host = "sub.example.test";
+        String title = "云航 ✈";
+        String encodedTitle = "base64:" + Base64.getEncoder().encodeToString(title.getBytes(StandardCharsets.UTF_8));
+        require(SubscriptionName.fromHeaders(encodedTitle, "attachment; filename=Other.yaml", host).equals(title),
+            "UTF-8 title takes precedence over filename");
+        require(SubscriptionName.fromHeaders("  Provider title  ", null, host).equals("Provider title"), "plain title");
+        require(SubscriptionName.fromHeaders("base64:@@", "attachment; filename=Other.yml; filename*=UTF-8'zh'%E4%BA%91+A.yaml", host)
+            .equals("云+A"), "extended filename takes precedence and preserves literal plus");
+        require(SubscriptionName.fromHeaders(null, "attachment; filename*=UTF-8''%FF; filename=\"Air; Line.YAML\"", host)
+            .equals("Air; Line"), "malformed UTF-8 falls back to the quoted filename");
+        require(SubscriptionName.fromHeaders(null, "attachment; note=\"ignored; filename=Other.yaml\"; filename=config.yaml", host)
+            .equals(host), "nested parameters and generic filenames do not become titles");
+        require(SubscriptionName.fromHeaders("base64:QQpC", "attachment; filename*=UTF-8''folder%2FAir.yaml", host).equals(host),
+            "multiline titles and paths fall back to the host");
+    }
+
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
 }

@@ -8,6 +8,7 @@ final class BackgroundWork {
     static final ExecutorService DOWNLOADS = Executors.newFixedThreadPool(2);
     final RetainedTask<AppUpdate.Release> updateCheck = new RetainedTask<>();
     final RetainedTask<SubscriptionPreview> preview = new RetainedTask<>();
+    final RetainedTask<Void> subscriptionSave = new RetainedTask<>();
     final RetainedTask<Void> updateDownload = new RetainedTask<>();
     final RetainedTask<Object> backup = new RetainedTask<>();
     final RetainedTask<UsageResult> usage = new RetainedTask<>();
@@ -22,6 +23,7 @@ final class BackgroundWork {
     void observe(java.util.concurrent.Executor dispatcher, Runnable callback) {
         updateCheck.observe(dispatcher, callback);
         preview.observe(dispatcher, callback);
+        subscriptionSave.observe(dispatcher, callback);
         updateDownload.observe(dispatcher, callback);
         backup.observe(dispatcher, callback);
         usage.observe(dispatcher, callback);
@@ -30,6 +32,7 @@ final class BackgroundWork {
     void stopObserving() {
         updateCheck.stopObserving();
         preview.stopObserving();
+        subscriptionSave.stopObserving();
         updateDownload.stopObserving();
         backup.stopObserving();
         usage.stopObserving();
