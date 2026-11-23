@@ -1,6 +1,6 @@
 # MinClash Mihomo modifications
 
-Modified through 2026-11-20, based on Mihomo v1.19.33, commit
+Modified through 2026-11-23, based on Mihomo v1.19.33, commit
 `3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8`. The upstream GPL v3 license applies.
 The source archive SHA-256 is
 `ecda5f8c8a8a1d60bc088c2640c85d92c8f002c0686234a26bdf671735afe216`.
@@ -57,7 +57,7 @@ GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
   CC='clang --target=aarch64-linux-android28' \
   CGO_LDFLAGS='-Wl,-z,max-page-size=16384' \
   go build -mod=vendor -tags with_gvisor -trimpath \
-  -ldflags '-X github.com/metacubex/mihomo/constant.Version=v1.19.33-minclash.9 -X github.com/metacubex/mihomo/constant.BuildTime=2026-11-22T00:00:00Z -w -s -buildid=' \
+  -ldflags '-X github.com/metacubex/mihomo/constant.Version=v1.19.33-minclash.11 -X github.com/metacubex/mihomo/constant.BuildTime=2026-11-23T00:00:00Z -w -s -buildid=' \
   -o mihomo .
 ```
 

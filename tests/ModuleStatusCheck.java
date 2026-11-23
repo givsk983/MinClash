@@ -96,6 +96,9 @@ public final class ModuleStatusCheck {
         Module.Status degraded = Module.parseStatus(facts + "protection_armed=1\nprotection_degraded=1\ntraffic_summary=1\n");
         require(!degraded.protectionArmed && degraded.runtime.protectionDegraded() && degraded.runtime.trafficSummary(),
             "failed protection verification overrides an ownership marker; traffic summary is capability-gated");
+        require(!degraded.runtime.appTraffic() && !Module.parseStatus(facts + "app_traffic=1\n").runtime.appTraffic()
+            && Module.parseStatus(facts + "traffic_summary=1\napp_traffic=1\n").runtime.appTraffic(),
+            "application traffic requires both summary and application counters capabilities");
         require(Module.parseStatus(facts.replace("controller_ready=1\n", "")).phase() == Module.Phase.DEGRADED,
             "controller readiness is distinguished");
         require(Module.parseStatus(facts.replace("state=running", "state=waiting_network")).phase() == Module.Phase.WAITING_NETWORK,

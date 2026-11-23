@@ -23,15 +23,22 @@ public final class AndroidNotificationChannelsCheck extends Instrumentation {
             Method ensure = channels.getDeclaredMethod("ensure", Context.class);
             selected.setAccessible(true);
             ensure.setAccessible(true);
-            require(selected.invoke(null, context).equals("proxy_controls"), "Android's persisted default legacy settings qualify for migration");
-            require(ensure.invoke(null, context).equals("proxy_controls"), "new control channel is selected");
-            NotificationChannel controls = manager.getNotificationChannel("proxy_controls");
-            require(controls != null && controls.getImportance() == NotificationManager.IMPORTANCE_DEFAULT, "ordinary importance");
+            String priorityId = "proxy_controls_priority";
+            require(selected.invoke(null, context).equals(priorityId), "Android's persisted low settings qualify for migration");
+            NotificationChannel previous = new NotificationChannel("proxy_controls", "代理状态与快捷控制", NotificationManager.IMPORTANCE_DEFAULT);
+            previous.setSound(null, null);
+            previous.setShowBadge(false);
+            manager.createNotificationChannel(previous);
+            require(selected.invoke(null, context).equals(priorityId), "Android's persisted silent default settings also qualify for migration");
+            require(ensure.invoke(null, context).equals(priorityId), "new control channel is selected");
+            NotificationChannel controls = manager.getNotificationChannel(priorityId);
+            require(controls != null && controls.getImportance() == NotificationManager.IMPORTANCE_HIGH, "high importance");
             require(controls.getSound() == null && !controls.shouldVibrate() && !controls.shouldShowLights(), "silent without light or vibration");
             require(!controls.canBypassDnd() && !controls.canShowBadge(), "no DND bypass or launcher badge");
-            require(ensure.invoke(null, context).equals("proxy_controls") && manager.getNotificationChannels().size() == 2, "repeated setup keeps stable channels");
+            require(ensure.invoke(null, context).equals(priorityId) && manager.getNotificationChannels().size() == 3, "repeated setup keeps stable channels");
             require(manager.getNotificationChannel("proxy_status").getImportance() == NotificationManager.IMPORTANCE_LOW, "legacy channel is retained intact");
-            result.putString("stream", "PASS: persisted Android defaults migrate, controls use ordinary importance and stay silent, repeated setup is stable.\n");
+            require(manager.getNotificationChannel("proxy_controls").getImportance() == NotificationManager.IMPORTANCE_DEFAULT, "previous controls channel is retained intact");
+            result.putString("stream", "PASS: persisted Android defaults migrate, controls use high importance and stay silent, repeated setup is stable.\n");
             finish(-1, result);
         } catch (Throwable error) {
             result.putString("stream", "FAIL: " + error + "\n");

@@ -119,3 +119,64 @@ func TestMinClashAndroidDefaultLink(t *testing.T) {
 		t.Fatalf("Android VPN split route link = %d, want 5", link)
 	}
 }
+
+func TestMinClashAndroidPhysicalFallbacks(t *testing.T) {
+	const tunTable = 20882
+	ipv4 := netlink.Route{Family: unix.AF_INET, Table: 1010, LinkIndex: 8, Type: unix.RTN_UNICAST}
+	ipv6 := netlink.Route{Family: unix.AF_INET6, Table: 1011, LinkIndex: 7, Type: unix.RTN_UNICAST}
+	otherV6 := netlink.Route{Family: unix.AF_INET6, Table: 1010, LinkIndex: 8, Type: unix.RTN_UNICAST}
+	tunV6 := netlink.Route{Family: unix.AF_INET6, Table: tunTable, LinkIndex: 9, Type: unix.RTN_UNICAST}
+	downV6 := netlink.Route{Family: unix.AF_INET6, Table: 1012, LinkIndex: 11, Flags: unix.RTNH_F_LINKDOWN, Type: unix.RTN_UNICAST}
+	dummyV6 := netlink.Route{Family: unix.AF_INET6, Table: 1013, LinkIndex: 12, Type: unix.RTN_UNICAST}
+	usableLink := func(index int) bool { return index != dummyV6.LinkIndex }
+
+	t.Run("missing family uses its own unique default", func(t *testing.T) {
+		tables := minclashAndroidTables{ipv4: ipv4.Table}
+		routes := []netlink.Route{ipv4, ipv6, tunV6, downV6, dummyV6}
+		fallbacks := minclashAndroidPhysicalFallbacks(routes, tables, tunTable, usableLink)
+		if len(fallbacks) != 1 || fallbacks[0].LinkIndex != ipv6.LinkIndex {
+			t.Fatalf("fallbacks = %v; want only IPv6 link %d", fallbacks, ipv6.LinkIndex)
+		}
+	})
+
+	t.Run("ambiguous family does not borrow another link", func(t *testing.T) {
+		tables := minclashAndroidTables{ipv4: ipv4.Table}
+		fallbacks := minclashAndroidPhysicalFallbacks([]netlink.Route{ipv4, ipv6, otherV6}, tables, tunTable, usableLink)
+		if len(fallbacks) != 0 {
+			t.Fatalf("guessed a default link from ambiguous routes: %v", fallbacks)
+		}
+	})
+
+	t.Run("terminal policy cannot be bypassed", func(t *testing.T) {
+		tables := minclashAndroidTables{ipv4: ipv4.Table, ipv6: 1000, ipv6Blocked: true}
+		fallbacks := minclashAndroidPhysicalFallbacks([]netlink.Route{ipv4, ipv6}, tables, tunTable, usableLink)
+		if len(fallbacks) != 0 {
+			t.Fatalf("replaced a terminal route: %v", fallbacks)
+		}
+	})
+
+	t.Run("split physical defaults stay independent", func(t *testing.T) {
+		fallbacks := minclashAndroidPhysicalFallbacks([]netlink.Route{ipv4, ipv6}, minclashAndroidTables{}, tunTable, usableLink)
+		if len(fallbacks) != 2 || fallbacks[0].Family != unix.AF_INET || fallbacks[0].LinkIndex != ipv4.LinkIndex ||
+			fallbacks[1].Family != unix.AF_INET6 || fallbacks[1].LinkIndex != ipv6.LinkIndex {
+			t.Fatalf("different default links for each family should be usable: %v", fallbacks)
+		}
+	})
+}
+
+func TestMinClashAndroidVPNFallbackCompatibility(t *testing.T) {
+	rules := []netlink.Rule{
+		{Family: unix.AF_INET, Table: 1000, IifName: "lo", Mask: androidProtectedVPN | androidExplicitNetID, UIDRange: netlink.NewRuleUIDRange(10000, 19999)},
+		{Family: unix.AF_INET, Table: 1001, IifName: "lo", Mask: androidNetIDMask},
+	}
+	routes := []netlink.Route{{Family: unix.AF_INET, Table: 1001, LinkIndex: 8, Type: unix.RTN_UNICAST}}
+	tables := minclashAndroidDefaultTables(rules, routes, 20882, true)
+	if !tables.vpnRulesSeen || tables.vpnEnabled || tables.vpnTable != 0 || tables.ipv4 != 1001 {
+		t.Fatalf("existing Android VPN policy changed: %+v", tables)
+	}
+	rules[0].Mask = androidProtectedVPN
+	tables = minclashAndroidDefaultTables(rules, routes, 20882, true)
+	if !tables.vpnRulesSeen || !tables.vpnEnabled || tables.vpnTable != 1000 {
+		t.Fatalf("existing VPN override changed: %+v", tables)
+	}
+}

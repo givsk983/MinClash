@@ -41,7 +41,7 @@ final class Module {
     record RuntimeStatus(boolean reported, boolean core, boolean tun4, boolean tun6, boolean tun6Required, boolean controller,
                          boolean notificationRecovery, boolean notificationEnabled, String hotspotReason,
                          long hotspotSent, long hotspotReceived, boolean trafficSummary, boolean protectionDegraded,
-                         String coreSession, boolean notificationHeartbeat) {}
+                         String coreSession, boolean notificationHeartbeat, boolean appTraffic) {}
 
     record WebRtcStatus(boolean available, boolean rules, boolean configured, boolean active,
                         boolean pending, boolean legacy, int ruleCount) {
@@ -223,13 +223,16 @@ final class Module {
                 match() { printf '%s\\n' "$recent" | grep -Eiq "$1" && echo "$2"; }
                 match 'dns resolve failed|no such host|all DNS requests failed' NODE_DNS
                 match 'fake DNS record .* missing' FAKE_DNS_MISSING
+                match 'MINCLASH_ORIGIN_UNKNOWN' PROTECTION_ORIGIN_BLOCK
+                match 'MINCLASH_(DIRECT_BLOCKED|UNSAFE_OUTBOUND|PROXY_MISSING)' PROTECTION_OUTBOUND_BLOCK
                 match "can't download (geo(site|ip)\\.dat|mmdb|asn)|geodata.*(failed|error)" GEODATA
                 match 'provider.*(download failed|initial error|update failed|could not)' PROVIDER
                 match 'certificate signed by unknown authority|x509:|tls handshake timeout' CORE_TLS
-                match 'TUN did not become ready|priorities .* already in use|Interface minclash0 is already in use' TUN_SETUP
+                match 'TUN did not become ready|required TUN routing is unavailable|priorities .* already in use|Interface minclash0 is already in use' TUN_SETUP
                 match 'Waiting for a stable system uplink at boot' BOOT_UPLINK_WAIT
                 match 'System uplink changed( after boot)?[.]' BOOT_UPLINK_RESTART
                 match 'MinClash refreshed Android default network' UPLINK_HANDOFF
+                match 'default interface lost by monitor' UPLINK_DEFAULT_LOST
                 match 'configuration (file .* )?test failed|parse config error' CONFIG
             fi
             exit 0
@@ -257,7 +260,7 @@ final class Module {
         boolean hotspotEnabled = false;
         String hotspotState = "off";
         boolean health = false, core = false, tun4 = false, tun6 = false, tun6Required = false, controller = false;
-        boolean trafficSummary = false, protectionDegraded = false;
+        boolean trafficSummary = false, appTraffic = false, protectionDegraded = false;
         boolean notificationRecovery = false, notificationEnabled = false, notificationHeartbeat = false;
         String coreSession = "";
         String hotspotReason = "none";
@@ -283,6 +286,7 @@ final class Module {
             if (line.equals("webrtc_active=1")) webRtcActive = true;
             if (line.equals("protection_degraded=1")) protectionDegraded = true;
             if (line.equals("traffic_summary=1")) trafficSummary = true;
+            if (line.equals("app_traffic=1")) appTraffic = true;
             if (line.equals("hotspot=1")) hotspot = true;
             if (line.equals("hotspot_enabled=1")) hotspotEnabled = true;
             if (line.equals("health=1")) health = true;
@@ -328,7 +332,7 @@ final class Module {
         return new Status(state, profile, boot, enabled, control, validate, replaceProfile, version, pendingVersion, revision, pendingRevision,
             hotspot, hotspotEnabled, hotspotState, new RuntimeStatus(health, core, tun4, tun6, tun6Required, controller,
                 notificationRecovery, notificationEnabled, hotspotReason, hotspotSent, hotspotReceived, trafficSummary, protectionDegraded,
-                core ? coreSession : "", notificationRecovery && notificationHeartbeat),
+                core ? coreSession : "", notificationRecovery && notificationHeartbeat, trafficSummary && appTraffic),
             TcpKeepAlive.parse(output), new WebRtcStatus(webRtcAvailable || webRtcRules, webRtcRules,
                 (webRtcAvailable || webRtcRules) && webRtcConfigured,
                 (webRtcAvailable || webRtcRules) && core && webRtcActive, core && webRtcPending,

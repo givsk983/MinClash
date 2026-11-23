@@ -465,11 +465,11 @@ public final class MainActivity extends ThemedActivity {
         add(notificationControls, label("显示连接与网速，点模式或节点名即可切换。", 13, MUTED, false), 10);
         LinearLayout notificationPosition = card(notificationPage, 14);
         add(notificationPosition, label("通知显示位置", 17, TEXT, true), 0);
-        add(notificationPosition, label("默认采用常规优先级、静音常驻，减少被归到底部的情况。网速刷新保持原时间，不反复抢位；最终顺序由系统决定。", 13, MUTED, false), 8);
+        add(notificationPosition, label("默认以较高优先级静音常驻。网速最多每 9 秒更新一次，通知保持原时间。切换模式或节点会及时显示，排列顺序由系统决定。", 13, MUTED, false), 8);
         Button notificationSettings = button("系统通知设置", false);
         notificationSettings.setOnClickListener(view -> openControlNotificationSettings());
         add(notificationPosition, notificationSettings, 12);
-        add(notificationPosition, label("已在系统手动调整过的通知设置会保留，可在这里检查重要程度与显示方式。", 12, MUTED, false), 8);
+        add(notificationPosition, label("已手动调整的通知设置会保留。若手机提供置顶或重要显示选项，可在这里开启。", 12, MUTED, false), 8);
         LinearLayout notificationPermissions = card(notificationPage, 14);
         add(notificationPermissions, label("快捷控制与后台权限", 17, TEXT, true), 0);
         backgroundPermissionButton = button("后台运行设置", false);

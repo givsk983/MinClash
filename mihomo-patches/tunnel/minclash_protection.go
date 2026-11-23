@@ -2,14 +2,21 @@ package tunnel
 
 import (
 	"errors"
+	"sync/atomic"
+	"time"
 
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/protection"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 )
+
+const minclashUnknownOriginLogInterval = 30 * time.Second
 
 var minclashVerifySocketUID = process.MinClashVerifiedSocketUID
 var errMinClashOriginUnknown = errors.New("MINCLASH_ORIGIN_UNKNOWN")
+var minclashOriginLogStart = time.Now()
+var minclashNextOriginLog atomic.Int64
 
 type minclashPacket struct {
 	C.PacketAdapter
@@ -24,6 +31,7 @@ func minclashIsolatePacket(p C.PacketAdapter) C.PacketAdapter {
 	m := p.Metadata().Clone()
 	m.MinClashIdentified = false
 	m.MinClashProtected = false
+	m.MinClashTrafficUID = 0
 	return &minclashPacket{p, m}
 }
 
@@ -33,11 +41,17 @@ func minclashIdentify(m *C.Metadata) error {
 	}
 	uid := minclashVerifySocketUID(m)
 	if uid == 0 {
+		now := int64(time.Since(minclashOriginLogStart))
+		next := minclashNextOriginLog.Load()
+		if now >= next && minclashNextOriginLog.CompareAndSwap(next, now+int64(minclashUnknownOriginLogInterval)) {
+			log.Infoln("%s", errMinClashOriginUnknown)
+		}
 		return errMinClashOriginUnknown
 	}
 	m.Uid = uid
 	m.MinClashIdentified = true
 	m.MinClashProtected = false
+	m.MinClashTrafficUID = uid
 	for _, app := range protection.Runtime.Apps {
 		if app.UID == uid {
 			m.MinClashProtected = true
@@ -46,6 +60,12 @@ func minclashIdentify(m *C.Metadata) error {
 		}
 	}
 	return nil
+}
+
+func minclashIdentifyTCPTraffic(m *C.Metadata) {
+	if m.Type == C.TUN && !m.MinClashIdentified {
+		m.MinClashTrafficUID = minclashVerifySocketUID(m)
+	}
 }
 
 // Only trust an identity verified at ingress, before metadata rewriting.

@@ -16,7 +16,8 @@ public final class NotificationLifecycleCheck {
         }
         durablePreference();
         sessionLifetime();
-        System.out.println("PASS: legacy opt-in, atomic cross-process preference, failed writes, restart/stop grace.");
+        notificationUpdates();
+        System.out.println("PASS: legacy opt-in, atomic cross-process preference, restart/stop grace and rate-limited notification updates.");
     }
 
     private static void durablePreference() throws Exception {
@@ -82,6 +83,16 @@ public final class NotificationLifecycleCheck {
             "boot and sticky recreation allow the module time to start");
         require(session.shouldStop(true, 181000), "restoration grace is bounded");
         require(!session.shouldStop(false, 181001), "network recovery retains controls");
+    }
+
+    private static void notificationUpdates() {
+        NotificationLifetime session = new NotificationLifetime();
+        session.posted(100);
+        require(!session.canUpdate(false, 3100) && !session.canUpdate(false, 9099), "display changes wait for the update interval");
+        require(session.canUpdate(false, 9100), "gradual changes become visible after the interval");
+        require(session.canUpdate(true, 3100), "connection and quick controls changes can post immediately");
+        session.posted(3100);
+        require(!session.canUpdate(false, 9100) && session.canUpdate(false, 12100), "the interval follows the last actual post");
     }
 
     private static void require(boolean condition, String message) {

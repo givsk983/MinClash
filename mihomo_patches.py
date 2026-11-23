@@ -14,6 +14,26 @@ def apply(source):
     replace("tunnel/statistic/manager.go", "return m.memory", "return m.memory.Load()")
     replace("tunnel/statistic/manager.go", "Memory:        m.memory,", "Memory:        m.memory.Load(),")
     replace("tunnel/statistic/manager.go", "m.memory = stat.RSS", "m.memory.Store(stat.RSS)")
+    replace("tunnel/statistic/manager.go", "connections   xsync.Map[string, Tracker]",
+            "connections   xsync.Map[string, Tracker]\n\tappTraffic    appTrafficStore")
+    replace("tunnel/statistic/manager.go", "func (m *Manager) ResetStatistic() {",
+            "func (m *Manager) ResetStatistic() {\n\tm.resetAppTraffic()")
+    tracker = "tunnel/statistic/tracker.go"
+    replace(tracker, "manager *Manager\n\n\tpushToManager",
+            "manager    *Manager\n\tappTraffic *appTrafficCounter\n\n\tpushToManager", count=2)
+    replace(tracker, "\tmetadata.RemoteDst = conn.RemoteDestination()", '''\tmetadata.RemoteDst = conn.RemoteDestination()
+\tappTraffic := manager.tunAppTraffic(metadata, pushToManager)
+\tappTraffic.addUpload(uploadTotal)
+\tappTraffic.addDownload(downloadTotal)''', count=2)
+    replace(tracker, "\t\tpushToManager: pushToManager,",
+            "\t\tpushToManager: pushToManager,\n\t\tappTraffic:    appTraffic,", count=2)
+    for receiver, direction, count in [("tt", "Upload", 2), ("tt", "Download", 2),
+                                       ("ut", "Upload", 1), ("ut", "Download", 2)]:
+        total = f"{receiver}.{direction}Total.Add({direction.lower()})"
+        app_total = f"{receiver}.appTraffic.add{direction}({direction.lower()})"
+        replace(tracker, f"\n\t{total}", f"\n\t{app_total}\n\t{total}", count=count)
+        if receiver == "tt":  # unwrap keeps the zero-copy paths counted too
+            replace(tracker, f"\n\t\t{total}", f"\n\t\t{app_total}\n\t\t{total}")
 
     replace("main.go", '"github.com/metacubex/mihomo/component/age"',
             '"github.com/metacubex/mihomo/component/age"\n "github.com/metacubex/mihomo/component/protection"')
@@ -25,7 +45,10 @@ def apply(source):
  }
  if err := protection.LoadRuntime(); err != nil { fmt.Fprintln(os.Stderr, "invalid protection policy:", err); os.Exit(1) }
 ''')
-    replace("constant/metadata.go", 'type Metadata struct {', 'type Metadata struct {\n MinClashProtected bool `json:"-"`\n MinClashIdentified bool `json:"-"`')
+    replace("constant/metadata.go", 'type Metadata struct {', '''type Metadata struct {
+\tMinClashProtected  bool   `json:"-"`
+\tMinClashIdentified bool   `json:"-"`
+\tMinClashTrafficUID uint32 `json:"-"`''')
     replace("component/process/process_linux.go",
             "func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uint32, inode uint32, err error) {",
             "func querySocketByNetlink(network string, ip netip.Addr, srcPort int) ([]netlink.Message, error) {")
@@ -77,9 +100,17 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
 		return
 	}
 	if !metadata.Valid() {''')
+    replace("tunnel/tunnel.go", '''\tfixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
+
+\tpreHandleFailed := false''', '''\tminclashIdentifyTCPTraffic(metadata)
+\tfixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
+
+\tpreHandleFailed := false''')
     replace("tunnel/tunnel.go", '''					} else {
 						metadata.Process = filepath.Base(path)''', '''					} else if !metadata.MinClashIdentified || metadata.Uid == uid {
 						metadata.Process = filepath.Base(path)''')
+    replace("tunnel/tunnel.go", 'func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {\n\tswitch {\n\tcase metadata.SpecialProxy != "":',
+            'func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {\n\tswitch {\n\tcase metadata.SpecialProxy != "" || metadata.MinClashProtected:')
     replace("tunnel/tunnel.go", 'func handleUDPConn(packet C.PacketAdapter) {', '''func handleUDPConn(packet C.PacketAdapter) {
  if minclashRejectWebRTCUDP(packet) {
    packet.Drop()
@@ -141,18 +172,60 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
 \t}
 \tvar nextProtos []string''')
 
+    # One resolver is registered for network changes. Its transports can be shared
+    # across the primary, direct, proxy-server, fallback and policy resolvers.
+    replace("dns/resolver.go", '\tdefaultResolver       *Resolver',
+            '\tdefaultResolver       *Resolver\n\tresetClients          []dnsClient')
+    replace("dns/resolver.go", '''		for _, c := range r.main {
+			c.ResetConnection()
+		}
+		for _, c := range r.fallback {
+			c.ResetConnection()
+		}''', '''		if r.resetClients != nil {
+			for _, c := range r.resetClients {
+				c.ResetConnection()
+			}
+		} else {
+			for _, c := range r.main {
+				c.ResetConnection()
+			}
+			for _, c := range r.fallback {
+				c.ResetConnection()
+			}
+		}''')
+    replace("dns/resolver.go", 'func (rs Resolvers) ResetConnection() {\n',
+            '''func (rs Resolvers) ResetConnection() {
+	if rs.Resolver != nil && rs.Resolver.resetClients != nil {
+		rs.Resolver.ResetConnection()
+		return
+	}
+''')
+    replace("dns/resolver.go", '\tcacheTransform := func(nameserver []NameServer) (result []dnsClient) {',
+            '\tresetClients := make([]dnsClient, 0)\n\tcacheTransform := func(nameserver []NameServer) (result []dnsClient) {')
+    replace("dns/resolver.go", '\t\t\t\tdc = built[0]',
+            '\t\t\t\tdc = built[0]\n\t\t\t\tresetClients = append(resetClients, dc)')
+    replace("dns/resolver.go", '\treturn\n}\n\nvar ParseNameServer',
+            '\tr.resetClients = resetClients\n\treturn\n}\n\nvar ParseNameServer')
+    replace("dns/dhcp.go", 'func (d *dhcpClient) ResetConnection() {\n\tfor _, client := range d.clients {',
+            '''func (d *dhcpClient) ResetConnection() {
+	d.lock.Lock()
+	clients := d.clients
+	d.lock.Unlock()
+	for _, client := range clients {''')
+
     # Android hands off by changing IP policy rules even when both links stay up.
     tun = "vendor/github.com/metacubex/sing-tun/"
     replace(tun + "monitor_linux.go", 'func (m *networkUpdateMonitor) Start() error {', '''func (m *networkUpdateMonitor) Start() error {
 	if runtime.GOOS == "android" {
 		return m.startMinClashAndroidMonitor()
 	}''')
-    replace(tun + "monitor_shared.go", '\t"errors"', '\t"errors"\n\t"runtime"')
+    replace(tun + "monitor_shared.go", '\t"errors"', '\t"errors"\n\t"net/netip"\n\t"runtime"')
     replace(tun + "monitor_shared.go", '\tnoRoute               atomic.Bool',
             '\tnoRoute               atomic.Bool\n\tandroidUplink         string\n\tandroidTunTable       int\n\tandroidFamilies       atomic.Pointer[androidUplinkInterfaces]')
     replace(tun + "monitor_shared.go", 'type defaultInterfaceMonitor struct {', '''type androidUplinkInterfaces struct {
 	ipv4, ipv6 *control.Interface
 	ipv4Blocked, ipv6Blocked bool
+	fallbackPrefixes []netip.Prefix
 }
 
 type defaultInterfaceMonitor struct {''')
@@ -164,9 +237,9 @@ type defaultInterfaceMonitor struct {''')
             'OverrideAndroidVPN: overrideAndroidVPN, MinClashTunTable: tableIndex})')
     replace("listener/sing_tun/server.go", '\tif netInterface := d.defaultInterfaceMonitor.DefaultInterface(); netInterface != nil {', '''	if destination.IsValid() && !destination.IsUnspecified() {
 		if monitor, ok := d.defaultInterfaceMonitor.(interface {
-			DefaultInterfaceForFamily(bool) (*control.Interface, bool)
+			DefaultInterfaceForDestination(netip.Addr) (*control.Interface, bool)
 		}); ok {
-			netInterface, blocked := monitor.DefaultInterfaceForFamily(destination.Unmap().Is6())
+			netInterface, blocked := monitor.DefaultInterfaceForDestination(destination.Unmap())
 			if blocked {
 				return "<invalid>"
 			}

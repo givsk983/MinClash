@@ -54,6 +54,12 @@ func TestMinClashProtectedPrecedesModes(t *testing.T) {
 			if err := minclashIdentify(m); err != nil {
 				t.Fatal(err)
 			}
+			if network == C.TCP {
+				minclashIdentifyTCPTraffic(m)
+			}
+			if m.MinClashTrafficUID != 10123 {
+				t.Fatal("the verified ingress UID was not retained for accounting")
+			}
 			m.DstIP = netip.Addr{} // Fake-IP / sniffing may replace the original target.
 			p, _, err := resolveMetadata(m)
 			if err != nil || p != direct || !m.MinClashProtected {
@@ -68,9 +74,18 @@ func TestMinClashProtectedPrecedesModes(t *testing.T) {
 		t.Fatal("verified origins were resolved again after ingress")
 	}
 	minclashVerifySocketUID = func(*C.Metadata) uint32 { return 0 }
+	previousLogDeadline := minclashNextOriginLog.Swap(0)
+	defer minclashNextOriginLog.Store(previousLogDeadline)
 	missing := &C.Metadata{Type: C.TUN, Uid: 10123}
 	if err := minclashIdentify(missing); !errors.Is(err, errMinClashOriginUnknown) {
 		t.Fatal("unverified metadata was accepted at ingress")
+	}
+	logDeadline := minclashNextOriginLog.Load()
+	if logDeadline == 0 {
+		t.Fatal("first rejection did not mark the origin diagnostic")
+	}
+	if err := minclashIdentify(missing); !errors.Is(err, errMinClashOriginUnknown) || minclashNextOriginLog.Load() != logDeadline {
+		t.Fatal("repeated rejection did not respect the diagnostic rate limit")
 	}
 	if _, _, err := resolveMetadata(missing); !errors.Is(err, errMinClashOriginUnknown) {
 		t.Fatal("unverified metadata reached ordinary routing")
@@ -78,5 +93,28 @@ func TestMinClashProtectedPrecedesModes(t *testing.T) {
 	protection.Runtime.Apps = nil
 	if _, handled, err := minclashResolve(&C.Metadata{Type: C.TUN}); handled || err != nil {
 		t.Fatal("off changed routing")
+	}
+}
+
+func TestMinClashOrdinaryAccountingDoesNotTrustMetadataUID(t *testing.T) {
+	oldPolicy, oldVerify := protection.Runtime, minclashVerifySocketUID
+	t.Cleanup(func() {
+		protection.Runtime = oldPolicy
+		minclashVerifySocketUID = oldVerify
+	})
+	protection.Runtime.Apps = nil
+	lookups := 0
+	minclashVerifySocketUID = func(*C.Metadata) uint32 {
+		lookups++
+		return 10123
+	}
+	tcp := &C.Metadata{Type: C.TUN, NetWork: C.TCP, Uid: 10222}
+	minclashIdentifyTCPTraffic(tcp)
+	if tcp.MinClashTrafficUID != 10123 || tcp.Uid != 10222 || tcp.MinClashIdentified {
+		t.Fatal("accounting did not preserve independence from traffic routing")
+	}
+	udp := &C.Metadata{Type: C.TUN, NetWork: C.UDP, Uid: 10222}
+	if err := minclashIdentify(udp); err != nil || udp.MinClashTrafficUID != 0 || lookups != 1 {
+		t.Fatal("ordinary UDP did not retain unverified attribution")
 	}
 }

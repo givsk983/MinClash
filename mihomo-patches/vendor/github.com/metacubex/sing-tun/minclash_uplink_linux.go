@@ -3,6 +3,7 @@ package tun
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -103,12 +104,13 @@ func (m *networkUpdateMonitor) readMinClashAndroidUplink(socket *nl.NetlinkSocke
 const (
 	androidNetIDMask     = 0xffff
 	androidExplicitNetID = 0x10000
+	androidProtectedVPN  = 0x20000
 )
 
 type minclashAndroidTables struct {
 	ipv4, ipv6, vpnTable     int
 	ipv4Blocked, ipv6Blocked bool
-	vpnEnabled               bool
+	vpnEnabled, vpnRulesSeen bool
 }
 
 func (tables minclashAndroidTables) tableFor(family int) int {
@@ -148,10 +150,13 @@ func minclashAndroidDefaultTables(rules []netlink.Rule, routes []netlink.Route, 
 		if rule.Table <= 0 || rule.Table == tunTable {
 			continue
 		}
-		if rule.Mask == 0x20000 && rule.UIDRange != nil {
+		if rule.UIDRange != nil && (rule.Mask == androidProtectedVPN || rule.Mask == androidProtectedVPN|androidExplicitNetID) {
+			tables.vpnRulesSeen = true
+		}
+		if rule.Mask == androidProtectedVPN && rule.UIDRange != nil {
 			tables.vpnEnabled = true
 			if overrideVPN {
-				return minclashAndroidTables{vpnTable: rule.Table, vpnEnabled: true}
+				return minclashAndroidTables{vpnTable: rule.Table, vpnEnabled: true, vpnRulesSeen: true}
 			}
 		}
 		if minclashAndroidRuleKind(rule) != androidNetIDMask || tables.tableFor(rule.Family) != 0 {
@@ -214,6 +219,53 @@ func minclashAndroidFamilyLinks(routes []netlink.Route, tables minclashAndroidTa
 		ipv6 = route.LinkIndex
 	}
 	return ipv4, ipv6
+}
+
+func minclashAndroidPhysicalFallbacks(routes []netlink.Route, tables minclashAndroidTables, tunTable int, usableLink func(int) bool) []netlink.Route {
+	var fallbacks []netlink.Route
+	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
+		if tables.tableFor(family) != 0 {
+			continue
+		}
+		var candidate netlink.Route
+		for _, route := range routes {
+			if route.Family != family || route.Table == tunTable || route.Table == unix.RT_TABLE_LOCAL ||
+				!minclashAndroidDefaultRoute(route) || !usableLink(route.LinkIndex) {
+				continue
+			}
+			if candidate.LinkIndex != 0 && candidate.LinkIndex != route.LinkIndex {
+				candidate = netlink.Route{}
+				break
+			}
+			if candidate.LinkIndex == 0 || route.Priority < candidate.Priority {
+				candidate = route
+			}
+		}
+		if candidate.LinkIndex != 0 {
+			fallbacks = append(fallbacks, candidate)
+		}
+	}
+	return fallbacks
+}
+
+func minclashAndroidScopedFallbacks(routes []netlink.Route, tables minclashAndroidTables, tunTable, linkIndex int) []netip.Prefix {
+	if linkIndex == 0 {
+		return nil
+	}
+	// A link with no default for one family can still carry a specifically routed
+	// destination. Only preserve these routes on the already chosen interface.
+	var prefixes []netip.Prefix
+	for _, route := range routes {
+		if route.LinkIndex != linkIndex || route.Table == tunTable || route.Table == unix.RT_TABLE_LOCAL ||
+			tables.tableFor(route.Family) != 0 || route.Type != unix.RTN_UNICAST ||
+			route.Flags&unix.RTNH_F_LINKDOWN != 0 || minclashAndroidDefaultPrefix(route) {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(route.Dst.String()); err == nil {
+			prefixes = append(prefixes, prefix)
+		}
+	}
+	return prefixes
 }
 
 func minclashAndroidDefaultLink(routes []netlink.Route, overrideVPN bool) int {

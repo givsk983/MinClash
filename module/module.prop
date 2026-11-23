@@ -1,7 +1,7 @@
 id=minclash
 name=MinClash Root TUN
-version=0.2.1
-versionCode=32
-revision=22
+version=0.2.3
+versionCode=34
+revision=24
 author=MinClash
-description=Mihomo v1.19.33-minclash.9 ARM64 with hardened app and DNS leak protection.
+description=Mihomo v1.19.33-minclash.11 ARM64 with application protection, network recovery and per-app traffic statistics.

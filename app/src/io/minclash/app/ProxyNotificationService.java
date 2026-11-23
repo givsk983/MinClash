@@ -101,13 +101,17 @@ public final class ProxyNotificationService extends Service {
     }
 
     private static boolean isRunning(Context context) {
+        return activeNotification(context) != null;
+    }
+
+    private static Notification activeNotification(Context context) {
         // Static fields belong to the caller's process, not necessarily the service's.
         for (android.service.notification.StatusBarNotification item :
                 context.getSystemService(NotificationManager.class).getActiveNotifications()) {
             if (item.getId() == NOTIFICATION_ID && item.getTag() == null
-                && (item.getNotification().flags & Notification.FLAG_FOREGROUND_SERVICE) != 0) return true;
+                && (item.getNotification().flags & Notification.FLAG_FOREGROUND_SERVICE) != 0) return item.getNotification();
         }
-        return false;
+        return null;
     }
 
     static Intent overlaySettings(Context context) {
@@ -190,10 +194,12 @@ public final class ProxyNotificationService extends Service {
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         // Also runs for a null intent when Android recreates this sticky foreground service.
         if (current == null) {
-            notificationSince = System.currentTimeMillis();
+            Notification previous = activeNotification(this);
+            notificationSince = previous != null && previous.when > 0 ? previous.when : System.currentTimeMillis();
             Connection starting = new Connection("代理模式", "正在读取连接…", false, false, false);
             current = new Sample(starting, "MinClash", starting.node(), Speed.UNKNOWN, Settings.canDrawOverlays(this));
             startForeground(NOTIFICATION_ID, notification());
+            lifetime.posted(SystemClock.elapsedRealtime());
             main.post(poll);
         }
         // Satisfy startForegroundService even if the user disabled controls during startup.
@@ -223,7 +229,10 @@ public final class ProxyNotificationService extends Service {
         // The launcher task can disappear while this foreground process continues running.
         closePanel();
         if (enabled(this) && canShow(this) && current != null) {
-            startForeground(NOTIFICATION_ID, notification());
+            if (!isRunning(this)) {
+                startForeground(NOTIFICATION_ID, notification());
+                lifetime.posted(SystemClock.elapsedRealtime());
+            }
             requestRefresh();
         }
         super.onTaskRemoved(rootIntent);
@@ -257,11 +266,16 @@ public final class ProxyNotificationService extends Service {
                 boolean followUp = refreshGate.finish();
                 if (!sample.overlayAllowed() || sample.connection().inactive()
                     || !getSystemService(PowerManager.class).isInteractive()) closePanel();
-                if (lifetime.shouldStop(sample.connection().inactive(), SystemClock.elapsedRealtime())) { stopSelf(); return; }
-                if (sample.overlayAllowed() != current.overlayAllowed()) overlayFailed = false;
-                if (!sample.equals(current)) {
+                long now = SystemClock.elapsedRealtime();
+                if (lifetime.shouldStop(sample.connection().inactive(), now)) { stopSelf(); return; }
+                boolean permissionChanged = sample.overlayAllowed() != current.overlayAllowed();
+                boolean connectionChanged = !sample.connection().equals(current.connection());
+                if (permissionChanged) overlayFailed = false;
+                // Speeds, foreground app names and their outlets can change every sample.
+                // Limit reposts while keeping actual status and control changes responsive.
+                if (!sample.equals(current) && lifetime.canUpdate(permissionChanged || connectionChanged, now)) {
                     current = sample;
-                    manager.notify(NOTIFICATION_ID, notification());
+                    publishNotification();
                 }
                 if (followUp) { main.removeCallbacks(poll); main.post(poll); }
                 else schedulePoll();
@@ -387,6 +401,11 @@ public final class ProxyNotificationService extends Service {
         return builder.build();
     }
 
+    private void publishNotification() {
+        manager.notify(NOTIFICATION_ID, notification());
+        lifetime.posted(SystemClock.elapsedRealtime());
+    }
+
     private PendingIntent openPicker(boolean mode) {
         Intent intent = current.overlayAllowed() && !overlayFailed ? new Intent(this, ProxyOverlayLauncher.class)
             .putExtra(EXTRA_MODE_PANEL, mode)
@@ -417,7 +436,7 @@ public final class ProxyNotificationService extends Service {
             panel = next;
             if (overlayFailed) {
                 overlayFailed = false;
-                manager.notify(NOTIFICATION_ID, notification());
+                publishNotification();
             }
         } catch (WindowManager.BadTokenException | WindowManager.InvalidDisplayException | SecurityException error) {
             Log.w("MinClash", "Cannot show proxy overlay", error);
@@ -428,7 +447,7 @@ public final class ProxyNotificationService extends Service {
     private void reportOverlayFailure(String message) {
         if (!overlayFailed) {
             overlayFailed = true;
-            manager.notify(NOTIFICATION_ID, notification());
+            publishNotification();
         }
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
     }

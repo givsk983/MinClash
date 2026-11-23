@@ -1,6 +1,9 @@
 package io.minclash.app;
 
+import android.app.AlertDialog;
 import android.content.Context;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.graphics.Canvas;
 import android.graphics.DashPathEffect;
 import android.graphics.Insets;
@@ -13,32 +16,61 @@ import android.os.SystemClock;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.widget.AdapterView;
+import android.widget.BaseAdapter;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 public final class TrafficActivity extends ThemedActivity {
     private static final long RECENT_MS = 60_000;
     private static final DateTimeFormatter HISTORY_DATE = DateTimeFormatter.ofPattern("MM-dd");
+    private static final int APP_PREVIEW_LIMIT = 8;
     private final TrafficMonitor.Observer observer = this::bind;
     private final TextView[] values = new TextView[6];
     private final TextView[] dailyValues = new TextView[DailyTraffic.DAYS];
     private final TextView[] dailyDates = new TextView[DailyTraffic.DAYS];
-    private List<DailyTraffic.Day> displayedDaily = List.of();
+    private List<DailyTraffic.Day> displayedDaily = Collections.emptyList();
+    private List<AppDailyTraffic.Day> displayedAppDaily = Collections.emptyList();
+    private List<LocalDate> appDates = Collections.emptyList();
+    private final Map<Integer, Owner> appOwners = new HashMap<>();
     private AppUi ui;
     private TextView status;
     private Chart chart;
     private Spinner range;
+    private Spinner appRange;
+    private LinearLayout appRows;
+    private TextView appHistoryMessage;
+    private Button allApps;
+    private int appSelection;
+    private boolean appTrafficSupported;
+    private AppIconLoader appIcons;
+    private AlertDialog appHistoryDialog;
+
+    private record Owner(String label, String packageName, long installed) {}
+    private record AppRow(int uid, String label, String packageName) {}
+    private record AppRowViews(ImageView icon, TextView name, TextView amount) {}
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         ui = new AppUi(this);
+        appIcons = new AppIconLoader(this);
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(AppUi.BG);
         scroll.setFillViewport(true);
@@ -122,12 +154,14 @@ public final class TrafficActivity extends ThemedActivity {
             row.addView(dailyValues[i], new LinearLayout.LayoutParams(0, -2, 1));
             ui.add(history, row, 12);
         }
+        addAppHistory(history, state);
         ui.add(body, history, 14);
         setContentView(scroll);
     }
 
     @Override protected void onSaveInstanceState(Bundle state) {
         state.putInt("traffic_range", range.getSelectedItemPosition());
+        state.putInt("app_traffic_range", appSelection);
         super.onSaveInstanceState(state);
     }
 
@@ -143,12 +177,24 @@ public final class TrafficActivity extends ThemedActivity {
 
     @Override protected void onResume() {
         super.onResume();
+        appIcons.observe(this::refreshAppIcons);
+        appIcons.invalidate();
+        appOwners.clear();
+        if (!displayedAppDaily.isEmpty()) renderAppHistory();
+        if (appHistoryDialog != null) refreshAppIcons();
         TrafficMonitor.INSTANCE.observe(this, observer, true);
     }
 
     @Override protected void onPause() {
         TrafficMonitor.INSTANCE.stopObserving(observer);
+        appIcons.stopObserving();
         super.onPause();
+    }
+
+    @Override protected void onDestroy() {
+        if (appHistoryDialog != null) appHistoryDialog.dismiss();
+        appIcons.close();
+        super.onDestroy();
     }
 
     private void bind(TrafficMonitor.Reading reading, TrafficMonitor.Rate rate) {
@@ -175,6 +221,184 @@ public final class TrafficActivity extends ThemedActivity {
                 : "↑ " + SubscriptionUsage.bytes(total.upload()) + "    ↓ " + SubscriptionUsage.bytes(total.download()));
         }
         displayedDaily = recent;
+        List<AppDailyTraffic.Day> recentApps = TrafficMonitor.INSTANCE.appDaily();
+        boolean appSupport = TrafficMonitor.INSTANCE.supportsAppTraffic();
+        if (!displayedAppDaily.equals(recentApps) || appTrafficSupported != appSupport) {
+            displayedAppDaily = recentApps;
+            appTrafficSupported = appSupport;
+            List<LocalDate> dates = new ArrayList<>(recentApps.size());
+            for (AppDailyTraffic.Day day : recentApps) dates.add(day.date());
+            if (!appDates.equals(dates)) {
+                appDates = dates;
+                String[] choices = new String[dates.size() + 1];
+                choices[0] = "近 7 天合计";
+                for (int i = 0; i < dates.size(); i++) choices[i + 1] = dates.get(i).format(HISTORY_DATE) + (i == 0 ? " 今天" : "");
+                appRange.setAdapter(ui.spinner(choices));
+                appRange.setSelection(Math.min(appSelection, dates.size()));
+            }
+            renderAppHistory();
+        }
+    }
+
+    private void addAppHistory(LinearLayout history, Bundle state) {
+        TextView heading = ui.label("按应用查看流量", 15, AppUi.TEXT, true);
+        heading.setAccessibilityHeading(true);
+        ui.add(history, heading, 20);
+        appSelection = state == null ? 0 : state.getInt("app_traffic_range");
+        appRange = new Spinner(this);
+        appRange.setContentDescription("应用流量日期");
+        appRange.setMinimumHeight(ui.dp(48));
+        appRange.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                appSelection = position;
+                renderAppHistory();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        ui.add(history, appRange, 6);
+        appHistoryMessage = ui.label("正在读取应用流量", 12, AppUi.MUTED, false);
+        ui.add(history, appHistoryMessage, 4);
+        appRows = ui.column();
+        ui.add(history, appRows, 0);
+        allApps = ui.button("查看全部应用");
+        allApps.setVisibility(View.GONE);
+        ui.add(history, allApps, 8);
+    }
+
+    private void renderAppHistory() {
+        Map<AppRow, DailyTraffic.Totals> totals = new LinkedHashMap<>();
+        LocalDate selected = appSelection > 0 && appSelection <= appDates.size() ? appDates.get(appSelection - 1) : null;
+        ZoneId zone = ZoneId.systemDefault();
+        for (AppDailyTraffic.Day day : displayedAppDaily) {
+            if (selected != null && !selected.equals(day.date())) continue;
+            long dayStart = day.date().atStartOfDay(zone).toInstant().toEpochMilli();
+            day.totals().forEach((uid, usage) -> {
+                Owner owner = appOwners.computeIfAbsent(uid, this::trafficOwner);
+                // A newly installed package may have inherited a UID used earlier that day.
+                AppRow key = owner.installed() > dayStart ? new AppRow(uid, "来源未识别 · UID " + uid, "")
+                    : new AppRow(uid, owner.label(), owner.packageName());
+                totals.merge(key, usage, (left, right) -> new DailyTraffic.Totals(
+                    addBytes(left.upload(), right.upload()), addBytes(left.download(), right.download())));
+            });
+        }
+        var sorted = new ArrayList<>(totals.entrySet());
+        sorted.sort(Comparator.<Map.Entry<AppRow, DailyTraffic.Totals>>comparingLong(
+            entry -> addBytes(entry.getValue().upload(), entry.getValue().download())).reversed()
+            .thenComparing(entry -> entry.getKey().label()).thenComparingInt(entry -> entry.getKey().uid()));
+        Map<String, Integer> nameCounts = new HashMap<>();
+        for (var entry : sorted) nameCounts.merge(entry.getKey().label(), 1, Integer::sum);
+        appRows.removeAllViews();
+        setText(appHistoryMessage, sorted.isEmpty()
+            ? appTrafficSupported ? "暂无应用流量记录，使用 TUN 后会逐步显示。" : "更新内置模块并重启后，可开始记录应用流量。"
+            : "应用流量从启用新版模块后记录，未能确认归属的流量单独显示。");
+        for (int i = 0; i < Math.min(sorted.size(), APP_PREVIEW_LIMIT); i++) {
+            LinearLayout row = createAppRow();
+            bindAppRow(row, sorted.get(i), nameCounts);
+            ui.add(appRows, row, 11);
+        }
+        boolean more = sorted.size() > APP_PREVIEW_LIMIT;
+        allApps.setVisibility(more ? View.VISIBLE : View.GONE);
+        allApps.setOnClickListener(more ? view -> showAllApps(sorted, nameCounts) : null);
+    }
+
+    private LinearLayout createAppRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setMinimumHeight(ui.dp(40));
+        ImageView icon = new ImageView(this);
+        icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        icon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        LinearLayout.LayoutParams iconSize = new LinearLayout.LayoutParams(ui.dp(32), ui.dp(32));
+        iconSize.setMarginEnd(ui.dp(9));
+        row.addView(icon, iconSize);
+        TextView name = ui.label("", 13, AppUi.TEXT, true);
+        name.setMaxLines(2);
+        name.setEllipsize(TextUtils.TruncateAt.END);
+        row.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView amount = ui.label("", 12, AppUi.MUTED, false);
+        amount.setPaddingRelative(ui.dp(8), 0, 0, 0);
+        amount.setGravity(Gravity.END);
+        row.addView(amount, new LinearLayout.LayoutParams(-2, -2));
+        row.setTag(new AppRowViews(icon, name, amount));
+        return row;
+    }
+
+    private void bindAppRow(View row, Map.Entry<AppRow, DailyTraffic.Totals> entry, Map<String, Integer> nameCounts) {
+        AppRowViews views = (AppRowViews) row.getTag();
+        views.name().setText(appRowLabel(entry.getKey(), nameCounts));
+        views.amount().setText(appUsage(entry.getValue()));
+        views.icon().setTag(entry.getKey().packageName());
+        refreshAppIcon(row);
+    }
+
+    private void refreshAppIcon(View row) {
+        if (!(row.getTag() instanceof AppRowViews views)) return;
+        String packageName = (String) views.icon().getTag();
+        AppIconLoader.Result result = packageName.isEmpty() ? null : appIcons.get(packageName);
+        if (result == null && !packageName.isEmpty()) appIcons.request(packageName, false);
+        if (result != null && result.bitmap() != null) views.icon().setImageBitmap(result.bitmap());
+        else views.icon().setImageResource(android.R.drawable.sym_def_app_icon);
+    }
+
+    private void refreshAppIcons() {
+        for (int i = 0; i < appRows.getChildCount(); i++) refreshAppIcon(appRows.getChildAt(i));
+        if (appHistoryDialog == null) return;
+        ListView list = appHistoryDialog.getListView();
+        if (list == null) return;
+        for (int i = 0; i < list.getChildCount(); i++) refreshAppIcon(list.getChildAt(i));
+    }
+
+    private void showAllApps(List<Map.Entry<AppRow, DailyTraffic.Totals>> entries, Map<String, Integer> nameCounts) {
+        BaseAdapter adapter = new BaseAdapter() {
+            @Override public int getCount() { return entries.size(); }
+            @Override public Map.Entry<AppRow, DailyTraffic.Totals> getItem(int position) { return entries.get(position); }
+            @Override public long getItemId(int position) { return position; }
+            @Override public View getView(int position, View recycled, ViewGroup parent) {
+                View row = recycled;
+                if (row == null) {
+                    row = createAppRow();
+                    row.setPaddingRelative(ui.dp(22), ui.dp(6), ui.dp(22), ui.dp(6));
+                }
+                bindAppRow(row, getItem(position), nameCounts);
+                return row;
+            }
+        };
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("应用流量")
+            .setAdapter(adapter, null).setPositiveButton("关闭", null).create();
+        dialog.setOnDismissListener(closed -> {
+            if (appHistoryDialog == dialog) appHistoryDialog = null;
+        });
+        appHistoryDialog = dialog;
+        dialog.show();
+    }
+
+    private Owner trafficOwner(int uid) {
+        if (uid == AppDailyTraffic.UNKNOWN_UID) return new Owner("来源未识别", "", 0);
+        PackageManager packages = getPackageManager();
+        try {
+            String[] names = packages.getPackagesForUid(uid);
+            if (names != null && names.length > 1) return new Owner("共享 UID " + uid, "", 0);
+            if (names != null && names.length == 1) {
+                PackageInfo info = packages.getPackageInfo(names[0], 0);
+                if (info.applicationInfo != null && info.applicationInfo.uid == uid) {
+                    return new Owner(info.applicationInfo.loadLabel(packages).toString(), names[0], info.firstInstallTime);
+                }
+            }
+        } catch (PackageManager.NameNotFoundException | SecurityException ignored) { }
+        return new Owner("来源未识别 · UID " + uid, "", 0);
+    }
+
+    private static String appRowLabel(AppRow row, Map<String, Integer> nameCounts) {
+        if (nameCounts.getOrDefault(row.label(), 0) < 2) return row.label();
+        return row.label() + "\n" + (row.packageName().isEmpty() ? "UID " + row.uid() : row.packageName());
+    }
+
+    private static long addBytes(long left, long right) {
+        return left > Long.MAX_VALUE - right ? Long.MAX_VALUE : left + right;
+    }
+
+    private static String appUsage(DailyTraffic.Totals usage) {
+        return "↑ " + SubscriptionUsage.bytes(usage.upload()) + "   ↓ " + SubscriptionUsage.bytes(usage.download());
     }
 
     private static void setText(TextView view, String value) {

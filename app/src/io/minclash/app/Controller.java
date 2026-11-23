@@ -46,7 +46,13 @@ final class Controller {
     static JSONObject runtimeSettings() throws Exception { return new JSONObject(request("GET", "/configs", "")); }
 
     static JSONObject trafficStatistics(boolean details) throws Exception {
-        return new JSONObject(probe(details ? "/minclash/statistics?details=1" : "/minclash/statistics"));
+        return trafficStatistics(details, false);
+    }
+
+    static JSONObject trafficStatistics(boolean details, boolean apps) throws Exception {
+        String path = details ? "/minclash/statistics?details=1" : "/minclash/statistics";
+        if (apps) path += details ? "&apps=1" : "?apps=1";
+        return new JSONObject(probe(path));
     }
 
     static long coreMemory() throws Exception {

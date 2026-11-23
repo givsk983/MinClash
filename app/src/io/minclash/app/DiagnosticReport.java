@@ -15,8 +15,9 @@ import java.util.concurrent.TimeUnit;
 record DiagnosticReport(String text) {
     enum Fact {
         IFACE, ROUTE4, ROUTE6, UPLINK4, UPLINK6, APP_REJECT_RULE, LOG_SAMPLE,
-        NODE_DNS, FAKE_DNS_MISSING, GEODATA, PROVIDER, CORE_TLS, TUN_SETUP, BOOT_UPLINK_WAIT, BOOT_UPLINK_RESTART,
-        UPLINK_HANDOFF, CONFIG
+        NODE_DNS, FAKE_DNS_MISSING, PROTECTION_ORIGIN_BLOCK, PROTECTION_OUTBOUND_BLOCK,
+        GEODATA, PROVIDER, CORE_TLS, TUN_SETUP, BOOT_UPLINK_WAIT, BOOT_UPLINK_RESTART,
+        UPLINK_HANDOFF, UPLINK_DEFAULT_LOST, CONFIG
     }
 
     static DiagnosticReport collect(String appVersion, long appCode, int androidApi,
@@ -92,6 +93,13 @@ record DiagnosticReport(String text) {
                 : "NO_KNOWN_APP_REJECT_RULE  未发现已知厂商拒绝规则。")
             .append('\n')
             .append("Root 内核与 App 使用不同 UID；内核能代理，不代表 App 可以下载订阅或检查更新。\n");
+        if (status != null && status.protection) {
+            report.append("\n[PROTECTION] 防泄漏\n")
+                .append(status.runtime.protectionDegraded() ? "PROTECTION_DEGRADED  请到保护页检查状态"
+                    : status.protectionArmed ? "PROTECTION_CONFIGURED  已配置保护"
+                    : "PROTECTION_NOT_REPORTED_ACTIVE  模块未报告保护已启用")
+                .append('\n');
+        }
 
         report.append("\n[FAMILY] 上游路由与固定地址 HTTPS\n")
             .append("IPv4 上游默认路由  ").append(factResult(facts, Fact.UPLINK4)).append('\n')
@@ -155,6 +163,7 @@ record DiagnosticReport(String text) {
         if (status == null) return "ROOT_OR_STATUS_UNAVAILABLE · 检查 Root 授权和模块状态";
         if (!status.installed() || !status.enabled) return "MODULE_INACTIVE · 检查模块是否安装并启用";
         if (!status.profile) return "NO_PROFILE · 导入有效配置";
+        if (status.runtime.protectionDegraded()) return "PROTECTION_DEGRADED · 到保护页检查规则、应用身份及私人 DNS";
         if (!status.state.equals("running")) return "TUN_INACTIVE · 查看模块状态及 CORE 信号";
         if (facts != null && (!facts.contains(Fact.IFACE) || !facts.contains(Fact.ROUTE4))) {
             return "TUN_ROUTE_MISSING · 检查 TUN 接口与 IPv4 路由";
@@ -163,7 +172,22 @@ record DiagnosticReport(String text) {
         if (facts != null && facts.contains(Fact.APP_REJECT_RULE)) {
             return "APP_REJECT_RULE_FOUND · 核对系统是否允许 MinClash 使用 Wi-Fi／移动数据";
         }
-        if (mode == Controller.Mode.DIRECT) return "DIRECT_MODE · 当前模式为直连";
+        if (status.protectionArmed && facts != null) {
+            if (facts.contains(Fact.PROTECTION_ORIGIN_BLOCK)) return "PROTECTION_ORIGIN_BLOCK · 最近有连接因来源不明被保护拦截";
+            if (facts.contains(Fact.PROTECTION_OUTBOUND_BLOCK)) return "PROTECTION_OUTBOUND_BLOCK · 最近有受保护连接的出站被拒绝";
+        }
+        if (mode == Controller.Mode.DIRECT) {
+            for (NetworkCheck target : NetworkCheck.values()) {
+                if (reachable(network, target)) return "DIRECT_HTTPS_OK · 至少一个 HTTPS 探测通过，请核对故障应用的连接";
+            }
+            if (network.values().stream().anyMatch(result -> result.state() == NetworkCheck.State.DNS_ERROR)) {
+                return "DIRECT_DNS_FAILED · 直连探测出现域名解析失败，请检查 DNS";
+            }
+            if (facts != null && facts.contains(Fact.UPLINK_DEFAULT_LOST)) {
+                return "UPLINK_DEFAULT_LOST · 最近失去默认出口，请核对 Wi-Fi 或移动网络";
+            }
+            return "DIRECT_HTTPS_NOT_CONFIRMED · 查看各 HTTPS 与地址族检测结果";
+        }
         if (outlet != null && outlet.state() == Controller.OutletState.HTTPS_FAILED) {
             if (facts != null && facts.contains(Fact.NODE_DNS)) return "NODE_DNS · 内核日志样本出现解析失败";
             return "OUTLET_FAILED · 主代理出口探测失败";

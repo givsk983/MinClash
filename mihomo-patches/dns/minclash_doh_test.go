@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/mihomo/component/ca"
+	D "github.com/miekg/dns"
 )
 
 func TestMinClashDoHIsolatesTLSAndRejectsRedirects(t *testing.T) {
@@ -45,5 +47,54 @@ func TestMinClashDoHIsolatesTLSAndRejectsRedirects(t *testing.T) {
 				t.Fatalf("bootstrap allowed an unexpected target: %v", err)
 			}
 		}
+	}
+}
+
+func TestMinClashDoHResetsEveryTransportOnNetworkChange(t *testing.T) {
+	endpoint := func(name string) NameServer {
+		return NameServer{Net: "https", Addr: "https://" + name + ".invalid/dns-query"}
+	}
+	shared := endpoint("main")
+	shared.MinClashDoHMode = MinClashDoHProtected
+	wrapped := shared
+	wrapped.Params = map[string]string{"disable-ipv6": "true"}
+	r := NewResolver(Config{
+		Default:     []NameServer{endpoint("default")},
+		Main:        []NameServer{shared},
+		Fallback:    []NameServer{endpoint("fallback"), wrapped},
+		Policy:      []Policy{{Domain: "app.invalid", NameServers: []NameServer{endpoint("app-policy")}}},
+		ProxyServer: []NameServer{endpoint("proxy")},
+		ProxyServerPolicy: []Policy{{
+			Domain: "proxy.invalid", NameServers: []NameServer{endpoint("proxy-policy")},
+		}},
+		DirectServer: []NameServer{endpoint("direct")},
+	})
+	if rewrapClient(r.fallback[1], nil) != r.main[0] || len(r.resetClients) != 6 {
+		t.Fatal("a shared resolver transport was not registered exactly once")
+	}
+	transports := map[string]dnsClient{
+		"default":      r.defaultResolver.main[0],
+		"main":         r.main[0],
+		"fallback":     r.fallback[0],
+		"app policy":   r.policy[0].Match("app.invalid")[0],
+		"proxy":        r.ProxyResolver.main[0],
+		"proxy policy": r.ProxyResolver.policy[0].Match("proxy.invalid")[0],
+		"direct":       r.DirectResolver.main[0],
+	}
+	for _, transport := range transports {
+		transport.(*dnsOverHTTPS).client = &http.Client{Transport: &http.Transport{}}
+	}
+	r.cache.SetWithExpire("cached", &D.Msg{}, time.Now().Add(time.Minute))
+
+	// This is the resolver called by the interface monitor on a network change.
+	r.Resolver.ResetConnection()
+
+	for name, transport := range transports {
+		if transport.(*dnsOverHTTPS).client != nil {
+			t.Errorf("%s still has its old connection", name)
+		}
+	}
+	if _, _, ok := r.cache.GetWithExpire("cached"); !ok {
+		t.Error("reset was also applied to the DNS response cache")
 	}
 }

@@ -14,16 +14,22 @@ func minclashStatistics(w http.ResponseWriter, r *http.Request) {
 	manager := statistic.DefaultManager
 	up, down := manager.Total()
 	data := struct {
-		Session       string `json:"session"`
-		UploadTotal   int64  `json:"uploadTotal"`
-		DownloadTotal int64  `json:"downloadTotal"`
-		Connections   *int   `json:"connections,omitempty"`
-		Memory        uint64 `json:"memory,omitempty"`
+		Session       string                       `json:"session"`
+		UploadTotal   int64                        `json:"uploadTotal"`
+		DownloadTotal int64                        `json:"downloadTotal"`
+		Connections   *int                         `json:"connections,omitempty"`
+		Memory        uint64                       `json:"memory,omitempty"`
+		Apps          *[]statistic.AppTrafficTotal `json:"apps,omitempty"`
 	}{Session: minclashSession, UploadTotal: up, DownloadTotal: down}
-	if r.URL.Query().Get("details") == "1" {
+	query := r.URL.Query()
+	if query.Get("details") == "1" {
 		count := manager.ActiveCount()
 		data.Connections = &count
 		data.Memory = manager.Memory()
+	}
+	if query.Get("apps") == "1" {
+		apps := manager.AppTrafficTotals()
+		data.Apps = &apps
 	}
 	render.JSON(w, r, data)
 }

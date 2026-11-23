@@ -626,6 +626,7 @@ case "${1:-}" in
             fi
         fi
         echo traffic_summary=1
+        echo app_traffic=1
         keepalive_status "$core_up"
         webrtc_status "$core_up"
         exit ;;

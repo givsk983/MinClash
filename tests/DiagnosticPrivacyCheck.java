@@ -28,6 +28,28 @@ public final class DiagnosticPrivacyCheck {
             || !report.contains("SUB_CONNECT") || !report.contains("TIMEOUT")) {
             throw new AssertionError("Diagnostic output was not confined to the public format");
         }
+        String direct = DiagnosticReport.format("0.3.5", 71, 36, module, flags, Controller.Mode.DIRECT,
+            null, results, null).text();
+        if (!direct.contains("DIRECT_DNS_FAILED")) {
+            throw new AssertionError("Direct mode must report observed DNS failures");
+        }
+        results.put(NetworkCheck.BAIDU, new NetworkCheck.Result(NetworkCheck.State.REACHABLE, 35, 200));
+        direct = DiagnosticReport.format("0.3.5", 71, 36, module, flags, Controller.Mode.DIRECT,
+            null, results, null).text();
+        if (!direct.contains("DIRECT_HTTPS_OK")) {
+            throw new AssertionError("A reachable domestic site must count in direct mode");
+        }
+        Module.Status protectedModule = Module.parseStatus("state=running\nprofile=1\nenabled=1\ncontrol=1\n"
+            + "version=0.2.2\nrevision=23\nprotection=1\nprotection_armed=1\n");
+        Set<DiagnosticReport.Fact> protection = DiagnosticReport.parseFacts("IFACE\nROUTE4\nLOG_SAMPLE\n"
+            + "PROTECTION_ORIGIN_BLOCK\nPROTECTION_OUTBOUND_BLOCK " + node + "\n");
+        String reportWithProtection = DiagnosticReport.format("0.3.5", 71, 36, protectedModule, protection,
+            Controller.Mode.DIRECT, null, results, null).text();
+        if (!reportWithProtection.contains("优先排查  PROTECTION_ORIGIN_BLOCK")
+            || !reportWithProtection.contains("PROTECTION_CONFIGURED")
+            || reportWithProtection.contains("PROTECTION_OUTBOUND_BLOCK") || reportWithProtection.contains(node)) {
+            throw new AssertionError("Protection diagnostics must report only fixed, allowlisted signals");
+        }
         System.out.println("PASS: diagnostic export drops arbitrary metadata, destinations and raw log lines.");
     }
 }
