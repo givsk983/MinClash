@@ -119,6 +119,7 @@ public final class MainActivity extends ThemedActivity {
     private Button cancelSubscriptionButton;
     private Button checkAppUpdateButton;
     private Button repairDnsButton;
+    private Button proxyDnsButton;
     private Switch autoUpdateSwitch;
     private Switch experimentalSwitch;
     private View experimentalRouting;
@@ -147,6 +148,8 @@ public final class MainActivity extends ThemedActivity {
     private OverviewActionRow connectionsRow;
     private TrafficCard trafficCard;
     private record RulesScreen(RoutingStore.State state, int generation, List<String> targets) {}
+    private record ProxyDnsScreen(RoutingStore.State state, List<String> targets, boolean eligible) {}
+    private record ProxyDnsSaved(RoutingStore.ApplyMethod method, Module.Status status) {}
     private record AppRoutingSaved(RoutingStore.ApplyMethod method, List<AppRouting.Entry> apps, java.time.Instant cutoff) {}
     private record AppConnectionsClosed(int count) {}
     private record PersonalRulesSaved(RoutingStore.ApplyMethod method, RulesScreen screen) {}
@@ -315,7 +318,7 @@ public final class MainActivity extends ThemedActivity {
         subscriptionButton.setOnClickListener(view -> showSubscriptions());
         updateButton = button("更新当前订阅", false);
         updateButton.setOnClickListener(view -> {
-            if (subscriptions != null) activateSubscription(subscriptions.active());
+            if (subscriptions != null) activateSubscription(subscriptions.active(), false);
         });
         buttonRow(settings, subscriptionButton, updateButton, 14);
         cancelSubscriptionButton = button("取消订阅请求", false);
@@ -330,6 +333,9 @@ public final class MainActivity extends ThemedActivity {
         add(settings, cancelSubscriptionButton, 10);
         add(settings, label("订阅请求总时限 60 秒；下载期间可在此取消。", 12, MUTED, false), 8);
         add(settings, label("切换或更新订阅时会先预览变化；运行中应用会短暂重连。", 12, MUTED, false), 10);
+        proxyDnsButton = button("DNS 查询出口  ›", false);
+        proxyDnsButton.setOnClickListener(view -> openProxyDns());
+        add(settings, proxyDnsButton, 12);
 
         LinearLayout routing = card(profiles, 14);
         add(routing, label("分流规则", 17, TEXT, true), 0);
@@ -1358,7 +1364,10 @@ public final class MainActivity extends ThemedActivity {
 
     private void dismissBackgroundResult(RetainedTask<?> task) {
         task.clearResult();
-        if (task == background.preview) background.editedPreview = null;
+        if (task == background.preview) {
+            background.editedPreview = null;
+            background.copiedPreviewRules = false;
+        }
         backgroundDialog = null;
         main.post(this::deliverBackgroundResults);
     }
@@ -1538,21 +1547,26 @@ public final class MainActivity extends ThemedActivity {
     private void showSubscriptionActions(SubscriptionCatalog.Entry entry) {
         boolean active = entry.address().equals(subscriptions.activeAddress());
         boolean failed = SubscriptionUpdateStatus.load(appPreferences(), entry.address()).failed();
-        String use = active ? (failed ? "重试更新订阅" : "更新订阅") : (failed ? "重试切换订阅" : "切换到此订阅");
+        String use = active ? (failed ? "重试更新订阅" : "更新订阅") : "切换到此订阅";
+        String download = failed ? "重试下载并切换" : "下载最新配置并切换";
         List<String> actions = new ArrayList<>();
-        if (canPreviewProfile()) actions.add(use);
+        if (canPreviewProfile()) {
+            actions.add(use);
+            if (!active) actions.add(download);
+        }
         actions.add("重命名");
         actions.add("流量与有效期");
         if (!active) actions.add("删除");
         trackManagement(new AlertDialog.Builder(this).setTitle(entry.name())
             .setItems(actions.toArray(new String[0]), (dialog, index) -> {
-                switch (actions.get(index)) {
+                String action = actions.get(index);
+                switch (action) {
                     case "流量与有效期" -> showUsage(entry);
                     case "重命名" -> renameSubscription(entry);
                     case "删除" -> trackManagement(new AlertDialog.Builder(this).setTitle("删除订阅")
                         .setMessage("删除「" + entry.name() + "」及其个人规则？")
                         .setNegativeButton("取消", null).setPositiveButton("删除", (view, which) -> deleteSubscription(entry)).show());
-                    default -> activateSubscription(entry);
+                    default -> activateSubscription(entry, !active && !action.equals(download));
                 }
             }).setNegativeButton("返回", (dialog, which) -> showSubscriptions()).show());
     }
@@ -1570,7 +1584,7 @@ public final class MainActivity extends ThemedActivity {
         ui.add(form, card, 0);
         Button retry = null;
         if (SubscriptionUpdateStatus.load(appPreferences(), entry.address()).failed() && canPreviewProfile()) {
-            retry = ui.button(current ? "重试更新订阅" : "重试切换订阅");
+            retry = ui.button(current ? "重试更新订阅" : "重试下载并切换");
             ui.add(form, retry, 10);
         }
         ui.add(form, ui.label("上传  " + SubscriptionUsage.bytes(usage.upload())
@@ -1586,7 +1600,7 @@ public final class MainActivity extends ThemedActivity {
         if (retry != null) retry.setOnClickListener(view -> {
             if (dismiss != null) dismiss.run();
             dialog.dismiss();
-            activateSubscription(entry);
+            activateSubscription(entry, false);
         });
         return dialog;
     }
@@ -1703,7 +1717,7 @@ public final class MainActivity extends ThemedActivity {
         SubscriptionCatalog.Entry entry = new SubscriptionCatalog.Entry(name, address);
         dialog.dismiss();
         if (activate && canPreviewProfile()) {
-            previewSubscription(entry, true);
+            previewSubscription(entry, true, false);
         } else if (name.isEmpty()) {
             saveSubscriptionWithAutoName(address, host);
         } else {
@@ -1786,18 +1800,36 @@ public final class MainActivity extends ThemedActivity {
         });
     }
 
-    private void activateSubscription(SubscriptionCatalog.Entry entry) {
+    private void activateSubscription(SubscriptionCatalog.Entry entry, boolean preferSaved) {
         if (entry == null || !canPreviewProfile()) return;
-        previewSubscription(entry, false);
+        previewSubscription(entry, false, preferSaved);
     }
 
-    private void previewSubscription(SubscriptionCatalog.Entry entry, boolean adding) {
+    private void previewSubscription(SubscriptionCatalog.Entry entry, boolean adding, boolean preferSaved) {
         Context context = getApplicationContext();
         SharedPreferences prefs = appPreferences();
-        long attempt = SubscriptionUpdateStatus.begin();
         DownloadRequest request = new DownloadRequest();
         if (background.preview.start(BackgroundWork.DOWNLOADS, () -> {
             try (request) {
+                if (preferSaved) {
+                    BackgroundWork.ProfilePreview saved = worker.submit(() -> RoutingMutations.run(context, () -> {
+                        request.check();
+                        RoutingMutations.recoverPending(context);
+                        RoutingStore routing = new RoutingStore(context);
+                        SubscriptionCatalog.Snapshot catalog = new SubscriptionCatalog(prefs, routing).load();
+                        if (entry.address().equals(catalog.activeAddress())) return null;
+                        if (catalog.entries().stream().noneMatch(listed -> listed.address().equals(entry.address()))) {
+                            throw new IOException("订阅列表已变化，请重新选择订阅。");
+                        }
+                        RoutingStore.State target = routing.forSubscription(entry.address());
+                        if (target == null) return null;
+                        request.seal();
+                        return buildProfilePreview(routing, entry, target.source(), false, target, target,
+                            "将使用上次保存的订阅配置。", true);
+                    })).get();
+                    if (saved != null) return saved;
+                }
+                long attempt = SubscriptionUpdateStatus.begin();
                 Subscription.Download downloaded;
                 try { downloaded = Subscription.download(entry.address(), request); }
                 catch (Exception error) {
@@ -1819,9 +1851,11 @@ public final class MainActivity extends ThemedActivity {
                         SubscriptionCatalog.Entry named = adding && entry.name().isEmpty()
                             ? new SubscriptionCatalog.Entry(downloaded.name(), entry.address()) : entry;
                         RoutingStore.State target = adding ? null : routing.forSubscription(named.address());
-                        BackgroundWork.ProfilePreview preview = buildProfilePreview(routing, named, downloaded.source(), adding, target, target);
+                        BackgroundWork.ProfilePreview preview = buildProfilePreview(routing, named, downloaded.source(), adding, target, target, "");
                         if (!adding && preview.changes().conflicts()) {
                             SubscriptionUpdateStatus.complete(prefs, entry.address(), attempt, "订阅缺少分流规则需要的代理组");
+                        } else if (!adding && preview.changes().proxyDnsConflict()) {
+                            SubscriptionUpdateStatus.complete(prefs, entry.address(), attempt, "新配置无法使用已保存的 DNS 出口");
                         }
                         return preview;
                     })).get();
@@ -1836,13 +1870,19 @@ public final class MainActivity extends ThemedActivity {
                 }
             }
         }, request::cancel)) {
-            showMessage("正在下载订阅并比较配置…");
+            showMessage(preferSaved ? "正在准备切换订阅…" : "正在下载订阅并比较配置…");
             render();
         } else request.close();
     }
 
     private BackgroundWork.ProfilePreview buildProfilePreview(RoutingStore routing, SubscriptionCatalog.Entry entry,
-            byte[] source, boolean adding, RoutingStore.State target, RoutingStore.State rules) throws Exception {
+            byte[] source, boolean adding, RoutingStore.State target, RoutingStore.State rules, String yamlAdjustment) throws Exception {
+        return buildProfilePreview(routing, entry, source, adding, target, rules, yamlAdjustment, false);
+    }
+
+    private BackgroundWork.ProfilePreview buildProfilePreview(RoutingStore routing, SubscriptionCatalog.Entry entry,
+            byte[] source, boolean adding, RoutingStore.State target, RoutingStore.State rules,
+            String profileNotice, boolean cachedSubscription) throws Exception {
         Module.Status current = Module.status();
         RoutingStore.State active = routing.loadIfAvailable(current);
         List<Controller.Group> selections = current.running() ? null : Collections.emptyList();
@@ -1854,27 +1894,30 @@ public final class MainActivity extends ThemedActivity {
             active, rules, selections);
         RoutingStore.State copyFrom = target == null && active != null && (!active.applications().isEmpty() || !active.rules().isEmpty())
             ? active : null;
-        return new BackgroundWork.ProfilePreview(changes, copyFrom, routing.protectionTargetIssue(current, source));
+        return new BackgroundWork.ProfilePreview(changes, copyFrom, routing.missingProtectionTargets(current, source),
+            profileNotice, cachedSubscription);
     }
 
     private void showProfilePreview(BackgroundWork.ProfilePreview result) {
         SubscriptionPreview preview = background.editedPreview == null ? result.changes() : background.editedPreview;
         boolean local = preview.entry().address().isEmpty();
+        List<String> missingProtection = preview.unresolvedProtectionTargets(result.missingProtectionTargets());
         showMessage("");
         LinearLayout form = column();
         form.setPadding(dp(20), dp(8), dp(20), dp(12));
+        if (!result.profileNotice().isEmpty()) add(form, label(result.profileNotice(), 13, TEXT, false), 0);
         if (result.copyFrom() != null) {
-            boolean copied = background.editedPreview != null;
+            boolean copied = background.copiedPreviewRules;
             Button copy = button(copied ? "使用新配置自带的规则" : "从当前配置复制个人规则", false);
             copy.setOnClickListener(view -> {
                 try {
-                    RoutingStore.State original = result.changes().rules();
-                    RoutingStore.State current = result.copyFrom();
-                    updateProfilePreview(result, copied ? null
-                        : result.changes().withRules(original.withApplications(current.applications()).withRules(current.rules())));
+                    RoutingStore.State from = copied ? result.changes().rules() : result.copyFrom();
+                    SubscriptionPreview next = preview.withRules(preview.rules().withApplications(from.applications()).withRules(from.rules()));
+                    background.copiedPreviewRules = !copied;
+                    updateProfilePreview(result, next);
                 } catch (IOException error) { showMessage(error.getMessage()); }
             });
-            add(form, copy, 0);
+            add(form, copy, result.profileNotice().isEmpty() ? 0 : 8);
             if (copied) add(form, label("已复制 " + preview.rules().applications().size() + " 项应用分流和 "
                 + preview.rules().rules().size() + " 条自定义规则。", 12, MUTED, false), 6);
         }
@@ -1883,7 +1926,28 @@ public final class MainActivity extends ThemedActivity {
             resolve.setOnClickListener(view -> chooseMissingTarget(result, preview));
             add(form, resolve, 8);
         }
-        if (!result.protectionIssue().isEmpty()) add(form, label(result.protectionIssue(), 13, AMBER, false), 8);
+        if (preview.proxyDnsConflict()) {
+            add(form, label("新配置无法使用已保存的 DNS 出口「" + preview.rules().proxyDnsTarget()
+                + "」。请选择可用出口或跟随原配置。", 13, AMBER, false), 8);
+        }
+        if (preview.proxyDnsConflict() || !preview.proxyDnsTargets().isEmpty()) {
+            String current = preview.rules().proxyDnsTarget();
+            Button dns = button("DNS 查询出口 · " + (current.isEmpty() ? "跟随原配置" : current), false);
+            dns.setOnClickListener(view -> choosePreviewProxyDns(result, preview));
+            add(form, dns, 8);
+        }
+        if (!missingProtection.isEmpty()) {
+            add(form, label("新配置缺少防泄漏保护需要的代理组「" + String.join("」、「", missingProtection)
+                + "」。请选择新配置里的代理组。", 13, AMBER, false), 8);
+            Button choose = button("选择保护出口", false);
+            choose.setOnClickListener(view -> chooseProtectionTarget(result, preview, missingProtection));
+            add(form, choose, 8);
+        }
+        if (!preview.protectionAliases().isEmpty()) {
+            List<String> choices = preview.protectionAliases().entrySet().stream()
+                .map(entry -> entry.getKey() + " → " + entry.getValue()).collect(java.util.stream.Collectors.toList());
+            add(form, label("保护出口\n" + String.join("\n", choices) + "\n出口不可用时，受保护流量将继续阻断。", 13, TEXT, false), 8);
+        }
         add(form, label(preview.summary(), 13, TEXT, false), 10);
         add(form, label("如果 TUN 正在运行，应用时可能短暂重连。", 12, MUTED, false), 10);
         ScrollView scroll = new ScrollView(this);
@@ -1895,7 +1959,7 @@ public final class MainActivity extends ThemedActivity {
             .setOnCancelListener(view -> dismissBackgroundResult(background.preview)).show();
         backgroundDialog = shown;
         Button apply = shown.getButton(AlertDialog.BUTTON_POSITIVE);
-        apply.setEnabled(!preview.conflicts() && result.protectionIssue().isEmpty());
+        apply.setEnabled(!preview.conflicts() && !preview.proxyDnsConflict() && missingProtection.isEmpty());
         apply.setOnClickListener(view -> {
             if (!canApplyProfile()) {
                 showMessage("TUN 正在切换状态，请稍后再应用。");
@@ -1904,8 +1968,23 @@ public final class MainActivity extends ThemedActivity {
             dismissBackgroundResult(background.preview);
             shown.dismiss();
             mutate(local ? "本地配置已应用。" : "订阅配置已应用。", true,
-                () -> local ? applyLocalProfile(preview) : applySubscription(preview));
+                () -> local ? applyLocalProfile(preview) : applySubscription(preview, result.cachedSubscription()));
         });
+    }
+
+    private void choosePreviewProxyDns(BackgroundWork.ProfilePreview result, SubscriptionPreview preview) {
+        List<String> targets = new ArrayList<>();
+        targets.add("");
+        targets.addAll(preview.proxyDnsTargets());
+        String[] labels = targets.toArray(String[]::new);
+        labels[0] = "跟随原配置";
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("DNS 查询出口")
+            .setSingleChoiceItems(labels, targets.indexOf(preview.rules().proxyDnsTarget()), (view, index) -> {
+                view.dismiss();
+                try { updateProfilePreview(result, preview.withRules(preview.rules().withProxyDns(targets.get(index)))); }
+                catch (IOException error) { showMessage(error.getMessage()); }
+            }).setNegativeButton("取消", null).show();
+        new AppUi(this).styleList(dialog);
     }
 
     private void updateProfilePreview(BackgroundWork.ProfilePreview result, SubscriptionPreview edited) {
@@ -1939,15 +2018,44 @@ public final class MainActivity extends ThemedActivity {
             }).setNegativeButton("返回预览", null).show());
     }
 
+    private void chooseProtectionTarget(BackgroundWork.ProfilePreview result, SubscriptionPreview preview, List<String> missing) {
+        if (missing.size() == 1) {
+            chooseProtectionReplacement(result, preview, missing.get(0));
+            return;
+        }
+        trackManagement(new AlertDialog.Builder(this).setTitle("选择需要更换的保护出口")
+            .setItems(missing.toArray(String[]::new), (dialog, index) -> chooseProtectionReplacement(result, preview, missing.get(index)))
+            .setNegativeButton("返回预览", null).show());
+    }
+
+    private void chooseProtectionReplacement(BackgroundWork.ProfilePreview result, SubscriptionPreview preview, String alias) {
+        try {
+            List<String> targets = Profile.protectionAliasTargets(preview.source(), alias);
+            AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("为「" + alias + "」选择代理组")
+                .setNegativeButton("返回预览", null);
+            if (targets.isEmpty()) dialog.setMessage("新配置中没有可用于此保护出口的代理组。");
+            else dialog.setItems(targets.toArray(String[]::new), (view, index) -> {
+                try { updateProfilePreview(result, preview.withProtectionAlias(alias, targets.get(index))); }
+                catch (IOException error) { showProtectionPreviewError(error); }
+            });
+            trackManagement(dialog.show());
+        } catch (IOException error) { showProtectionPreviewError(error); }
+    }
+
+    private void showProtectionPreviewError(IOException error) {
+        trackManagement(new AlertDialog.Builder(this).setTitle("无法设置保护出口")
+            .setMessage(error.getMessage()).setPositiveButton("返回预览", null).show());
+    }
+
     private void requireProfilePreviewCurrent(SubscriptionPreview preview) throws Exception {
         RoutingMutations.recoverPending(this);
         if (preview.generation() != RoutingStore.generation()) throw new IOException("当前配置已变化，请重新预览。");
         if (!canApplyProfile(Module.status())) throw new IOException("TUN 正在切换状态，请稍后重试。");
     }
 
-    private Module.Status applySubscription(SubscriptionPreview preview) throws Exception {
+    private Module.Status applySubscription(SubscriptionPreview preview, boolean cachedSubscription) throws Exception {
         String address = preview.entry().address();
-        long attempt = SubscriptionUpdateStatus.begin();
+        long attempt = cachedSubscription ? 0 : SubscriptionUpdateStatus.begin();
         boolean listed = !preview.adding();
         try {
             requireProfilePreviewCurrent(preview);
@@ -1958,12 +2066,14 @@ public final class MainActivity extends ThemedActivity {
                 listed = true;
             }
             new RoutingStore(this).apply(preview.rules());
-            SubscriptionUpdateStatus.complete(appPreferences(), address, attempt, "");
+            if (!cachedSubscription) SubscriptionUpdateStatus.complete(appPreferences(), address, attempt, "");
         } catch (RoutingStore.SelectionRestoreFailure warning) {
-            SubscriptionUpdateStatus.complete(appPreferences(), address, attempt, "");
+            if (!cachedSubscription) SubscriptionUpdateStatus.complete(appPreferences(), address, attempt, "");
             throw warning;
         } catch (Exception error) {
-            if (listed) SubscriptionUpdateStatus.complete(appPreferences(), address, attempt, SubscriptionUpdateStatus.applyFailure(error));
+            if (listed && !cachedSubscription) {
+                SubscriptionUpdateStatus.complete(appPreferences(), address, attempt, SubscriptionUpdateStatus.applyFailure(error));
+            }
             throw error;
         } finally {
             refreshSubscriptionCatalog();
@@ -2043,7 +2153,7 @@ public final class MainActivity extends ThemedActivity {
             if (uri != null) {
                 try (InputStream input = context.getContentResolver().openInputStream(uri)) {
                     if (input == null) throw new IOException("无法打开所选文件。");
-                    incoming = Profile.normalize(input);
+                    incoming = Profile.readLimited(input);
                 }
             }
             byte[] source = incoming;
@@ -2053,10 +2163,26 @@ public final class MainActivity extends ThemedActivity {
                 RoutingStore routing = new RoutingStore(context);
                 RoutingStore.State target = profileId == null ? null : routing.forLocalProfile(profileId);
                 if (profileId != null && target == null) throw new IOException("这份本地配置已被删除。");
-                byte[] yaml = source == null ? target.source() : source;
+                Profile.LocalYaml prepared = Profile.prepareLocalYaml(source == null ? target.source() : source);
+                byte[] yaml = prepared.source();
+                String adjustment = "";
+                Profile.GroupChange group = prepared.group();
+                if (group != null) {
+                    adjustment = switch (group.update()) {
+                        case CREATED -> "已自动添加代理组「" + group.name() + "」。";
+                        case FILLED -> "已自动补全代理组「" + group.name() + "」。";
+                        case NONE -> "";
+                    };
+                    if (group.nodes() > 0) adjustment += "\n已收录 " + group.nodes() + " 个代理节点。";
+                    if (group.providers() > 0) adjustment += "\n已关联 " + group.providers() + " 个代理提供者，节点由 Mihomo 加载。";
+                    if (group.addedCatchAll()) {
+                        if (!adjustment.isEmpty()) adjustment += "\n";
+                        adjustment += "原配置没有规则，已添加一条默认规则，将流量交给「" + group.name() + "」。";
+                    }
+                }
                 RoutingStore.State rules = target == null ? new RoutingStore.State(yaml, Collections.emptyMap(), "", Collections.emptyList(),
                     Collections.emptySet(), UUID.randomUUID().toString(), uniqueLocalName(fileName, routing.localProfileEntries())) : target;
-                return buildProfilePreview(routing, new SubscriptionCatalog.Entry(rules.localName(), ""), yaml, target == null, target, rules);
+                return buildProfilePreview(routing, new SubscriptionCatalog.Entry(rules.localName(), ""), yaml, target == null, target, rules, adjustment);
             })).get();
         })) {
             showMessage("正在准备本地配置预览…");
@@ -3524,6 +3650,59 @@ public final class MainActivity extends ThemedActivity {
             }).show();
     }
 
+    private void openProxyDns() {
+        if (!canPreviewProfile() || !status.profile) return;
+        execute("", () -> RoutingMutations.run(this, () -> {
+            RoutingMutations.recoverPending(this);
+            RoutingStore.State current = new RoutingStore(this).load();
+            boolean eligible = Profile.canUseProxyDns(current.source());
+            return new ProxyDnsScreen(current, eligible ? Profile.proxyDnsTargets(current.source()) : List.of(), eligible);
+        }));
+    }
+
+    private void showProxyDns(ProxyDnsScreen screen) {
+        String current = screen.state().proxyDnsTarget();
+        List<String> choices = new ArrayList<>();
+        choices.add("");
+        choices.addAll(screen.targets());
+        String[] labels = choices.toArray(String[]::new);
+        labels[0] = "跟随原配置";
+        int[] selected = {choices.indexOf(current)};
+
+        LinearLayout heading = column();
+        heading.setPadding(dp(20), dp(16), dp(20), dp(12));
+        add(heading, label("DNS 查询出口", 20, TEXT, true), 0);
+        String summary = selected[0] == -1 ? "已保存的代理组不可用 · " + current
+            : current.isEmpty() ? "当前设置 · 跟随原配置" : "当前设置 · " + current;
+        add(heading, label(summary, 13, selected[0] == -1 ? AMBER : MUTED, false), 8);
+        if (screen.targets().isEmpty()) {
+            add(heading, label(screen.eligible() ? "当前配置没有可用的代理出口。"
+                : "当前配置自带 DNS 设置。此功能适用于未指定 DNS 上游的配置。", 13, MUTED, false), 8);
+        } else {
+            add(heading, label("常规 DNS 查询通过所选代理。节点域名可通过直连加密 DNS 解析。开启严格 DNS 时以严格 DNS 为准。",
+                13, MUTED, false), 8);
+        }
+        AlertDialog dialog = new AlertDialog.Builder(this).setCustomTitle(heading)
+            .setSingleChoiceItems(labels, selected[0], (view, index) -> {
+                selected[0] = index;
+                ((AlertDialog) view).getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(!current.equals(choices.get(index)));
+            })
+            .setNegativeButton("取消", null).setPositiveButton("保存并应用", (view, which) -> {
+                if (!canApplyProfile()) {
+                    showMessage("TUN 正在切换状态，请稍后再应用。");
+                    return;
+                }
+                String target = choices.get(selected[0]);
+                mutate("", true, () -> {
+                    var method = new RoutingStore(this).setProxyDns(screen.state(), target);
+                    return new ProxyDnsSaved(method, Module.status());
+                });
+            }).show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
+        trackManagement(dialog);
+        new AppUi(this).styleList(dialog);
+    }
+
     private RulesScreen readPersonalRules() throws Exception {
         RoutingStore.State state = new RoutingStore(this).load();
         List<String> targets = Profile.routingTargets(state.source());
@@ -3823,7 +4002,8 @@ public final class MainActivity extends ThemedActivity {
             try {
                 Object result = operation.run();
                 Module.Status updatedStatus = result instanceof Module.Status updated ? updated
-                    : result instanceof AppRouting.Screen screen ? screen.status() : null;
+                    : result instanceof AppRouting.Screen screen ? screen.status()
+                    : result instanceof ProxyDnsSaved saved ? saved.status() : null;
                 Controller.Overview summary = readProxySummary(updatedStatus);
                 main.post(() -> {
                     if (isDestroyed()) return;
@@ -3831,17 +4011,24 @@ public final class MainActivity extends ThemedActivity {
                     if (completion != null) completion.accept(null);
                     if (!success.isEmpty()) showMessage(success);
                     if (result instanceof DiagnosticReport) showMessage("");
-                    if (result instanceof Module.Status updated) {
-                        checkNetworkAfterStatus(updated, summary, checkConnection);
-                        status = updated;
+                    if (result instanceof Module.Status || result instanceof ProxyDnsSaved) {
+                        checkNetworkAfterStatus(updatedStatus, summary, checkConnection);
+                        status = updatedStatus;
                         proxySummary = summary;
                         appPreferences().edit().putBoolean("connected", true).apply();
+                        if (result instanceof ProxyDnsSaved saved) showMessage(switch (saved.method()) {
+                            case UNCHANGED -> "DNS 设置已保存。";
+                            case SAVED -> "DNS 设置已保存，下次启动 TUN 时应用。";
+                            case RELOADED -> "DNS 设置已保存并重载配置。";
+                            case RESTARTED -> "DNS 设置已保存，TUN 已重新连接。";
+                        });
                     } else if (visible) {
                         if (result instanceof String logs) showLogs(logs);
                         if (result instanceof DiagnosticReport report) showDiagnosticReport(report.text());
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
                         if (result instanceof WebRtcRules rules) showWebRtcRules(rules);
                         if (result instanceof RulesScreen screen) showPersonalRules(screen);
+                        if (result instanceof ProxyDnsScreen screen) showProxyDns(screen);
                         if (result instanceof AppRoutingSaved saved) showAppRoutingSaved(saved);
                         if (result instanceof AppConnectionsClosed closed)
                             showMessage(closed.count() == 0 ? "没有可确认的旧连接。" : "已处理 " + closed.count() + " 条旧连接。");
@@ -3953,6 +4140,8 @@ public final class MainActivity extends ThemedActivity {
         subscriptionButton.setEnabled(!busy && subscriptions != null && !savingSubscription());
         subscriptionButton.setText(noSubscriptions ? "添加订阅" : "管理订阅");
         boolean subscribed = active != null && installed && status.profile;
+        proxyDnsButton.setVisibility(installed && status.profile ? View.VISIBLE : View.GONE);
+        proxyDnsButton.setEnabled(canPreviewProfile());
         updateButton.setVisibility(subscribed ? View.VISIBLE : View.GONE);
         updateButton.setText(update != null && update.failed() ? "重试当前订阅" : "更新当前订阅");
         updateButton.setEnabled(subscribed && canPreviewProfile());

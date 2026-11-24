@@ -7,6 +7,7 @@ enum ProxyGroupSection {
     MAIN("主代理"), REGION("地区线路"), SERVICE("应用与服务"), OTHER("其他策略");
 
     private static final Pattern DECORATION = Pattern.compile("^[^\\p{L}\\p{N}]+|[^\\p{L}\\p{N}]+$");
+    private static final Pattern NUMBERED_MINCLASH = Pattern.compile("minclash [0-9]+");
     private static final Pattern REGION_NAME = Pattern.compile(
         "(?:hk|tw|mo|jp|sg|us|uk|gb|kr|ko|de|fr|ca|au|in|cn|my|th|vn|id|ph|nl|ru|tr|eu|sea|uae"
         + "|hong kong|taiwan|macao|macau|japan|singapore|united states|usa|united kingdom|korea|south korea"
@@ -36,6 +37,7 @@ enum ProxyGroupSection {
             case "proxies", "proxy", "global", "minclash", "节点选择", "節點選擇", "代理选择", "代理選擇",
                  "手动切换", "自动选择", "auto", "url-test", "select", "proxy select" -> MAIN;
             default -> {
+                if (NUMBERED_MINCLASH.matcher(key).matches()) yield MAIN;
                 if (REGION_NAME.matcher(key).matches()) yield REGION;
                 if (SERVICE_NAME.matcher(key).find()) yield SERVICE;
                 yield OTHER;

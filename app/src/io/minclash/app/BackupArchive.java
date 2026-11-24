@@ -191,8 +191,11 @@ final class BackupArchive {
             localName = string(object.get("localName"), 128);
             if (!address.isEmpty() || !localId.matches("[A-Za-z0-9_-]+") || localName.trim().isEmpty()) throw new IOException();
         }
-        Profile.withPersonalRules(normalized, rules, personal, bypassed);
-        return new RoutingStore.State(normalized, rules, address, personal, bypassed, localId, localName);
+        String proxyDnsTarget = version >= 4 && object.has("proxyDnsTarget")
+            ? string(object.get("proxyDnsTarget"), 256) : "";
+        RoutingStore.State state = new RoutingStore.State(normalized, rules, address, personal, bypassed, localId, localName, proxyDnsTarget);
+        RoutingStore.render(state);
+        return state;
     }
 
     static JSONObject json(Data data) throws Exception {
@@ -215,9 +218,11 @@ final class BackupArchive {
     }
 
     private static JSONObject writeProfile(RoutingStore.State state) throws Exception {
-        return new JSONObject().put("source", new String(state.source(), StandardCharsets.UTF_8))
+        JSONObject profile = new JSONObject().put("source", new String(state.source(), StandardCharsets.UTF_8))
             .put("applications", new JSONObject(state.applications())).put("personalRules", PersonalRules.json(state.rules()))
             .put("bypassedApps", new JSONArray(state.bypassedApps())).put("localId", state.localId()).put("localName", state.localName());
+        if (!state.proxyDnsTarget().isEmpty()) profile.put("proxyDnsTarget", state.proxyDnsTarget());
+        return profile;
     }
 
     private static String subscription(RoutingStore.State state) {

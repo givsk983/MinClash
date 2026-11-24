@@ -12,7 +12,8 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 
 record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int generation, boolean adding,
-                           Comparison comparison, RoutingStore.State rules, List<String> missingTargets, String summary) {
+                           Comparison comparison, RoutingStore.State rules, Map<String, String> protectionAliases,
+                           List<String> missingTargets, List<String> proxyDnsTargets, String summary) {
     private record Comparison(Set<String> groups, Set<String> added, Set<String> removed, List<String> lost) {}
 
     static SubscriptionPreview compare(SubscriptionCatalog.Entry entry, byte[] source, int generation, boolean adding,
@@ -45,13 +46,32 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
         Comparison comparison = new Comparison(Collections.unmodifiableSet(candidate.groups().keySet()),
             Collections.unmodifiableSet(added), Collections.unmodifiableSet(removed),
             selections == null ? null : Collections.unmodifiableList(lost));
-        return describe(entry, source, generation, adding, comparison, forCandidate(entry, source, rules));
+        return describe(entry, source, generation, adding, comparison, forCandidate(entry, source, rules), Map.of());
     }
 
     boolean conflicts() { return !missingTargets.isEmpty(); }
 
+    boolean proxyDnsConflict() {
+        return !rules.proxyDnsTarget().isEmpty() && !proxyDnsTargets.contains(rules.proxyDnsTarget());
+    }
+
     SubscriptionPreview withRules(RoutingStore.State rules) throws IOException {
-        return describe(entry, source, generation, adding, comparison, forCandidate(entry, source, rules));
+        return describe(entry, source, generation, adding, comparison, forCandidate(entry, source, rules), protectionAliases);
+    }
+
+    List<String> unresolvedProtectionTargets(List<String> required) {
+        return required.stream().filter(name -> !protectionAliases.containsKey(name)).collect(java.util.stream.Collectors.toList());
+    }
+
+    SubscriptionPreview withProtectionAlias(String alias, String target) throws IOException {
+        byte[] adjusted = Profile.withProtectionAlias(source, alias, target);
+        Set<String> groups = new TreeSet<>(comparison.groups());
+        groups.add(alias);
+        Comparison updated = new Comparison(groups, comparison.added(), comparison.removed(), comparison.lost());
+        Map<String, String> aliases = new TreeMap<>(protectionAliases);
+        aliases.put(alias, target);
+        return describe(entry, adjusted, generation, adding, updated, rules.withSource(adjusted, entry.address()),
+            Collections.unmodifiableMap(aliases));
     }
 
     List<String> replacementTargets(String oldTarget) {
@@ -72,7 +92,7 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
             personal.add(rule.target().equals(oldTarget) ? PersonalRules.create(rule.type(), rule.value(), newTarget) : rule);
         }
         RoutingStore.State updated = rules.withApplications(applications).withRules(personal);
-        return describe(entry, source, generation, adding, comparison, updated);
+        return describe(entry, source, generation, adding, comparison, updated, protectionAliases);
     }
 
     private static RoutingStore.State forCandidate(SubscriptionCatalog.Entry entry, byte[] source, RoutingStore.State rules) {
@@ -80,7 +100,7 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
     }
 
     private static SubscriptionPreview describe(SubscriptionCatalog.Entry entry, byte[] source, int generation, boolean adding,
-                                                Comparison comparison, RoutingStore.State rules) {
+                                                Comparison comparison, RoutingStore.State rules, Map<String, String> protectionAliases) throws IOException {
         Set<String> missing = new TreeSet<>();
         List<String> conflicts = new ArrayList<>();
         for (PersonalRules.Rule rule : rules.rules()) {
@@ -109,8 +129,9 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
         if (!conflicts.isEmpty()) summary.append("\n请为缺失的出口选择替代项。");
         if (comparison.lost() == null) summary.append("\n\n当前节点选择暂不可读取。");
         else append(summary, "预计无法沿用的节点选择", comparison.lost());
-        return new SubscriptionPreview(entry, source, generation, adding, comparison, rules,
-            Collections.unmodifiableList(new ArrayList<>(missing)), summary.toString());
+        List<String> dnsTargets = Profile.canUseProxyDns(source) ? Profile.proxyDnsTargets(source) : List.of();
+        return new SubscriptionPreview(entry, source, generation, adding, comparison, rules, protectionAliases,
+            Collections.unmodifiableList(new ArrayList<>(missing)), dnsTargets, summary.toString());
     }
 
     private static void append(StringBuilder summary, String label, Collection<String> entries) {

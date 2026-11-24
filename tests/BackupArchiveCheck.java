@@ -85,11 +85,12 @@ public final class BackupArchiveCheck {
     private static void profiles(BackupArchive.Data base, char[] password) throws Exception {
         byte[] source = base.state().source();
         RoutingStore.State first = new RoutingStore.State(source, Map.of("com.example.local", "DIRECT"), "", List.of(),
-            Set.of(), "first", "本地一.yaml");
+            Set.of(), "first", "本地一.yaml").withProxyDns("US");
+        RoutingStore.State subscription = base.state().withProxyDns("US");
         RoutingStore.State second = new RoutingStore.State(source, Map.of(), "", List.of(PersonalRules.create("DOMAIN", "example.test", "US")),
             Set.of("com.example.bypassed"), "second", "本地二.yaml");
         BackupArchive.Data multiple = new BackupArchive.Data(first, base.subscriptions(), base.preferences(), 1, "0.1.7",
-            List.of(base.state(), second));
+            List.of(subscription, second));
         BackupArchive.Data restored = BackupArchive.decode(BackupArchive.encode(multiple, password), password);
         roundTrip(multiple, restored);
         require(restored.state().localId().equals("first") && restored.state().localName().equals("本地一.yaml"), "active local metadata survives");
@@ -98,11 +99,15 @@ public final class BackupArchiveCheck {
         RoutingStore.State restoredLocal = restored.inactiveProfiles().get(1);
         require(restoredSubscription.subscription().equals(base.state().subscription())
             && restoredSubscription.applications().equals(base.state().applications()), "inactive subscription retains its own application rules");
+        require(restoredSubscription.proxyDnsTarget().equals("US") && restoredLocal.proxyDnsTarget().isEmpty(),
+            "inactive profiles retain their own DNS preference");
         require(restoredLocal.localId().equals(second.localId()) && restoredLocal.localName().equals(second.localName())
             && restoredLocal.rules().equals(second.rules()) && restoredLocal.bypassedApps().equals(second.bypassedApps()),
             "inactive local profile retains its own name, rules and exclusions");
         rejectData(new BackupArchive.Data(first, base.subscriptions(), base.preferences(), 1, "0.1.7", List.of(first)), "duplicate active local identity");
         rejectData(new BackupArchive.Data(first, List.of(), base.preferences(), 1, "0.1.7", List.of(base.state())), "inactive subscription absent from catalog");
+        rejectData(new BackupArchive.Data(first, base.subscriptions(), base.preferences(), 1, "0.1.7",
+            List.of(subscription.withProxyDns("missing-dns-group"))), "missing DNS target in inactive subscription");
     }
 
     private static void legacy(BackupArchive.Data base) throws Exception {
@@ -139,6 +144,7 @@ public final class BackupArchiveCheck {
         require(Arrays.equals(Profile.normalize(before.state().source()), after.state().source()), "source YAML survives normalization");
         require(before.state().applications().equals(after.state().applications()), "uninstalled app override survives");
         require(before.state().subscription().equals(after.state().subscription()), "active source survives");
+        require(before.state().proxyDnsTarget().equals(after.state().proxyDnsTarget()), "active DNS preference survives");
         require(before.subscriptions().equals(after.subscriptions()) && before.preferences().equals(after.preferences()),
             "all subscriptions, categories, favorites and portable preferences survive");
         require(before.createdAt() == after.createdAt() && before.appVersion().equals(after.appVersion()), "preview metadata survives");

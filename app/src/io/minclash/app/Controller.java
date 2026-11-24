@@ -27,7 +27,7 @@ final class Controller {
         }
     }
 
-    record Group(String name, String current, List<String> options, boolean automatic, boolean selectable) {}
+    record Group(String name, String current, List<String> options, boolean automatic, boolean selectable, boolean hidden) {}
     record Groups(List<Group> values) {}
     record Snapshot(Mode mode, String node, List<Group> groups) {}
     record Overview(Mode mode, String node, String probeOutlet) {}
@@ -107,8 +107,9 @@ final class Controller {
             if (all == null) continue;
             List<String> options = new ArrayList<>();
             for (int j = 0; j < all.length(); j++) options.add(all.getString(j));
-            boolean selectable = (automatic || type.equals("Selector")) && !proxy.optBoolean("hidden") && !options.isEmpty();
-            groups.add(new Group(name, proxy.optString("now"), options, automatic, selectable));
+            boolean hidden = proxy.optBoolean("hidden");
+            boolean selectable = (automatic || type.equals("Selector")) && !hidden && !options.isEmpty();
+            groups.add(new Group(name, proxy.optString("now"), options, automatic, selectable, hidden));
         }
         groups.sort(Comparator.comparing(Group::name, String.CASE_INSENSITIVE_ORDER));
         return groups;
@@ -185,10 +186,10 @@ final class Controller {
     }
 
     static Group primaryGroup(Mode mode, List<Group> groups) {
-        Group primary = groups.stream().filter(group -> mode == Mode.GLOBAL
+        Group primary = groups.stream().filter(group -> !group.hidden()).filter(group -> mode == Mode.GLOBAL
             ? ProxyGroupSection.isGlobal(group.name()) : ProxyGroupSection.isProxies(group.name())).findFirst().orElse(null);
         if (primary == null && mode != Mode.GLOBAL) {
-            primary = groups.stream().filter(group -> ProxyGroupSection.of(group.name()) == ProxyGroupSection.MAIN
+            primary = groups.stream().filter(group -> !group.hidden() && ProxyGroupSection.of(group.name()) == ProxyGroupSection.MAIN
                 && !ProxyGroupSection.isGlobal(group.name())).min(Comparator.comparing(Group::automatic)).orElse(null);
         }
         return primary;

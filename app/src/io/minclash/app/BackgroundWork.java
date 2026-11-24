@@ -1,5 +1,6 @@
 package io.minclash.app;
 
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -12,8 +13,10 @@ final class BackgroundWork {
     final RetainedTask<Void> updateDownload = new RetainedTask<>();
     final RetainedTask<Object> backup = new RetainedTask<>();
     final RetainedTask<UsageResult> usage = new RetainedTask<>();
-    record ProfilePreview(SubscriptionPreview changes, RoutingStore.State copyFrom, String protectionIssue) {}
+    record ProfilePreview(SubscriptionPreview changes, RoutingStore.State copyFrom, List<String> missingProtectionTargets,
+                          String profileNotice, boolean cachedSubscription) {}
     SubscriptionPreview editedPreview;
+    boolean copiedPreviewRules;
     record UsageResult(SubscriptionCatalog.Entry entry, SubscriptionUsage value) {}
     byte[] pendingExport;
     boolean backupRestoring;

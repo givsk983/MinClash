@@ -6,6 +6,11 @@ import java.util.Map;
 
 public final class SubscriptionPreviewCheck {
     public static void main(String[] args) throws Exception {
+        Controller.Group proxy = group("MinClash", "node");
+        Controller.Group hidden = new Controller.Group("PROXIES", "MinClash", List.of("MinClash"), false, false, true);
+        require(Controller.primaryGroup(Controller.Mode.RULE, List.of(hidden, proxy)) == proxy
+            && Controller.route(hidden, List.of(hidden, proxy)).equals(List.of("MinClash", "node")),
+            "hidden protection groups resolve as routes without taking the main proxy slot");
         byte[] before = profile("""
             proxies:
               - {name: retired, type: socks5, server: 127.0.0.1, port: 9}
@@ -62,6 +67,31 @@ public final class SubscriptionPreviewCheck {
         require(!mapped.replaceTarget("Personal", "REJECT").conflicts(), "offer reject for personal-only conflicts");
         require(!mapped.withRules(new RoutingStore.State(after, Map.of())).conflicts(), "preview explicitly supplied rules");
         require(candidateRules.applications().get("com.example.app").equals("Removed"), "discarded preview leaves original rules intact");
+        SubscriptionPreview protectedPreview = localPreview.withProtectionAlias("Removed", "Static");
+        require(protectedPreview.unresolvedProtectionTargets(List.of("Removed", "Missing")).equals(List.of("Missing"))
+            && protectedPreview.missingTargets().equals(List.of("Personal")), "the protection alias resolves the same group's personal references");
+        SubscriptionPreview edited = protectedPreview.withRules(protectedPreview.rules()).replaceTarget("Personal", "REJECT");
+        require(!edited.conflicts() && edited.protectionAliases().equals(Map.of("Removed", "Static"))
+            && java.util.Arrays.equals(edited.rules().source(), edited.source()), "editing personal rules retains the protection alias");
+
+        RoutingStore.State withDns = new RoutingStore.State(before, Map.of(), entry.address()).withProxyDns("Removed");
+        RoutingStore.State decoded = RoutingStore.decodeState(RoutingStore.encodeState(withDns));
+        require(decoded.proxyDnsTarget().equals("Removed"), "persist the per-profile DNS target");
+        SubscriptionPreview newDns = SubscriptionPreview.compare(entry, before, 0, true, null, null);
+        require(newDns.proxyDnsTargets().contains("Removed") && newDns.rules().proxyDnsTarget().isEmpty(),
+            "new subscriptions without DNS can opt in and start off");
+        SubscriptionPreview staleDns = SubscriptionPreview.compare(entry, after, 0, false, decoded, null);
+        require(staleDns.proxyDnsConflict(), "subscription updates retain the selection and surface a missing DNS target");
+        SubscriptionPreview selectedDns = staleDns.withRules(staleDns.rules().withProxyDns("Static"));
+        require(!selectedDns.proxyDnsConflict() && selectedDns.rules().proxyDnsTarget().equals("Static"), "DNS target can be reselected");
+        require(!java.util.Arrays.equals(RoutingStore.render(selectedDns.rules()),
+            RoutingStore.render(selectedDns.rules().withProxyDns(""))), "DNS can follow the configuration again");
+        byte[] explicit = profile(new String(after, StandardCharsets.UTF_8).replace("dns:\n  enable: true",
+            "dns:\n  nameserver: ['8.8.8.8']"));
+        SubscriptionPreview localDns = SubscriptionPreview.compare(local, explicit, 0, false, selectedDns.rules(), null);
+        require(localDns.proxyDnsConflict() && localDns.proxyDnsTargets().isEmpty()
+            && !localDns.withRules(localDns.rules().withProxyDns("")).proxyDnsConflict(),
+            "an explicit DNS configuration takes effect after restoring the profile default");
         System.out.println("PASS: subscription preview, invalid app targets, removed selections and provider uncertainty.");
     }
 
@@ -70,7 +100,7 @@ public final class SubscriptionPreviewCheck {
     }
 
     private static Controller.Group group(String name, String current) {
-        return new Controller.Group(name, current, List.of(current), false, true);
+        return new Controller.Group(name, current, List.of(current), false, true, false);
     }
 
     private static void require(boolean condition, String name) {

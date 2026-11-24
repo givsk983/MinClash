@@ -45,7 +45,11 @@ final class RoutingStore {
     }
 
     record State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules,
-                 Set<String> bypassedApps, String localId, String localName) {
+                 Set<String> bypassedApps, String localId, String localName, String proxyDnsTarget) {
+        State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules,
+              Set<String> bypassedApps, String localId, String localName) {
+            this(source, applications, subscription, rules, bypassedApps, localId, localName, "");
+        }
         State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules,
               Set<String> bypassedApps) {
             this(source, applications, subscription, rules, bypassedApps, null, null);
@@ -63,14 +67,25 @@ final class RoutingStore {
             applications = Collections.unmodifiableMap(new TreeMap<>(applications));
             rules = Collections.unmodifiableList(new ArrayList<>(rules));
             bypassedApps = Collections.unmodifiableSet(new TreeSet<>(bypassedApps));
+            Objects.requireNonNull(proxyDnsTarget);
         }
         State withSource(byte[] source, String subscription) {
             boolean local = subscription == null || subscription.isEmpty();
-            return new State(source, applications, subscription, rules, bypassedApps, local ? localId : null, local ? localName : null);
+            return new State(source, applications, subscription, rules, bypassedApps,
+                local ? localId : null, local ? localName : null, proxyDnsTarget);
         }
-        State withApplications(Map<String, String> applications) { return new State(source, applications, subscription, rules, bypassedApps, localId, localName); }
-        State withRules(List<PersonalRules.Rule> rules) { return new State(source, applications, subscription, rules, bypassedApps, localId, localName); }
-        State withBypassedApps(Set<String> packages) { return new State(source, applications, subscription, rules, packages, localId, localName); }
+        State withApplications(Map<String, String> applications) {
+            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, proxyDnsTarget);
+        }
+        State withRules(List<PersonalRules.Rule> rules) {
+            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, proxyDnsTarget);
+        }
+        State withBypassedApps(Set<String> packages) {
+            return new State(source, applications, subscription, rules, packages, localId, localName, proxyDnsTarget);
+        }
+        State withProxyDns(String target) {
+            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, target);
+        }
     }
 
     record LocalProfile(String id, String name, boolean active) {}
@@ -93,6 +108,18 @@ final class RoutingStore {
     State loadIfAvailable(Module.Status status) throws Exception {
         if (status.profile) return load();
         return read();
+    }
+
+    ApplyMethod setProxyDns(State expected, String target) throws Exception {
+        return RoutingMutations.run(context, () -> {
+            RoutingMutations.recoverPending(context);
+            State latest = load();
+            if (!identity(latest).equals(identity(expected)) || !Arrays.equals(latest.source(), expected.source())
+                || !latest.proxyDnsTarget().equals(expected.proxyDnsTarget())) {
+                throw new IOException("当前配置或 DNS 出口已变化，请重新打开 DNS 查询出口。");
+            }
+            return apply(latest.withProxyDns(target));
+        });
     }
 
     State withoutBypass(Module.Status status) throws Exception {
@@ -261,7 +288,8 @@ final class RoutingStore {
         String id = state.localId();
         String name = state.localName();
         if (id == null && name == null) {
-            return new State(state.source(), state.applications(), "", state.rules(), state.bypassedApps(), LEGACY_LOCAL_ID, LEGACY_LOCAL_NAME);
+            return new State(state.source(), state.applications(), "", state.rules(), state.bypassedApps(),
+                LEGACY_LOCAL_ID, LEGACY_LOCAL_NAME, state.proxyDnsTarget());
         }
         if (id == null || !id.matches("[A-Za-z0-9_-]{1,64}") || name == null || name.trim().isEmpty() || name.length() > 128) {
             throw new IOException("本地配置名称或标识无效。");
@@ -333,9 +361,11 @@ final class RoutingStore {
         }
         Set<String> bypassed = version < 3 ? Collections.emptySet() : TunBypass.parse(object.getJSONArray("bypassedApps"));
         TunBypass.validate(bypassed, applications);
+        Object proxyDns = object.opt("proxyDnsTarget");
+        if (proxyDns != null && !(proxyDns instanceof String)) throw new IOException("DNS 查询出口无效。");
         return new State(Profile.normalize(object.getString("source").getBytes(StandardCharsets.UTF_8)), applications,
             object.optString("subscription", null), PersonalRules.parse(version == 1 ? null : object.getJSONArray("personalRules")),
-            bypassed, object.optString("localId", null), object.optString("localName", null));
+            bypassed, object.optString("localId", null), object.optString("localName", null), proxyDns == null ? "" : (String) proxyDns);
     }
 
     private JSONObject readObject() throws Exception {
@@ -367,6 +397,7 @@ final class RoutingStore {
         object.put("subscription", state.subscription());
         object.put("localId", state.localId());
         object.put("localName", state.localName());
+        if (!state.proxyDnsTarget().isEmpty()) object.put("proxyDnsTarget", state.proxyDnsTarget());
         return object;
     }
 
@@ -463,15 +494,18 @@ final class RoutingStore {
             BackupStore.requireResolved(context);
             recoverPending();
             checkExperimentalAccess(state);
-            byte[] merged = Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps());
-            return apply(merged, state, recreateTun, null);
+            return apply(render(state), state, recreateTun, null);
         });
     }
 
     void applyBackup(State state, List<State> inactive) throws Exception {
         checkExperimentalAccess(state);
+        apply(render(state), state, false, inactive);
+    }
+
+    static byte[] render(State state) throws IOException {
         byte[] merged = Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps());
-        apply(merged, state, false, inactive);
+        return state.proxyDnsTarget().isEmpty() ? merged : Profile.withProxyDns(merged, state.proxyDnsTarget());
     }
 
     void checkExperimentalAccess(State state) throws Exception {
@@ -484,12 +518,12 @@ final class RoutingStore {
         return ProtectionPolicy.parse(new JSONObject(Module.run(command, null)).getJSONObject("policy"));
     }
 
-    String protectionTargetIssue(Module.Status status, byte[] source) throws Exception {
-        return protectionTargetIssue(protectionPolicy(status), source);
+    List<String> missingProtectionTargets(Module.Status status, byte[] source) throws Exception {
+        return missingProtectionTargets(protectionPolicy(status), source);
     }
 
-    private static String protectionTargetIssue(ProtectionPolicy protection, byte[] source) throws IOException {
-        if (!protection.enabled()) return "";
+    private static List<String> missingProtectionTargets(ProtectionPolicy protection, byte[] source) throws IOException {
+        if (!protection.enabled()) return List.of();
         Set<String> targets = new HashSet<>(Profile.routingTargets(source));
         Set<String> missing = new TreeSet<>();
         for (ProtectionPolicy.App app : protection.apps) {
@@ -498,9 +532,7 @@ final class RoutingStore {
         if (protection.strictDns && (!targets.contains(protection.dnsProxy) || !ProtectionPolicy.safeTarget(protection.dnsProxy))) {
             missing.add(protection.dnsProxy);
         }
-        if (missing.isEmpty()) return "";
-        return "新配置缺少防泄漏保护需要的代理组「" + String.join("」、「", missing)
-            + "」。请选择包含这些代理组的配置，或先在「应用防泄漏保护」调整出口。";
+        return List.copyOf(missing);
     }
 
     private ApplyMethod apply(byte[] merged, State state, boolean recreateTun, List<State> backupProfiles) throws Exception {
@@ -522,8 +554,9 @@ final class RoutingStore {
             if (!state.bypassedApps().isEmpty() || before.protection && profileChanged) {
                 ProtectionPolicy protection = protectionPolicy(before);
                 if (profileChanged) {
-                    String issue = protectionTargetIssue(protection, state.source());
-                    if (!issue.isEmpty()) throw new IOException(issue);
+                    List<String> missing = missingProtectionTargets(protection, state.source());
+                    if (!missing.isEmpty()) throw new IOException("新配置缺少防泄漏保护需要的代理组「"
+                        + String.join("」、「", missing) + "」。请重新预览配置并选择可用的保护出口。");
                 }
                 if (!state.bypassedApps().isEmpty()) TunBypass.checkCurrent(context, state.bypassedApps(), protection);
             }
@@ -664,9 +697,10 @@ final class RoutingStore {
         return !recreateTun && status.running() && status.control && status.validate && status.runtime.reported()
             && saved != null && changed != null && installed != null
             && saved.bypassedApps().equals(changed.bypassedApps())
+            && saved.proxyDnsTarget().equals(changed.proxyDnsTarget())
             && Objects.equals(saved.subscription(), changed.subscription()) && Objects.equals(saved.localId(), changed.localId())
             && Arrays.equals(saved.source(), changed.source())
-            && Arrays.equals(installed, Profile.withPersonalRules(saved.source(), saved.applications(), saved.rules(), saved.bypassedApps()));
+            && Arrays.equals(installed, render(saved));
     }
 
     interface LiveChange {

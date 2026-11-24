@@ -66,6 +66,7 @@ final class SubscriptionUpdateStatus {
         for (Throwable cause = error; cause != null; cause = cause.getCause()) {
             if (cause instanceof Module.ProfileFailure) return "内核配置校验失败";
             if (cause instanceof Profile.MissingRoutingTarget) return "订阅缺少分流规则需要的代理组";
+            if (cause instanceof Profile.ProxyDnsConflict) return "新配置无法使用已保存的 DNS 出口，请手动预览";
         }
         return "应用配置失败，请检查 TUN 状态或重新预览";
     }

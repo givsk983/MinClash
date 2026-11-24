@@ -5,8 +5,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.StringReader;
 import java.io.StringWriter;
+import java.net.URLEncoder;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -35,13 +37,20 @@ final class Profile {
     static final class MissingRoutingTarget extends IOException {
         MissingRoutingTarget(String message) { super(message); }
     }
+    static final class ProxyDnsConflict extends IOException {
+        ProxyDnsConflict(String message) { super(message); }
+    }
 
     private static final Pattern LOOPBACK_DNS = Pattern.compile(
         "(?i)^(?:[a-z][a-z0-9+.-]*://)?(?:localhost\\.?|127(?:\\.[0-9]{1,3}){3}|\\[(?:::1|0:0:0:0:0:0:0:1)\\])(?=[:/?#]|$)|^::1$");
     private static final List<String> DNS_UPSTREAMS = Arrays.asList("default-nameserver", "nameserver", "fallback",
         "proxy-server-nameserver", "direct-nameserver");
+    private static final List<String> DNS_POLICIES = List.of("nameserver-policy", "proxy-server-nameserver-policy");
+    private static final String CLOUDFLARE_DOH = "https://1.1.1.1/dns-query";
     private static final List<String> DIRECT_DNS = Arrays.asList(
-        "https://223.5.5.5/dns-query#DIRECT", "https://1.1.1.1/dns-query#DIRECT");
+        "https://223.5.5.5/dns-query#DIRECT", CLOUDFLARE_DOH + "#DIRECT");
+    private static final Set<String> NON_PROXY_TYPES = new HashSet<>(Arrays.asList(
+        "direct", "reject", "reject-drop", "dns", "pass", "compatible", "rematch"));
     private static final Set<String> MANAGED_FIELDS = new HashSet<>(Arrays.asList("port", "socks-port", "mixed-port",
         "redir-port", "tproxy-port", "listeners", "tunnels", "tuic-server", "iptables", "ebpf",
         "ss-config", "vmess-config", "tcptun-config", "udptun-config",
@@ -85,6 +94,14 @@ final class Profile {
     }
 
     static byte[] normalize(byte[] content) throws IOException {
+        return normalize(content, false).source();
+    }
+
+    static LocalYaml prepareLocalYaml(byte[] content) throws IOException {
+        return normalize(content, true);
+    }
+
+    private static LocalYaml normalize(byte[] content, boolean localImport) throws IOException {
         if (content.length > MAX_BYTES) throw new TooLarge();
         String source = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(content)).toString();
         if (source.startsWith("\uFEFF")) source = source.substring(1);
@@ -103,7 +120,8 @@ final class Profile {
                 throw new IOException("配置至少需要 rules、proxies 或 proxy-providers 中的一项。");
             }
             List<NodeTuple> fields = root.getValue();
-            if (!keys.contains("rules") && !keys.contains("proxy-groups")) addDefaultGroup(yaml, fields);
+            GroupChange change = localImport ? completeMainGroup(root, yaml) : null;
+            if (change == null && !keys.contains("rules") && !keys.contains("proxy-groups")) addDefaultGroup(yaml, fields);
             fields.removeIf(tuple -> {
                 String key = keyOf(tuple);
                 return MANAGED_FIELDS.contains(key) || key.startsWith("external-") ||
@@ -129,8 +147,9 @@ final class Profile {
             StringWriter output = new StringWriter();
             yaml.serialize(root, output);
             byte[] normalized = output.toString().getBytes(StandardCharsets.UTF_8);
+            if (normalized.length > MAX_BYTES && change != null) return normalize(content, false);
             if (normalized.length > MAX_BYTES) throw new IOException("应用 TUN 设置后，配置超过 2 MiB。");
-            return normalized;
+            return new LocalYaml(normalized, change);
         } catch (MarkedYAMLException error) {
             int line = error.getProblemMark() == null ? 0 : error.getProblemMark().getLine() + 1;
             throw new IOException(line > 0 ? "YAML 格式有误，请检查第 " + line + " 行。" : "YAML 格式有误。", error);
@@ -148,6 +167,58 @@ final class Profile {
     static boolean hasTunBypass(byte[] content) throws IOException {
         return field(routingRoot(content), "tun") instanceof MappingNode tun
             && field(tun, "exclude-package") instanceof SequenceNode packages && !packages.getValue().isEmpty();
+    }
+
+    static boolean canUseProxyDns(byte[] content) throws IOException {
+        if (content.length > MAX_BYTES) throw new TooLarge();
+        return canUseProxyDns(field(routingRoot(content), "dns"));
+    }
+
+    private static boolean canUseProxyDns(Node configured) throws IOException {
+        if (configured == null || Tag.NULL.equals(configured.getTag())) return true;
+        if (!(configured instanceof MappingNode dns)) return false;
+        keysOf(dns);
+        for (String upstream : DNS_UPSTREAMS) {
+            if (!emptyField(field(dns, upstream))) return false;
+        }
+        for (String policy : DNS_POLICIES) {
+            Node value = field(dns, policy);
+            if (value != null && !Tag.NULL.equals(value.getTag())
+                && !(value instanceof MappingNode mapping && mapping.getValue().isEmpty())) return false;
+        }
+        return true;
+    }
+
+    // Apply to the effective configuration. The subscription remains the source of truth.
+    static byte[] withProxyDns(byte[] content, String target) throws IOException {
+        if (content.length > MAX_BYTES) throw new TooLarge();
+        MappingNode root = routingRoot(content);
+        Node configured = field(root, "dns");
+        if (!canUseProxyDns(configured)) throw new ProxyDnsConflict("当前配置已指定 DNS 上游或解析规则，不能开启 DNS 经代理。");
+        if (!safeProxyDnsName(target) || !proxyDnsTargets(root).contains(target)) {
+            throw new ProxyDnsConflict("DNS 代理出口已不可用，请重新选择有效的代理节点或组。");
+        }
+
+        Yaml yaml = new Yaml();
+        MappingNode dns = configured instanceof MappingNode mapping
+            ? new MappingNode(Tag.MAP, new ArrayList<>(mapping.getValue()), mapping.getFlowStyle())
+            : (MappingNode) yaml.represent(new LinkedHashMap<>());
+        // Mihomo decodes the fragment before looking up the adapter name.
+        String fragment = URLEncoder.encode(target, StandardCharsets.UTF_8.name()).replace("+", "%20");
+        List<String> resolver = List.of(CLOUDFLARE_DOH + "#" + fragment);
+        setField(dns, yaml, "enable", yaml.represent(true));
+        setField(dns, yaml, "prefer-h3", yaml.represent(false));
+        setField(dns, yaml, "nameserver", yaml.represent(resolver));
+        setField(dns, yaml, "direct-nameserver", yaml.represent(resolver));
+        setField(dns, yaml, "default-nameserver", yaml.represent(DIRECT_DNS));
+        setField(dns, yaml, "proxy-server-nameserver", yaml.represent(DIRECT_DNS));
+        setField(root, yaml, "dns", dns);
+
+        StringWriter output = new StringWriter();
+        yaml.serialize(root, output);
+        byte[] updated = output.toString().getBytes(StandardCharsets.UTF_8);
+        if (updated.length > MAX_BYTES) throw new TooLarge();
+        return updated;
     }
 
     static byte[] repairDns(byte[] content) throws IOException {
@@ -219,6 +290,306 @@ final class Profile {
         names.add("DIRECT");
         names.addAll(namedEntries(field(root, "proxy-groups")).keySet());
         return new ArrayList<>(names);
+    }
+
+    static List<String> proxyDnsTargets(byte[] content) throws IOException {
+        if (content.length > MAX_BYTES) throw new TooLarge();
+        return proxyDnsTargets(routingRoot(content));
+    }
+
+    private static List<String> proxyDnsTargets(MappingNode root) {
+        Map<String, MappingNode> groups = namedEntries(field(root, "proxy-groups"));
+        Map<String, MappingNode> nodes = namedEntries(field(root, "proxies"));
+        Set<String> providers = providerNames(field(root, "proxy-providers"));
+        Set<String> remoteNodes = new LinkedHashSet<>();
+        Set<String> rejects = new HashSet<>(List.of("REJECT", "REJECT-DROP"));
+        nodes.forEach((name, node) -> {
+            if (isProxyNode(node)) remoteNodes.add(name);
+            if ("reject".equalsIgnoreCase(text(field(node, "type")))) rejects.add(name);
+        });
+        boolean hasDirectNode = nodes.keySet().stream().anyMatch(name -> !remoteNodes.contains(name) && !rejects.contains(name));
+        List<String> targets = new ArrayList<>();
+        groups.forEach((name, group) -> {
+            if (safeProxyDnsName(name) && routesToProxy(group, groups, remoteNodes, providers)
+                && keepsProxyDnsOffDirect(group, groups, remoteNodes, rejects, providers, hasDirectNode)) {
+                targets.add(name);
+            }
+        });
+        remoteNodes.stream().filter(Profile::safeProxyDnsName).forEach(targets::add);
+        return List.copyOf(targets);
+    }
+
+    // The ordinary DNS dialer accepts a group selecting DIRECT, including its default
+    // COMPATIBLE fallback. Offer only groups without a known path to direct DNS.
+    private static boolean keepsProxyDnsOffDirect(MappingNode group, Map<String, MappingNode> groups,
+                                                  Set<String> nodes, Set<String> rejects, Set<String> providers,
+                                                  boolean hasDirectNode) {
+        ArrayDeque<MappingNode> pending = new ArrayDeque<>();
+        Set<MappingNode> visited = new HashSet<>();
+        pending.add(group);
+        while (!pending.isEmpty()) {
+            MappingNode current = pending.remove();
+            if (!visited.add(current)) continue;
+            boolean all = enabled(current, "include-all");
+            boolean allNodes = all || enabled(current, "include-all-proxies");
+            boolean usesProviders = !emptyField(field(current, "use"))
+                || !providers.isEmpty() && (all || enabled(current, "include-all-providers"));
+            String excluded = text(field(current, "exclude-type"));
+            if (usesProviders || allNodes && hasDirectNode) {
+                if (Arrays.stream(excluded.split("\\|")).noneMatch("Direct"::equalsIgnoreCase)) return false;
+            }
+            if (usesProviders || !excluded.isEmpty() || !text(field(current, "exclude-filter")).isEmpty()
+                || allNodes && (nodes.isEmpty() || !text(field(current, "filter")).isEmpty())) {
+                String fallback = text(field(current, "empty-fallback"));
+                if (!nodes.contains(fallback) && !rejects.contains(fallback)) return false;
+            }
+            if (field(current, "proxies") instanceof SequenceNode members) {
+                for (Node member : members.getValue()) {
+                    String name = text(member);
+                    if (nodes.contains(name) || rejects.contains(name)) continue;
+                    MappingNode nested = groups.get(name);
+                    if (nested == null) return false;
+                    pending.add(nested);
+                }
+            }
+        }
+        return true;
+    }
+
+    private static boolean safeProxyDnsName(String name) {
+        return safeAliasName(name) && !name.trim().isEmpty() && !name.equalsIgnoreCase("RULES") && !name.contains("=");
+    }
+
+    static List<String> protectionAliasTargets(byte[] content, String alias) throws IOException {
+        if (content.length > MAX_BYTES) throw new TooLarge();
+        return protectionAliasOptions(routingRoot(content), alias).targets();
+    }
+
+    static byte[] withProtectionAlias(byte[] content, String alias, String target) throws IOException {
+        if (content.length > MAX_BYTES) throw new TooLarge();
+        MappingNode root = routingRoot(content);
+        ProtectionAliasOptions options = protectionAliasOptions(root, alias);
+        if (!safeAliasName(target) || !options.targets().contains(target)) {
+            throw new IOException("请选择新配置中可用的代理组作为防泄漏出口。");
+        }
+        Yaml yaml = new Yaml();
+        Map<String, Object> selector = new LinkedHashMap<>();
+        selector.put("name", alias);
+        selector.put("type", "select");
+        selector.put("hidden", true);
+        selector.put("proxies", List.of(target));
+        selector.put("empty-fallback", "REJECT");
+        List<Node> groups = new ArrayList<>(options.groups().getValue());
+        groups.add(yaml.represent(selector));
+        setField(root, yaml, "proxy-groups", new SequenceNode(Tag.SEQ, groups, options.groups().getFlowStyle()));
+        StringWriter output = new StringWriter();
+        yaml.serialize(root, output);
+        byte[] updated = output.toString().getBytes(StandardCharsets.UTF_8);
+        if (updated.length > MAX_BYTES) throw new TooLarge();
+        return updated;
+    }
+
+    private record ProtectionAliasOptions(SequenceNode groups, List<String> targets) {}
+
+    private static ProtectionAliasOptions protectionAliasOptions(MappingNode root, String alias) throws IOException {
+        if (!safeAliasName(alias)) throw new IOException("防泄漏出口名称无效。");
+        if (!(field(root, "proxy-groups") instanceof SequenceNode configured)) {
+            return new ProtectionAliasOptions(null, List.of());
+        }
+        Map<String, MappingNode> groups = namedEntries(configured);
+        Map<String, MappingNode> nodes = namedEntries(field(root, "proxies"));
+        Set<String> providers = providerNames(field(root, "proxy-providers"));
+        if (groups.containsKey(alias) || nodes.containsKey(alias) || providers.contains(alias)
+            || providerNames(field(root, "rule-providers")).contains(alias)) {
+            throw new IOException("防泄漏出口名称与新配置中的现有名称冲突。");
+        }
+        Set<String> remoteNodes = new HashSet<>();
+        nodes.forEach((name, node) -> { if (isProxyNode(node)) remoteNodes.add(name); });
+        Set<String> dependents = aliasDependents(groups, alias);
+        List<String> targets = new ArrayList<>();
+        groups.forEach((name, group) -> {
+            if (safeAliasName(name) && !dependents.contains(name) && routesToProxy(group, groups, remoteNodes, providers)) {
+                targets.add(name);
+            }
+        });
+        return new ProtectionAliasOptions(configured, List.copyOf(targets));
+    }
+
+    private static boolean safeAliasName(String name) {
+        return ProtectionPolicy.safeTarget(name) && !name.equalsIgnoreCase("PASS-RULE") && !name.equalsIgnoreCase("default");
+    }
+
+    private static Set<String> providerNames(Node node) {
+        Set<String> names = new HashSet<>();
+        if (node instanceof MappingNode providers) {
+            for (NodeTuple entry : providers.getValue()) if (entry.getKeyNode() instanceof ScalarNode key) names.add(key.getValue());
+        }
+        return names;
+    }
+
+    private static Set<String> aliasDependents(Map<String, MappingNode> groups, String alias) {
+        Map<String, List<String>> parents = new LinkedHashMap<>();
+        groups.forEach((name, group) -> {
+            if (field(group, "proxies") instanceof SequenceNode members) {
+                for (Node member : members.getValue()) {
+                    parents.computeIfAbsent(text(member), unused -> new ArrayList<>()).add(name);
+                }
+            }
+        });
+        Set<String> dependents = new HashSet<>();
+        ArrayDeque<String> pending = new ArrayDeque<>();
+        pending.add(alias);
+        while (!pending.isEmpty()) {
+            String name = pending.remove();
+            if (dependents.add(name)) pending.addAll(parents.getOrDefault(name, List.of()));
+        }
+        return dependents;
+    }
+
+    enum GroupUpdate { CREATED, FILLED, NONE }
+
+    record GroupChange(String name, int nodes, int providers, GroupUpdate update, boolean addedCatchAll) {}
+    record LocalYaml(byte[] source, GroupChange group) {
+        String addedGroup() { return group == null || group.update() == GroupUpdate.NONE ? "" : group.name(); }
+        boolean addedCatchAll() { return group != null && group.addedCatchAll(); }
+    }
+
+    private static GroupChange completeMainGroup(MappingNode root, Yaml yaml) {
+        Node configuredGroups = field(root, "proxy-groups");
+        if (configuredGroups != null && !Tag.NULL.equals(configuredGroups.getTag()) && !(configuredGroups instanceof SequenceNode)) return null;
+        Map<String, MappingNode> groups = namedEntries(configuredGroups);
+        Map.Entry<String, MappingNode> primary = groups.entrySet().stream()
+            .filter(entry -> ProxyGroupSection.isProxies(entry.getKey())).findFirst().orElse(null);
+        if (primary == null) {
+            for (Map.Entry<String, MappingNode> entry : groups.entrySet()) {
+                if (ProxyGroupSection.isGlobal(entry.getKey()) || ProxyGroupSection.of(entry.getKey()) != ProxyGroupSection.MAIN) continue;
+                if (hasGroupMembers(entry.getValue())) {
+                    primary = entry;
+                    break;
+                }
+                if (primary == null) primary = entry;
+            }
+        }
+        boolean populated = primary != null && hasGroupMembers(primary.getValue());
+        if (populated && !canAddCatchAll(root, primary.getKey())) return null;
+
+        Map<String, MappingNode> declared = namedEntries(field(root, "proxies"));
+        List<String> nodes = new ArrayList<>();
+        for (Map.Entry<String, MappingNode> node : declared.entrySet()) {
+            if (!node.getKey().trim().isEmpty() && isProxyNode(node.getValue())) nodes.add(node.getKey());
+        }
+        List<String> providers = new ArrayList<>();
+        if (field(root, "proxy-providers") instanceof MappingNode providerMap) {
+            for (NodeTuple entry : providerMap.getValue()) {
+                String key = text(entry.getKeyNode());
+                if (!key.trim().isEmpty() && entry.getValueNode() instanceof MappingNode) providers.add(key);
+            }
+        }
+        if (nodes.isEmpty() && providers.isEmpty()) return null;
+        if (populated) {
+            if (!routesToProxy(primary.getValue(), groups, new HashSet<>(nodes), new HashSet<>(providers))) return null;
+            addCatchAll(root, yaml, primary.getKey());
+            return new GroupChange(primary.getKey(), 0, 0, GroupUpdate.NONE, true);
+        }
+
+        String name = primary == null ? unusedGroupName(declared.keySet(), providers, groups.keySet()) : primary.getKey();
+        List<Node> entries = configuredGroups instanceof SequenceNode list ? new ArrayList<>(list.getValue()) : new ArrayList<>();
+        List<NodeTuple> settings = primary == null ? new ArrayList<>() : new ArrayList<>(primary.getValue().getValue());
+        MappingNode group = new MappingNode(Tag.MAP, settings, org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK);
+        if (primary == null) setField(group, yaml, "name", yaml.represent(name));
+        if (emptyField(field(group, "type"))) setField(group, yaml, "type", yaml.represent("select"));
+        if (!nodes.isEmpty()) setField(group, yaml, "proxies", yaml.represent(nodes));
+        if (!providers.isEmpty()) {
+            setField(group, yaml, "use", yaml.represent(providers));
+            String excluded = text(field(group, "exclude-type"));
+            String specials = "Direct|Reject|RejectDrop|Dns|Pass|Compatible|Rematch";
+            setField(group, yaml, "exclude-type", yaml.represent(excluded.isEmpty() ? specials : excluded + "|" + specials));
+            if (emptyField(field(group, "empty-fallback"))) setField(group, yaml, "empty-fallback", yaml.represent("REJECT"));
+        }
+        if (primary == null) entries.add(group);
+        else entries.set(entries.indexOf(primary.getValue()), group);
+        setField(root, yaml, "proxy-groups", new SequenceNode(Tag.SEQ, entries, org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK));
+
+        boolean catchAll = canAddCatchAll(root, name);
+        if (catchAll) addCatchAll(root, yaml, name);
+        return new GroupChange(name, nodes.size(), providers.size(), primary == null ? GroupUpdate.CREATED : GroupUpdate.FILLED, catchAll);
+    }
+
+    private static boolean canAddCatchAll(MappingNode root, String name) {
+        Node mode = field(root, "mode");
+        return field(root, "rules") == null && name.matches("[^\\r\\n,]+")
+            && (mode == null || "rule".equalsIgnoreCase(text(mode)));
+    }
+
+    private static void addCatchAll(MappingNode root, Yaml yaml, String name) {
+        setField(root, yaml, "rules", yaml.represent(Collections.singletonList("MATCH," + name)));
+    }
+
+    private static boolean routesToProxy(MappingNode primary, Map<String, MappingNode> groups, Set<String> nodes, Set<String> providers) {
+        ArrayDeque<MappingNode> pending = new ArrayDeque<>();
+        Set<MappingNode> visited = new HashSet<>();
+        pending.add(primary);
+        while (!pending.isEmpty()) {
+            MappingNode group = pending.remove();
+            if (!visited.add(group)) continue;
+            boolean all = enabled(group, "include-all");
+            if (!nodes.isEmpty() && (all || enabled(group, "include-all-proxies"))) return true;
+            if (!providers.isEmpty() && (all || enabled(group, "include-all-providers"))) return true;
+            if (field(group, "use") instanceof SequenceNode use
+                && use.getValue().stream().map(Profile::text).anyMatch(providers::contains)) return true;
+            if (field(group, "proxies") instanceof SequenceNode members) {
+                for (Node member : members.getValue()) {
+                    String name = text(member);
+                    if (nodes.contains(name)) return true;
+                    MappingNode nested = groups.get(name);
+                    if (nested != null) pending.add(nested);
+                }
+            }
+        }
+        return false;
+    }
+
+    private static String unusedGroupName(Set<String> nodes, List<String> providers, Set<String> groups) {
+        Set<String> occupied = new HashSet<>();
+        for (String node : nodes) occupied.add(node.toLowerCase(Locale.ROOT));
+        for (String provider : providers) occupied.add(provider.toLowerCase(Locale.ROOT));
+        for (String group : groups) occupied.add(group.toLowerCase(Locale.ROOT));
+        String name = "PROXIES";
+        for (int suffix = 1; occupied.contains(name.toLowerCase(Locale.ROOT)); suffix++) {
+            name = suffix == 1 ? "MinClash" : "MinClash " + suffix;
+        }
+        return name;
+    }
+
+    private static boolean hasGroupMembers(MappingNode group) {
+        return !emptyField(field(group, "proxies")) || !emptyField(field(group, "use"))
+            || enabled(group, "include-all") || enabled(group, "include-all-proxies") || enabled(group, "include-all-providers");
+    }
+
+    private static boolean emptyField(Node node) {
+        return node == null || Tag.NULL.equals(node.getTag()) || (node instanceof SequenceNode sequence && sequence.getValue().isEmpty());
+    }
+
+    private static void setField(MappingNode map, Yaml yaml, String key, Node value) {
+        List<NodeTuple> fields = map.getValue();
+        for (int i = 0; i < fields.size(); i++) {
+            NodeTuple field = fields.get(i);
+            if (field.getKeyNode() instanceof ScalarNode scalar && scalar.getValue().equals(key)) {
+                fields.set(i, new NodeTuple(scalar, value));
+                return;
+            }
+        }
+        fields.add(new NodeTuple(yaml.represent(key), value));
+    }
+
+    private static boolean isProxyNode(MappingNode node) {
+        if (node == null) return false;
+        String type = text(field(node, "type")).trim().toLowerCase(Locale.ROOT);
+        return !type.isEmpty() && !NON_PROXY_TYPES.contains(type);
+    }
+
+    private static String text(Node node) {
+        return node instanceof ScalarNode scalar && Tag.STR.equals(scalar.getTag()) ? scalar.getValue() : "";
     }
 
     record PreviewGroup(Set<String> members, boolean allNodes, boolean providerNodes) {}
