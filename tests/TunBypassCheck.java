@@ -54,7 +54,9 @@ public final class TunBypassCheck {
         JSONObject oldBackup = BackupArchive.json(backup).put("version", 2);
         oldBackup.remove("bypassedApps");
         require(BackupArchive.decode(envelope(oldBackup), new char[0]).state().bypassedApps().isEmpty(), "version 2 backup migration");
-        reject(() -> BackupArchive.decode(envelope(BackupArchive.json(backup).put("version", 4)), new char[0]), "unknown backup version");
+        JSONObject futureBackup = BackupArchive.json(backup);
+        futureBackup.put("version", futureBackup.getInt("version") + 1);
+        reject(() -> BackupArchive.decode(envelope(futureBackup), new char[0]), "unknown backup version");
         reject(() -> TunBypass.parse(new JSONArray().put(GAME).put(GAME)), "duplicate package");
         reject(() -> TunBypass.parse(new JSONArray().put(1)), "non-string package");
         reject(() -> TunBypass.validate(Set.of("com.game\nuidrange 0-0"), Map.of()), "unsafe package");

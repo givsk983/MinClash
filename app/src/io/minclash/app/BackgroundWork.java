@@ -7,11 +7,13 @@ import java.util.concurrent.Executors;
 final class BackgroundWork {
     static final ExecutorService DOWNLOADS = Executors.newFixedThreadPool(2);
     final RetainedTask<AppUpdate.Release> updateCheck = new RetainedTask<>();
-    final RetainedTask<SubscriptionPreview> preview = new RetainedTask<>();
+    final RetainedTask<ProfilePreview> preview = new RetainedTask<>();
     final RetainedTask<Void> subscriptionSave = new RetainedTask<>();
     final RetainedTask<Void> updateDownload = new RetainedTask<>();
     final RetainedTask<Object> backup = new RetainedTask<>();
     final RetainedTask<UsageResult> usage = new RetainedTask<>();
+    record ProfilePreview(SubscriptionPreview changes, RoutingStore.State copyFrom, String protectionIssue) {}
+    SubscriptionPreview editedPreview;
     record UsageResult(SubscriptionCatalog.Entry entry, SubscriptionUsage value) {}
     byte[] pendingExport;
     boolean backupRestoring;

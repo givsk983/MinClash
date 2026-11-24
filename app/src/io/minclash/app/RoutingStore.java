@@ -10,21 +10,28 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import org.json.JSONArray;
 import org.json.JSONObject;
-import java.util.Objects;
 
 /** Private subscription source and personal policies, independent of the generated core config. */
 final class RoutingStore {
+    static final String LEGACY_LOCAL_ID = "legacy-local";
+    private static final String LEGACY_LOCAL_NAME = "本地配置";
+    private static final String INACTIVE_PROFILES = "inactiveProfiles";
+
     // Serialize configuration changes across Activities and scheduled subscription updates.
     static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
     private static volatile int generation;
@@ -38,7 +45,11 @@ final class RoutingStore {
     }
 
     record State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules,
-                 Set<String> bypassedApps) {
+                 Set<String> bypassedApps, String localId, String localName) {
+        State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules,
+              Set<String> bypassedApps) {
+            this(source, applications, subscription, rules, bypassedApps, null, null);
+        }
         State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules) {
             this(source, applications, subscription, rules, Collections.emptySet());
         }
@@ -50,14 +61,19 @@ final class RoutingStore {
         State {
             source = source.clone();
             applications = Collections.unmodifiableMap(new TreeMap<>(applications));
-            rules = Collections.unmodifiableList(new java.util.ArrayList<>(rules));
+            rules = Collections.unmodifiableList(new ArrayList<>(rules));
             bypassedApps = Collections.unmodifiableSet(new TreeSet<>(bypassedApps));
         }
-        State withSource(byte[] source, String subscription) { return new State(source, applications, subscription, rules, bypassedApps); }
-        State withApplications(Map<String, String> applications) { return new State(source, applications, subscription, rules, bypassedApps); }
-        State withRules(List<PersonalRules.Rule> rules) { return new State(source, applications, subscription, rules, bypassedApps); }
-        State withBypassedApps(Set<String> packages) { return new State(source, applications, subscription, rules, packages); }
+        State withSource(byte[] source, String subscription) {
+            boolean local = subscription == null || subscription.isEmpty();
+            return new State(source, applications, subscription, rules, bypassedApps, local ? localId : null, local ? localName : null);
+        }
+        State withApplications(Map<String, String> applications) { return new State(source, applications, subscription, rules, bypassedApps, localId, localName); }
+        State withRules(List<PersonalRules.Rule> rules) { return new State(source, applications, subscription, rules, bypassedApps, localId, localName); }
+        State withBypassedApps(Set<String> packages) { return new State(source, applications, subscription, rules, packages, localId, localName); }
     }
+
+    record LocalProfile(String id, String name, boolean active) {}
 
     private final AtomicFile file;
     private final ProfileApplyJournal journal;
@@ -71,7 +87,7 @@ final class RoutingStore {
 
     State load() throws Exception {
         State saved = read();
-        return saved == null ? new State(Profile.normalize(Module.readProfile()), Collections.emptyMap()) : saved;
+        return saved == null ? installedState(Module.readProfile()) : saved;
     }
 
     State loadIfAvailable(Module.Status status) throws Exception {
@@ -85,14 +101,119 @@ final class RoutingStore {
         if (!status.profile) return null;
         byte[] installed = Module.readProfile();
         if (!Profile.hasTunBypass(installed)) return null;
-        return saved == null ? new State(Profile.normalize(installed), Map.of()) : saved;
+        return saved == null ? installedState(installed) : saved;
     }
 
     void importProfile(byte[] source, String subscription) throws Exception {
         RoutingMutations.run(context, () -> {
             recoverPending();
-            State saved = read();
-            return apply(saved == null ? new State(source, Collections.emptyMap(), subscription) : saved.withSource(source, subscription));
+            State target = subscription.isEmpty() ? forLocalProfile(LEGACY_LOCAL_ID) : forSubscription(subscription);
+            return apply(target == null ? new State(source, Collections.emptyMap(), subscription) : target.withSource(source, subscription));
+        });
+    }
+
+    State forSubscription(String address) throws Exception {
+        if (address.isEmpty()) return null;
+        JSONObject object = readObject();
+        if (object == null) return null;
+        String activeAddress = object.isNull("subscription") ? legacyAddress() : object.getString("subscription");
+        if (address.equals(activeAddress)) return activeState(object);
+        JSONArray profiles = object.optJSONArray(INACTIVE_PROFILES);
+        if (profiles != null) for (int index = 0; index < profiles.length(); index++) {
+            JSONObject profile = profiles.getJSONObject(index);
+            if (address.equals(profile.optString("subscription"))) return decodeState(profile);
+        }
+        return null;
+    }
+
+    State forLocalProfile(String id) throws Exception {
+        JSONObject object = readObject();
+        LocalProfile active = localEntry(object, true);
+        if (active != null && active.id().equals(id)) {
+            return object == null ? installedState(Module.readProfile()) : activeState(object);
+        }
+        if (object == null) return null;
+        JSONArray profiles = object.optJSONArray(INACTIVE_PROFILES);
+        if (profiles != null) for (int index = 0; index < profiles.length(); index++) {
+            JSONObject profile = profiles.getJSONObject(index);
+            if (id.equals(profile.optString("localId"))) return decodeState(profile);
+        }
+        return null;
+    }
+
+    List<LocalProfile> localProfileEntries() throws Exception {
+        JSONObject object = readObject();
+        List<LocalProfile> local = new ArrayList<>();
+        LocalProfile active = localEntry(object, true);
+        if (active != null) local.add(active);
+        JSONArray profiles = object == null ? null : object.optJSONArray(INACTIVE_PROFILES);
+        if (profiles != null) for (int index = 0; index < profiles.length(); index++) {
+            LocalProfile entry = localEntry(profiles.getJSONObject(index), false);
+            if (entry != null) local.add(entry);
+        }
+        return Collections.unmodifiableList(local);
+    }
+
+    private LocalProfile localEntry(JSONObject object, boolean active) throws Exception {
+        if (object == null) {
+            if (!legacyAddress().isEmpty()) return null;
+            try { if (Module.status().profile) return new LocalProfile(LEGACY_LOCAL_ID, LEGACY_LOCAL_NAME, true); }
+            catch (IOException unavailable) { /* The subscription catalog is also usable without Root. */ }
+            return null;
+        }
+        String address = object.isNull("subscription") && active ? legacyAddress() : object.optString("subscription");
+        return address.isEmpty() ? new LocalProfile(object.optString("localId", LEGACY_LOCAL_ID),
+            object.optString("localName", LEGACY_LOCAL_NAME), active) : null;
+    }
+
+    List<State> inactiveProfiles() throws Exception {
+        return Collections.unmodifiableList(inactiveProfiles(readObject()));
+    }
+
+    void deleteLocalProfile(String id) throws Exception {
+        forgetProfile("local:" + id, "请切换到其他配置，再删除当前本地配置。");
+    }
+
+    void forgetSubscription(String address) throws Exception {
+        if (!address.isEmpty()) forgetProfile("subscription:" + address, "请切换到其他配置，再删除当前订阅。");
+    }
+
+    private void forgetProfile(String identity, String activeMessage) throws Exception {
+        RoutingMutations.run(context, () -> {
+            BackupStore.requireResolved(context);
+            recoverPending();
+            JSONObject saved = readObject();
+            if (saved == null) return null;
+            State active = activeState(saved);
+            if (identity(active).equals(identity)) throw new IOException(activeMessage);
+            JSONArray inactive = saved.optJSONArray(INACTIVE_PROFILES);
+            JSONArray remaining = withoutProfile(inactive, identity);
+            if (inactive == null || remaining.length() == inactive.length()) return null;
+            restoreSnapshot(encodeProfiles(active, remaining));
+            return null;
+        });
+    }
+
+    void clearInactiveBypass() throws Exception {
+        RoutingMutations.run(context, () -> {
+            JSONObject saved = readObject();
+            JSONArray profiles = saved == null ? null : saved.optJSONArray(INACTIVE_PROFILES);
+            if (profiles == null) return null;
+            BackupStore.requireResolved(context);
+            if (recoverPending()) {
+                saved = readObject();
+                profiles = saved == null ? null : saved.optJSONArray(INACTIVE_PROFILES);
+            }
+            boolean changed = false;
+            if (profiles != null) for (int index = 0; index < profiles.length(); index++) {
+                JSONObject profile = profiles.getJSONObject(index);
+                JSONArray bypass = profile.optJSONArray("bypassedApps");
+                if (bypass == null || bypass.length() == 0) continue;
+                profile.put("bypassedApps", new JSONArray());
+                changed = true;
+            }
+            if (changed) restoreSnapshot(saved.toString().getBytes(StandardCharsets.UTF_8));
+            return null;
         });
     }
 
@@ -103,7 +224,7 @@ final class RoutingStore {
             byte[] installed = Module.readProfile();
             byte[] repaired = Profile.repairDns(installed);
             if (installed == repaired) return false;
-            apply(repaired, null, false, false);
+            apply(repaired, null, false, null);
             return true;
         });
     }
@@ -113,10 +234,92 @@ final class RoutingStore {
         return object == null ? legacyAddress : object.optString("subscription", legacyAddress);
     }
 
+    private String legacyAddress() {
+        return context.getSharedPreferences("MainActivity", Context.MODE_PRIVATE).getString("subscription", "");
+    }
+
     private State read() throws Exception {
         JSONObject object = readObject();
-        if (object == null) return null;
-        return decodeState(object);
+        return object == null ? null : activeState(object);
+    }
+
+    private State activeState(JSONObject object) throws Exception {
+        State state = decodeState(object);
+        return identify(state, state.subscription() == null ? legacyAddress() : "");
+    }
+
+    private State installedState(byte[] installed) throws IOException {
+        return identify(new State(Profile.normalize(installed), Collections.emptyMap()), legacyAddress());
+    }
+
+    private static State identify(State state, String fallbackSubscription) throws IOException {
+        String address = state.subscription() == null ? fallbackSubscription : state.subscription();
+        if (!address.isEmpty()) {
+            if (state.localId() != null || state.localName() != null) throw new IOException("配置标识无效。");
+            return state.subscription() != null ? state : state.withSource(state.source(), address);
+        }
+        String id = state.localId();
+        String name = state.localName();
+        if (id == null && name == null) {
+            return new State(state.source(), state.applications(), "", state.rules(), state.bypassedApps(), LEGACY_LOCAL_ID, LEGACY_LOCAL_NAME);
+        }
+        if (id == null || !id.matches("[A-Za-z0-9_-]{1,64}") || name == null || name.trim().isEmpty() || name.length() > 128) {
+            throw new IOException("本地配置名称或标识无效。");
+        }
+        return state.subscription() != null ? state : state.withSource(state.source(), "");
+    }
+
+    private static String identity(State state) {
+        return state.subscription().isEmpty() ? "local:" + state.localId() : "subscription:" + state.subscription();
+    }
+
+    private static List<State> inactiveProfiles(JSONObject object) throws Exception {
+        List<State> result = new ArrayList<>();
+        JSONArray profiles = object == null ? null : object.optJSONArray(INACTIVE_PROFILES);
+        if (profiles != null) for (int index = 0; index < profiles.length(); index++) {
+            result.add(identify(decodeState(profiles.getJSONObject(index)), ""));
+        }
+        return result;
+    }
+
+    private static JSONArray withoutProfile(JSONArray inactive, String identity) throws Exception {
+        JSONArray result = new JSONArray();
+        if (inactive != null) for (int index = 0; index < inactive.length(); index++) {
+            JSONObject entry = inactive.getJSONObject(index);
+            String address = entry.getString("subscription");
+            String key = address.isEmpty() ? "local:" + entry.getString("localId") : "subscription:" + address;
+            if (!key.equals(identity)) result.put(entry);
+        }
+        return result;
+    }
+
+    private static JSONArray switchingTo(State next, State current, JSONObject saved) throws Exception {
+        String target = identity(next);
+        JSONArray inactive = withoutProfile(saved == null ? null : saved.optJSONArray(INACTIVE_PROFILES), target);
+        if (current != null && !identity(current).equals(target)) inactive.put(encodeState(current));
+        return inactive;
+    }
+
+    private static JSONArray encodeInactiveProfiles(State active, List<State> inactive) throws Exception {
+        Set<String> seen = new HashSet<>();
+        seen.add(identity(active));
+        JSONArray result = new JSONArray();
+        for (State state : inactive) {
+            State profile = identify(state, "");
+            if (!seen.add(identity(profile))) throw new IOException("保存的配置包含重复项。");
+            result.put(encodeState(profile));
+        }
+        return result;
+    }
+
+    private static byte[] encodeProfiles(State active, JSONArray inactive) throws Exception {
+        JSONObject object = encodeState(active);
+        if (inactive.length() > 0) object.put(INACTIVE_PROFILES, inactive);
+        byte[] bytes = object.toString().getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > BackupArchive.MAX_BYTES) {
+            throw new IOException("已保存的配置超过 16 MiB，请删除不再使用的配置后重试。");
+        }
+        return bytes;
     }
 
     static State decodeState(JSONObject object) throws Exception {
@@ -131,7 +334,8 @@ final class RoutingStore {
         Set<String> bypassed = version < 3 ? Collections.emptySet() : TunBypass.parse(object.getJSONArray("bypassedApps"));
         TunBypass.validate(bypassed, applications);
         return new State(Profile.normalize(object.getString("source").getBytes(StandardCharsets.UTF_8)), applications,
-            object.optString("subscription", null), PersonalRules.parse(version == 1 ? null : object.getJSONArray("personalRules")), bypassed);
+            object.optString("subscription", null), PersonalRules.parse(version == 1 ? null : object.getJSONArray("personalRules")),
+            bypassed, object.optString("localId", null), object.optString("localName", null));
     }
 
     private JSONObject readObject() throws Exception {
@@ -143,7 +347,7 @@ final class RoutingStore {
             byte[] buffer = new byte[8192];
             int count;
             while ((count = input.read(buffer)) != -1) {
-                if (bytes.size() + count > Profile.MAX_BYTES * 8) throw new IOException("应用分流设置过大。");
+                if (bytes.size() + count > BackupArchive.MAX_BYTES) throw new IOException("应用分流设置过大。");
                 bytes.write(buffer, 0, count);
             }
             JSONObject object = new JSONObject(bytes.toString(StandardCharsets.UTF_8.name()));
@@ -156,16 +360,21 @@ final class RoutingStore {
         JSONObject object = new JSONObject();
         TunBypass.validate(state.bypassedApps(), state.applications());
         object.put("version", 3);
-        object.put("bypassedApps", new org.json.JSONArray(state.bypassedApps()));
+        object.put("bypassedApps", new JSONArray(state.bypassedApps()));
         object.put("personalRules", PersonalRules.json(state.rules()));
         object.put("source", new String(state.source(), StandardCharsets.UTF_8));
         object.put("applications", new JSONObject(state.applications()));
         object.put("subscription", state.subscription());
+        object.put("localId", state.localId());
+        object.put("localName", state.localName());
         return object;
     }
 
     private void save(State state) throws Exception {
-        restoreSnapshot(encodeState(state).toString().getBytes(StandardCharsets.UTF_8));
+        JSONObject object = readObject();
+        State active = object == null ? null : activeState(object);
+        State next = identify(state, active == null ? "" : active.subscription());
+        restoreSnapshot(encodeProfiles(next, switchingTo(next, active, object)));
     }
 
     static final class RecoveryPending extends IOException {
@@ -255,48 +464,97 @@ final class RoutingStore {
             recoverPending();
             checkExperimentalAccess(state);
             byte[] merged = Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps());
-            return apply(merged, state, recreateTun, false);
+            return apply(merged, state, recreateTun, null);
         });
     }
 
-    void applyBackup(State state) throws Exception {
+    void applyBackup(State state, List<State> inactive) throws Exception {
         checkExperimentalAccess(state);
         byte[] merged = Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps());
-        apply(merged, state, false, true);
+        apply(merged, state, false, inactive);
     }
 
     void checkExperimentalAccess(State state) throws Exception {
         ExperimentalFeatures.checkBypass(ExperimentalFeatures.enabled(context), state.bypassedApps());
     }
 
-    private ApplyMethod apply(byte[] merged, State state, boolean recreateTun, boolean restoringBackup) throws Exception {
+    private static ProtectionPolicy protectionPolicy(Module.Status status) throws Exception {
+        if (!status.protection) return new ProtectionPolicy();
+        Module.Command command = status.functionalRevision() >= 10 ? Module.Command.PROTECTION_POLICY : Module.Command.PROTECTION_GET;
+        return ProtectionPolicy.parse(new JSONObject(Module.run(command, null)).getJSONObject("policy"));
+    }
+
+    String protectionTargetIssue(Module.Status status, byte[] source) throws Exception {
+        return protectionTargetIssue(protectionPolicy(status), source);
+    }
+
+    private static String protectionTargetIssue(ProtectionPolicy protection, byte[] source) throws IOException {
+        if (!protection.enabled()) return "";
+        Set<String> targets = new HashSet<>(Profile.routingTargets(source));
+        Set<String> missing = new TreeSet<>();
+        for (ProtectionPolicy.App app : protection.apps) {
+            if (!targets.contains(app.target()) || !ProtectionPolicy.safeTarget(app.target())) missing.add(app.target());
+        }
+        if (protection.strictDns && (!targets.contains(protection.dnsProxy) || !ProtectionPolicy.safeTarget(protection.dnsProxy))) {
+            missing.add(protection.dnsProxy);
+        }
+        if (missing.isEmpty()) return "";
+        return "新配置缺少防泄漏保护需要的代理组「" + String.join("」、「", missing)
+            + "」。请选择包含这些代理组的配置，或先在「应用防泄漏保护」调整出口。";
+    }
+
+    private ApplyMethod apply(byte[] merged, State state, boolean recreateTun, List<State> backupProfiles) throws Exception {
+        boolean restoringBackup = backupProfiles != null;
         Module.Status before = Module.status();
         if (restoringBackup && before.phase() != Module.Phase.STOPPED) throw new IOException("请先停止 TUN。");
-        if (state != null && !state.bypassedApps().isEmpty()) {
-            ProtectionPolicy protection = before.protection
-                ? ProtectionPolicy.parse(new JSONObject(Module.run(before.functionalRevision() >= 10 ? Module.Command.PROTECTION_POLICY : Module.Command.PROTECTION_GET, null)).getJSONObject("policy"))
-                : new ProtectionPolicy();
-            TunBypass.checkCurrent(context, state.bypassedApps(), protection);
-        }
         byte[] previous = before.profile ? Module.readProfile() : null;
-        if (!recreateTun && before.enabled && Arrays.equals(merged, previous)) {
-            if (state != null) save(state);
+        JSONObject object = state == null ? null : readObject();
+        State saved = object == null ? null : activeState(object);
+        State current = saved;
+        if (state != null && current == null && previous != null) {
+            try { current = installedState(previous); }
+            catch (IOException invalid) { /* A malformed legacy config can still be replaced. */ }
+        }
+        if (state != null) {
+            state = identify(state, current == null ? "" : current.subscription());
+            boolean profileChanged = current == null || !identity(current).equals(identity(state))
+                || !Arrays.equals(current.source(), state.source());
+            if (!state.bypassedApps().isEmpty() || before.protection && profileChanged) {
+                ProtectionPolicy protection = protectionPolicy(before);
+                if (profileChanged) {
+                    String issue = protectionTargetIssue(protection, state.source());
+                    if (!issue.isEmpty()) throw new IOException(issue);
+                }
+                if (!state.bypassedApps().isEmpty()) TunBypass.checkCurrent(context, state.bypassedApps(), protection);
+            }
+        }
+        boolean unchanged = !recreateTun && before.enabled && Arrays.equals(merged, previous);
+        if (unchanged) {
+            if (state == null) return ApplyMethod.UNCHANGED;
+            if (!restoringBackup && current == saved) {
+                save(state);
+                return ApplyMethod.UNCHANGED;
+            }
+        }
+        byte[] nextRouting = state == null ? null : encodeProfiles(state, restoringBackup ? encodeInactiveProfiles(state, backupProfiles)
+            : switchingTo(state, current, object));
+        if (unchanged) {
+            restoreSnapshot(nextRouting);
             return ApplyMethod.UNCHANGED;
         }
         boolean reconnect = before.installed() && !before.state.equals("stopped");
         List<Controller.Group> selections = before.state.equals("running") && before.control
             ? Controller.groups().values() : Collections.emptyList();
-        State saved = state == null ? null : read();
         boolean reload = canReload(before, saved, state, previous, recreateTun);
         ProfileApplyJournal.Pending pending = state == null || restoringBackup ? null : new ProfileApplyJournal.Pending(
             ProfileApplyJournal.digest(previous), ProfileApplyJournal.digest(merged), ProfileApplyJournal.digest(snapshot()),
-            encodeState(state).toString().getBytes(StandardCharsets.UTF_8), java.util.UUID.randomUUID().toString().replace("-", ""));
+            nextRouting, java.util.UUID.randomUUID().toString().replace("-", ""));
         try {
             if (pending != null) {
                 journal.write(pending);
                 LiveProfile.authorize(pending.liveToken());
             }
-            ApplyMethod method = applyPrepared(before, state, merged, previous, reconnect, selections, reload, pending);
+            ApplyMethod method = applyPrepared(before, nextRouting, merged, previous, reconnect, selections, reload, pending);
             if (pending != null) journal.clear();
             return method;
         } catch (Exception error) {
@@ -310,7 +568,7 @@ final class RoutingStore {
         }
     }
 
-    private ApplyMethod applyPrepared(Module.Status before, State state, byte[] merged, byte[] previous, boolean reconnect,
+    private ApplyMethod applyPrepared(Module.Status before, byte[] nextRouting, byte[] merged, byte[] previous, boolean reconnect,
                                       List<Controller.Group> selections, boolean reload, ProfileApplyJournal.Pending pending) throws Exception {
         String token = pending == null ? "" : pending.liveToken();
         if (reload) {
@@ -348,7 +606,7 @@ final class RoutingStore {
             imported = true;
             if (reconnect) restart(before.control);
             if (pending != null) restoreSnapshot(pending.newRouting());
-            else if (state != null) save(state);
+            else if (nextRouting != null) restoreSnapshot(nextRouting);
         } catch (Exception error) {
             if (staged && !imported) {
                 if (error instanceof Module.ProfileFailure || error instanceof Module.ProfileUnchanged) throw error;
@@ -406,7 +664,8 @@ final class RoutingStore {
         return !recreateTun && status.running() && status.control && status.validate && status.runtime.reported()
             && saved != null && changed != null && installed != null
             && saved.bypassedApps().equals(changed.bypassedApps())
-            && Objects.equals(saved.subscription(), changed.subscription()) && Arrays.equals(saved.source(), changed.source())
+            && Objects.equals(saved.subscription(), changed.subscription()) && Objects.equals(saved.localId(), changed.localId())
+            && Arrays.equals(saved.source(), changed.source())
             && Arrays.equals(installed, Profile.withPersonalRules(saved.source(), saved.applications(), saved.rules(), saved.bypassedApps()));
     }
 

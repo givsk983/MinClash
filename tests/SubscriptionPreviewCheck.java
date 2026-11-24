@@ -37,6 +37,31 @@ public final class SubscriptionPreviewCheck {
         require(summary.contains("Static → retired") && summary.contains("Removed → retired"), "lost group selections");
         require(!summary.contains("Provider → dynamic") && !summary.contains("Local → replacement"), "dynamic and include-all groups");
         require(!SubscriptionPreview.compare(entry, after, 0, true, null, null).conflicts(), "first import");
+
+        SubscriptionCatalog.Entry local = new SubscriptionCatalog.Entry("local.yaml", "");
+        RoutingStore.State baseline = new RoutingStore.State(before, Map.of("com.example.old", "Removed"));
+        RoutingStore.State candidateRules = new RoutingStore.State(before,
+            Map.of("com.example.app", "Removed", "com.example.direct", "DIRECT"), "https://old.test/config", List.of(
+                PersonalRules.create("DOMAIN", "shared.example", "Removed"),
+                PersonalRules.create("DOMAIN", "custom.example", "Personal")));
+        SubscriptionPreview localPreview = SubscriptionPreview.compare(local, after, 7, false, baseline, candidateRules, selected);
+        require(localPreview.missingTargets().equals(List.of("Personal", "Removed")), "group missing targets across rule types");
+        require(!localPreview.summary().contains("com.example.old"), "compare baselines independently of rules");
+        require(localPreview.replacementTargets("Removed").containsAll(List.of("Static", "DIRECT"))
+            && !localPreview.replacementTargets("Removed").contains("REJECT"), "offer valid replacement targets for apps");
+        try {
+            localPreview.replaceTarget("Removed", "REJECT");
+            throw new AssertionError("reject target for app rules");
+        } catch (java.io.IOException expected) {}
+        SubscriptionPreview mapped = localPreview.replaceTarget("Removed", "Static");
+        require(mapped.missingTargets().equals(List.of("Personal")), "update all references to a resolved target");
+        require(mapped.rules().applications().equals(Map.of("com.example.app", "Static", "com.example.direct", "DIRECT"))
+            && mapped.rules().rules().get(0).target().equals("Static"), "preserve unaffected rules and change app and custom targets");
+        require(mapped.rules().subscription().isEmpty() && mapped.source() == after && mapped.generation() == 7,
+            "keep the local candidate and its generation");
+        require(!mapped.replaceTarget("Personal", "REJECT").conflicts(), "offer reject for personal-only conflicts");
+        require(!mapped.withRules(new RoutingStore.State(after, Map.of())).conflicts(), "preview explicitly supplied rules");
+        require(candidateRules.applications().get("com.example.app").equals("Removed"), "discarded preview leaves original rules intact");
         System.out.println("PASS: subscription preview, invalid app targets, removed selections and provider uncertainty.");
     }
 

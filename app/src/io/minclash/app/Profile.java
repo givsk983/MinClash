@@ -294,7 +294,7 @@ final class Profile {
             }
             if (!targets.contains(entry.getValue())) {
                 throw new MissingRoutingTarget("应用 " + entry.getKey() + " 指定的代理组「" + entry.getValue()
-                    + "」已不存在。请先在应用分流中重新选择，再更新订阅。");
+                    + "」已不存在。请为这份配置重新选择应用分流出口。");
             }
             rules.add(yaml.represent("PROCESS-NAME," + entry.getKey() + "," + entry.getValue()));
         }

@@ -13,6 +13,7 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Typeface;
@@ -26,6 +27,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.text.InputType;
 import android.text.Editable;
@@ -56,6 +58,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.Locale;
@@ -108,6 +111,8 @@ public final class MainActivity extends ThemedActivity {
     };
     private Button toggle;
     private Button importButton;
+    private Button localProfilesButton;
+    private String pendingLocalReplacement;
     private Button subscriptionButton;
     private Button addSubscriptionButton;
     private Button updateButton;
@@ -133,6 +138,7 @@ public final class MainActivity extends ThemedActivity {
     private boolean subscriptionNotificationSettingsOpened;
     private SubscriptionCatalog subscriptionCatalog;
     private SubscriptionCatalog.Snapshot subscriptions;
+    private List<RoutingStore.LocalProfile> localProfiles = Collections.emptyList();
     private ProxyModeRow modeRow;
     private OverviewActionRow groupsRow;
     private Controller.Overview proxySummary;
@@ -365,9 +371,12 @@ public final class MainActivity extends ThemedActivity {
         LinearLayout localProfile = card(profiles, 14);
         add(localProfile, label("本地配置", 17, TEXT, true), 0);
         importButton = button("导入 YAML 文件  ›", false);
-        importButton.setOnClickListener(view -> pickProfile());
+        importButton.setOnClickListener(view -> pickProfile(null));
         add(localProfile, importButton, 12);
-        add(localProfile, label("从手机文件中导入 Mihomo 配置，导入前请先停止 TUN。", 12, MUTED, false), 8);
+        localProfilesButton = button("管理本地配置  ›", false);
+        localProfilesButton.setOnClickListener(view -> showLocalProfiles());
+        add(localProfile, localProfilesButton, 8);
+        add(localProfile, label("导入前可预览。每份配置单独保存应用分流和自定义规则。", 12, MUTED, false), 8);
 
 
         LinearLayout instructions = card(profiles, 14);
@@ -674,7 +683,10 @@ public final class MainActivity extends ThemedActivity {
         try { bundledModule = BundledModule.info(this); }
         catch (IOException error) { showMessage("无法读取内置模块信息，现有模块仍可继续运行。"); }
         moduleReleaseNotes = ModuleReleaseNotes.load(this);
-        if (savedInstanceState != null) pendingUpdate = (AppUpdate.Release) savedInstanceState.getSerializable("pendingUpdate");
+        if (savedInstanceState != null) {
+            pendingUpdate = (AppUpdate.Release) savedInstanceState.getSerializable("pendingUpdate");
+            pendingLocalReplacement = savedInstanceState.getString("pendingLocalReplacement");
+        }
         if (autoUpdateSwitch.isChecked() && !SubscriptionUpdateJob.schedule(this, true)) {
             appPreferences().edit().putBoolean(SubscriptionUpdateJob.ENABLED, false).apply();
             autoUpdateSwitch.setChecked(false);
@@ -689,6 +701,7 @@ public final class MainActivity extends ThemedActivity {
     @Override protected void onSaveInstanceState(Bundle state) {
         state.putInt("page", selectedPage);
         state.putSerializable("pendingUpdate", pendingUpdate);
+        state.putString("pendingLocalReplacement", pendingLocalReplacement);
         settingsNavigation.save(state);
         super.onSaveInstanceState(state);
     }
@@ -1246,14 +1259,17 @@ public final class MainActivity extends ThemedActivity {
 
     private void refreshSubscriptionCatalog() {
         try {
+            List<RoutingStore.LocalProfile> locals = new ArrayList<>();
             SubscriptionCatalog.Snapshot loaded = RoutingMutations.run(this, () -> {
                 RoutingMutations.recoverPending(this);
+                locals.addAll(new RoutingStore(this).localProfileEntries());
                 return subscriptionCatalog.load();
             });
             SubscriptionReminders.reconcile(getApplicationContext(), loaded);
             main.post(() -> {
                 if (isDestroyed()) return;
                 subscriptions = loaded;
+                localProfiles = locals;
                 render();
                 handleSubscriptionReminderIntent();
             });
@@ -1342,6 +1358,7 @@ public final class MainActivity extends ThemedActivity {
 
     private void dismissBackgroundResult(RetainedTask<?> task) {
         task.clearResult();
+        if (task == background.preview) background.editedPreview = null;
         backgroundDialog = null;
         main.post(this::deliverBackgroundResults);
     }
@@ -1401,7 +1418,7 @@ public final class MainActivity extends ThemedActivity {
         }
         if (background.preview.outcome() != null) {
             if (status == null) return;
-            showSubscriptionPreview(background.preview.outcome().value());
+            showProfilePreview(background.preview.outcome().value());
         }
         else if (background.updateCheck.outcome() != null) showAppUpdate(background.updateCheck.outcome().value());
         render();
@@ -1523,7 +1540,7 @@ public final class MainActivity extends ThemedActivity {
         boolean failed = SubscriptionUpdateStatus.load(appPreferences(), entry.address()).failed();
         String use = active ? (failed ? "重试更新订阅" : "更新订阅") : (failed ? "重试切换订阅" : "切换到此订阅");
         List<String> actions = new ArrayList<>();
-        if (canPreviewSubscription()) actions.add(use);
+        if (canPreviewProfile()) actions.add(use);
         actions.add("重命名");
         actions.add("流量与有效期");
         if (!active) actions.add("删除");
@@ -1533,12 +1550,8 @@ public final class MainActivity extends ThemedActivity {
                     case "流量与有效期" -> showUsage(entry);
                     case "重命名" -> renameSubscription(entry);
                     case "删除" -> trackManagement(new AlertDialog.Builder(this).setTitle("删除订阅")
-                        .setMessage("从列表移除「" + entry.name() + "」？")
-                        .setNegativeButton("取消", null).setPositiveButton("删除", (view, which) -> {
-                            List<SubscriptionCatalog.Entry> entries = new ArrayList<>(subscriptions.entries());
-                            entries.remove(entry);
-                            saveSubscriptions(entries, "已删除订阅。");
-                        }).show());
+                        .setMessage("删除「" + entry.name() + "」及其个人规则？")
+                        .setNegativeButton("取消", null).setPositiveButton("删除", (view, which) -> deleteSubscription(entry)).show());
                     default -> activateSubscription(entry);
                 }
             }).setNegativeButton("返回", (dialog, which) -> showSubscriptions()).show());
@@ -1556,7 +1569,7 @@ public final class MainActivity extends ThemedActivity {
         card.bind(entry, usage, appPreferences(), System.currentTimeMillis(), false, current);
         ui.add(form, card, 0);
         Button retry = null;
-        if (SubscriptionUpdateStatus.load(appPreferences(), entry.address()).failed() && canPreviewSubscription()) {
+        if (SubscriptionUpdateStatus.load(appPreferences(), entry.address()).failed() && canPreviewProfile()) {
             retry = ui.button(current ? "重试更新订阅" : "重试切换订阅");
             ui.add(form, retry, 10);
         }
@@ -1639,7 +1652,7 @@ public final class MainActivity extends ThemedActivity {
         content.setPadding(dp(20), dp(4), dp(20), 0);
         add(content, linkRow, 0);
         add(content, nameInput, 10);
-        boolean canActivate = canPreviewSubscription();
+        boolean canActivate = canPreviewProfile();
         AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle("添加订阅")
             .setMessage("粘贴机场提供的 HTTPS 格式 Clash / Mihomo 订阅链接。\n" + Subscription.PROXY_HINT)
             .setView(content).setNegativeButton("取消", null).setPositiveButton(canActivate ? "保存并启用" : "保存", null);
@@ -1689,7 +1702,7 @@ public final class MainActivity extends ThemedActivity {
         String name = nameInput.getText().toString().trim();
         SubscriptionCatalog.Entry entry = new SubscriptionCatalog.Entry(name, address);
         dialog.dismiss();
-        if (activate && canPreviewSubscription()) {
+        if (activate && canPreviewProfile()) {
             previewSubscription(entry, true);
         } else if (name.isEmpty()) {
             saveSubscriptionWithAutoName(address, host);
@@ -1752,8 +1765,29 @@ public final class MainActivity extends ThemedActivity {
         });
     }
 
+    private void deleteSubscription(SubscriptionCatalog.Entry entry) {
+        mutate("已删除订阅。", () -> {
+            RoutingMutations.recoverPending(this);
+            SubscriptionCatalog.Snapshot catalog = subscriptionCatalog.load();
+            if (entry.address().equals(catalog.activeAddress())) throw new IOException("请先切换到另一份配置。");
+            List<SubscriptionCatalog.Entry> entries = new ArrayList<>(catalog.entries());
+            entries.removeIf(saved -> saved.address().equals(entry.address()));
+            subscriptionCatalog.save(entries);
+            try {
+                new RoutingStore(this).forgetSubscription(entry.address());
+            } catch (Exception error) {
+                try { subscriptionCatalog.save(catalog.entries()); }
+                catch (Exception recovery) { error.addSuppressed(recovery); }
+                throw error;
+            } finally {
+                refreshSubscriptionCatalog();
+            }
+            return null;
+        });
+    }
+
     private void activateSubscription(SubscriptionCatalog.Entry entry) {
-        if (entry == null || !canPreviewSubscription()) return;
+        if (entry == null || !canPreviewProfile()) return;
         previewSubscription(entry, false);
     }
 
@@ -1782,17 +1816,11 @@ public final class MainActivity extends ThemedActivity {
                             .anyMatch(saved -> saved.address().equals(entry.address()))) {
                             downloaded.usage().cache(prefs, entry.address());
                         }
-                        Module.Status current = Module.status();
-                        List<Controller.Group> selections = null;
-                        if (hasProxyControl(current)) {
-                            try { selections = Controller.groups().values(); }
-                            catch (Exception unavailable) { selections = null; }
-                        }
                         SubscriptionCatalog.Entry named = adding && entry.name().isEmpty()
                             ? new SubscriptionCatalog.Entry(downloaded.name(), entry.address()) : entry;
-                        SubscriptionPreview preview = SubscriptionPreview.compare(named, downloaded.source(),
-                            RoutingStore.generation(), adding, routing.loadIfAvailable(current), selections);
-                        if (!adding && preview.conflicts()) {
+                        RoutingStore.State target = adding ? null : routing.forSubscription(named.address());
+                        BackgroundWork.ProfilePreview preview = buildProfilePreview(routing, named, downloaded.source(), adding, target, target);
+                        if (!adding && preview.changes().conflicts()) {
                             SubscriptionUpdateStatus.complete(prefs, entry.address(), attempt, "订阅缺少分流规则需要的代理组");
                         }
                         return preview;
@@ -1813,23 +1841,108 @@ public final class MainActivity extends ThemedActivity {
         } else request.close();
     }
 
-    private void showSubscriptionPreview(SubscriptionPreview preview) {
+    private BackgroundWork.ProfilePreview buildProfilePreview(RoutingStore routing, SubscriptionCatalog.Entry entry,
+            byte[] source, boolean adding, RoutingStore.State target, RoutingStore.State rules) throws Exception {
+        Module.Status current = Module.status();
+        RoutingStore.State active = routing.loadIfAvailable(current);
+        List<Controller.Group> selections = current.running() ? null : Collections.emptyList();
+        if (hasProxyControl(current)) {
+            try { selections = Controller.groups().values(); }
+            catch (Exception unavailable) { selections = null; }
+        }
+        SubscriptionPreview changes = SubscriptionPreview.compare(entry, source, RoutingStore.generation(), adding,
+            active, rules, selections);
+        RoutingStore.State copyFrom = target == null && active != null && (!active.applications().isEmpty() || !active.rules().isEmpty())
+            ? active : null;
+        return new BackgroundWork.ProfilePreview(changes, copyFrom, routing.protectionTargetIssue(current, source));
+    }
+
+    private void showProfilePreview(BackgroundWork.ProfilePreview result) {
+        SubscriptionPreview preview = background.editedPreview == null ? result.changes() : background.editedPreview;
+        boolean local = preview.entry().address().isEmpty();
         showMessage("");
-        AlertDialog.Builder dialog = textDialog("订阅变更预览 · " + preview.entry().name(), preview.summary())
-            .setNegativeButton("关闭", (view, which) -> dismissBackgroundResult(background.preview))
-            .setOnCancelListener(view -> dismissBackgroundResult(background.preview));
-        if (!preview.conflicts()) dialog.setPositiveButton("应用配置", null);
-        AlertDialog shown = dialog.show();
+        LinearLayout form = column();
+        form.setPadding(dp(20), dp(8), dp(20), dp(12));
+        if (result.copyFrom() != null) {
+            boolean copied = background.editedPreview != null;
+            Button copy = button(copied ? "使用新配置自带的规则" : "从当前配置复制个人规则", false);
+            copy.setOnClickListener(view -> {
+                try {
+                    RoutingStore.State original = result.changes().rules();
+                    RoutingStore.State current = result.copyFrom();
+                    updateProfilePreview(result, copied ? null
+                        : result.changes().withRules(original.withApplications(current.applications()).withRules(current.rules())));
+                } catch (IOException error) { showMessage(error.getMessage()); }
+            });
+            add(form, copy, 0);
+            if (copied) add(form, label("已复制 " + preview.rules().applications().size() + " 项应用分流和 "
+                + preview.rules().rules().size() + " 条自定义规则。", 12, MUTED, false), 6);
+        }
+        if (preview.conflicts()) {
+            Button resolve = button("更换缺失出口（" + preview.missingTargets().size() + "）", false);
+            resolve.setOnClickListener(view -> chooseMissingTarget(result, preview));
+            add(form, resolve, 8);
+        }
+        if (!result.protectionIssue().isEmpty()) add(form, label(result.protectionIssue(), 13, AMBER, false), 8);
+        add(form, label(preview.summary(), 13, TEXT, false), 10);
+        add(form, label("如果 TUN 正在运行，应用时可能短暂重连。", 12, MUTED, false), 10);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(form);
+        AlertDialog shown = new AlertDialog.Builder(this)
+            .setTitle((local ? "本地配置预览 · " : "订阅变更预览 · ") + preview.entry().name())
+            .setView(scroll).setNegativeButton("取消", (view, which) -> dismissBackgroundResult(background.preview))
+            .setPositiveButton("应用配置", null)
+            .setOnCancelListener(view -> dismissBackgroundResult(background.preview)).show();
         backgroundDialog = shown;
-        if (!preview.conflicts()) shown.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
-            if (!canApplySubscription()) {
-                shown.setMessage(preview.summary() + "\n\n当前 TUN 状态不允许应用订阅，请等待状态刷新后重试。");
+        Button apply = shown.getButton(AlertDialog.BUTTON_POSITIVE);
+        apply.setEnabled(!preview.conflicts() && result.protectionIssue().isEmpty());
+        apply.setOnClickListener(view -> {
+            if (!canApplyProfile()) {
+                showMessage("TUN 正在切换状态，请稍后再应用。");
                 return;
             }
             dismissBackgroundResult(background.preview);
             shown.dismiss();
-            mutate("订阅配置已应用。", true, () -> applySubscription(preview));
+            mutate(local ? "本地配置已应用。" : "订阅配置已应用。", true,
+                () -> local ? applyLocalProfile(preview) : applySubscription(preview));
         });
+    }
+
+    private void updateProfilePreview(BackgroundWork.ProfilePreview result, SubscriptionPreview edited) {
+        background.editedPreview = edited;
+        if (backgroundDialog != null) backgroundDialog.dismiss();
+        showProfilePreview(result);
+    }
+
+    private void chooseMissingTarget(BackgroundWork.ProfilePreview result, SubscriptionPreview preview) {
+        List<String> missing = preview.missingTargets();
+        if (missing.size() == 1) {
+            chooseReplacement(result, preview, missing.get(0));
+            return;
+        }
+        trackManagement(new AlertDialog.Builder(this).setTitle("选择要更换的旧出口")
+            .setItems(missing.toArray(new String[0]), (dialog, which) -> chooseReplacement(result, preview, missing.get(which)))
+            .setNegativeButton("返回预览", null).show());
+    }
+
+    private void chooseReplacement(BackgroundWork.ProfilePreview result, SubscriptionPreview preview, String oldTarget) {
+        List<String> targets = preview.replacementTargets(oldTarget);
+        String[] names = targets.stream().map(target -> switch (target) {
+            case "DIRECT" -> "直连（DIRECT）";
+            case "REJECT" -> "拒绝连接（REJECT）";
+            default -> target;
+        }).toArray(String[]::new);
+        trackManagement(new AlertDialog.Builder(this).setTitle("「" + oldTarget + "」的替代出口")
+            .setItems(names, (dialog, which) -> {
+                try { updateProfilePreview(result, preview.replaceTarget(oldTarget, targets.get(which))); }
+                catch (IOException error) { showMessage(error.getMessage()); }
+            }).setNegativeButton("返回预览", null).show());
+    }
+
+    private void requireProfilePreviewCurrent(SubscriptionPreview preview) throws Exception {
+        RoutingMutations.recoverPending(this);
+        if (preview.generation() != RoutingStore.generation()) throw new IOException("当前配置已变化，请重新预览。");
+        if (!canApplyProfile(Module.status())) throw new IOException("TUN 正在切换状态，请稍后重试。");
     }
 
     private Module.Status applySubscription(SubscriptionPreview preview) throws Exception {
@@ -1837,21 +1950,14 @@ public final class MainActivity extends ThemedActivity {
         long attempt = SubscriptionUpdateStatus.begin();
         boolean listed = !preview.adding();
         try {
-            RoutingMutations.recoverPending(this);
-            if (preview.generation() != RoutingStore.generation()) {
-                throw new IOException("当前配置已变化，请重新预览订阅。");
-            }
-            Module.Status current = Module.status();
-            if (!canApplySubscription(current)) throw new IOException("当前 TUN 状态不允许应用订阅，请稍后重试。");
-            List<SubscriptionCatalog.Entry> entries = new ArrayList<>(subscriptionCatalog.load().entries());
-            boolean exists = entries.stream().anyMatch(entry -> entry.address().equals(address));
+            requireProfilePreviewCurrent(preview);
+            boolean exists = subscriptionCatalog.load().entries().stream().anyMatch(entry -> entry.address().equals(address));
             if (exists == preview.adding()) throw new IOException("订阅列表已变化，请重新预览。");
             if (preview.adding()) {
-                entries.add(preview.entry());
-                subscriptionCatalog.save(entries);
+                subscriptionCatalog.add(preview.entry());
                 listed = true;
             }
-            new RoutingStore(this).importProfile(preview.source(), address);
+            new RoutingStore(this).apply(preview.rules());
             SubscriptionUpdateStatus.complete(appPreferences(), address, attempt, "");
         } catch (RoutingStore.SelectionRestoreFailure warning) {
             SubscriptionUpdateStatus.complete(appPreferences(), address, attempt, "");
@@ -1865,11 +1971,104 @@ public final class MainActivity extends ThemedActivity {
         return Module.status();
     }
 
-    private void pickProfile() {
+    private void showLocalProfiles() {
+        List<RoutingStore.LocalProfile> entries = localProfiles;
+        String[] names = entries.stream().map(entry -> entry.name() + (entry.active() ? " · 当前使用" : "")).toArray(String[]::new);
+        trackManagement(new AlertDialog.Builder(this).setTitle("管理本地配置")
+            .setItems(names, (dialog, which) -> showLocalProfileActions(entries.get(which)))
+            .setNegativeButton("关闭", null).show());
+    }
+
+    private void showLocalProfileActions(RoutingStore.LocalProfile entry) {
+        String[] actions = entry.active() ? new String[] {"替换 YAML"}
+            : new String[] {"切换到此配置", "替换 YAML 并使用", "删除"};
+        trackManagement(new AlertDialog.Builder(this).setTitle(entry.name())
+            .setItems(actions, (dialog, which) -> {
+                switch (actions[which]) {
+                    case "切换到此配置" -> previewLocalProfile(null, entry.id());
+                    case "删除" -> confirmDeleteLocalProfile(entry);
+                    default -> pickProfile(entry.id());
+                }
+            }).setNegativeButton("返回", (dialog, which) -> showLocalProfiles()).show());
+    }
+
+    private void confirmDeleteLocalProfile(RoutingStore.LocalProfile entry) {
+        trackManagement(new AlertDialog.Builder(this).setTitle("删除本地配置")
+            .setMessage("删除「" + entry.name() + "」及其个人规则？")
+            .setNegativeButton("取消", null).setPositiveButton("删除", (dialog, which) -> mutate("已删除本地配置。", () -> {
+                RoutingMutations.recoverPending(this);
+                new RoutingStore(this).deleteLocalProfile(entry.id());
+                refreshSubscriptionCatalog();
+                return null;
+            })).show());
+    }
+
+    private void pickProfile(String replacementId) {
+        if (!canPreviewProfile()) return;
+        pendingLocalReplacement = replacementId;
         Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         picker.setType("*/*");
         picker.addCategory(Intent.CATEGORY_OPENABLE);
         startActivityForResult(picker, PICK_PROFILE);
+    }
+
+    private static String localFileName(Context context, Uri file) {
+        try (Cursor cursor = context.getContentResolver().query(file, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                String name = cursor.getString(0);
+                if (name != null) {
+                    name = name.replaceAll("[\\p{Cntrl}]", " ").trim();
+                    if (!name.isEmpty()) return name.length() <= 128 ? name : name.substring(0, 128);
+                }
+            }
+        } catch (RuntimeException unavailable) { }
+        return "本地配置";
+    }
+
+    private static String uniqueLocalName(String name, List<RoutingStore.LocalProfile> entries) {
+        Set<String> names = new LinkedHashSet<>();
+        for (RoutingStore.LocalProfile entry : entries) names.add(entry.name());
+        String candidate = name;
+        for (int index = 2; names.contains(candidate); index++) {
+            String suffix = " (" + index + ")";
+            candidate = name.substring(0, Math.min(name.length(), 128 - suffix.length())).trim() + suffix;
+        }
+        return candidate;
+    }
+
+    private void previewLocalProfile(Uri uri, String profileId) {
+        Context context = getApplicationContext();
+        if (background.preview.start(BackgroundWork.DOWNLOADS, () -> {
+            byte[] incoming = null;
+            if (uri != null) {
+                try (InputStream input = context.getContentResolver().openInputStream(uri)) {
+                    if (input == null) throw new IOException("无法打开所选文件。");
+                    incoming = Profile.normalize(input);
+                }
+            }
+            byte[] source = incoming;
+            String fileName = profileId == null ? localFileName(context, uri) : "";
+            return worker.submit(() -> RoutingMutations.run(context, () -> {
+                RoutingMutations.recoverPending(context);
+                RoutingStore routing = new RoutingStore(context);
+                RoutingStore.State target = profileId == null ? null : routing.forLocalProfile(profileId);
+                if (profileId != null && target == null) throw new IOException("这份本地配置已被删除。");
+                byte[] yaml = source == null ? target.source() : source;
+                RoutingStore.State rules = target == null ? new RoutingStore.State(yaml, Collections.emptyMap(), "", Collections.emptyList(),
+                    Collections.emptySet(), UUID.randomUUID().toString(), uniqueLocalName(fileName, routing.localProfileEntries())) : target;
+                return buildProfilePreview(routing, new SubscriptionCatalog.Entry(rules.localName(), ""), yaml, target == null, target, rules);
+            })).get();
+        })) {
+            showMessage("正在准备本地配置预览…");
+            render();
+        }
+    }
+
+    private Module.Status applyLocalProfile(SubscriptionPreview preview) throws Exception {
+        requireProfilePreviewCurrent(preview);
+        try { new RoutingStore(this).apply(preview.rules()); }
+        finally { refreshSubscriptionCatalog(); }
+        return Module.status();
     }
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
@@ -1929,18 +2128,12 @@ public final class MainActivity extends ThemedActivity {
             });
             return;
         }
-        if (request != PICK_PROFILE || result != RESULT_OK || data == null) return;
+        if (request != PICK_PROFILE) return;
+        String replacement = pendingLocalReplacement;
+        pendingLocalReplacement = null;
+        if (result != RESULT_OK || data == null) return;
         Uri uri = data.getData();
-        if (uri == null) return;
-        mutate("配置已通过 Mihomo 校验并保存。", () -> {
-            try (InputStream input = getContentResolver().openInputStream(uri)) {
-                if (input == null) throw new IOException("无法打开所选文件。");
-                new RoutingStore(this).importProfile(Profile.normalize(input), "");
-            } finally {
-                refreshSubscriptionCatalog();
-            }
-            return Module.status();
-        });
+        if (uri != null) previewLocalProfile(uri, replacement);
     }
 
     private EditText backupPassword(String hint) {
@@ -2065,16 +2258,26 @@ public final class MainActivity extends ThemedActivity {
             });
         } else if (result instanceof BackgroundWork.BackupPreview preview) {
             BackupArchive.Data data = preview.data();
+            int applications = data.state().applications().size();
+            int rules = data.state().rules().size();
+            int bypassed = data.state().bypassedApps().size();
+            int locals = data.state().subscription().isEmpty() ? 1 : 0;
+            for (RoutingStore.State saved : data.inactiveProfiles()) {
+                applications += saved.applications().size();
+                rules += saved.rules().size();
+                bypassed += saved.bypassedApps().size();
+                if (saved.subscription().isEmpty()) locals++;
+            }
             int favorites = 0;
             int categories = 0;
             for (Object value : data.preferences().values()) if (value instanceof Set<?> set) favorites += set.size();
             try { categories = new org.json.JSONArray((String) data.preferences().getOrDefault("routing_categories", "[]")).length(); }
             catch (org.json.JSONException invalid) { /* Already validated by BackupArchive. */ }
-            String summary = "自定义分流  " + data.state().rules().size() + " 条\n备份版本  " + data.appVersion() + "\n备份时间  "
+            String summary = "自定义分流  " + rules + " 条\n备份版本  " + data.appVersion() + "\n备份时间  "
                 + java.text.DateFormat.getDateTimeInstance().format(new java.util.Date(data.createdAt()))
-                + "\n订阅  " + data.subscriptions().size() + " 个\n应用分流  " + data.state().applications().size()
-                + " 项\n绕过 TUN  " + data.state().bypassedApps().size() + " 个应用\n自定义分类  " + categories + " 个\n节点收藏  " + favorites + " 项\n配置  " + data.state().source().length / 1024 + " KiB"
-                + "\n\n将替换当前配置、全部订阅、应用分流、绕过 TUN、自定义分流、分类、收藏和订阅自动更新／节点列表偏好。"
+                + "\n订阅  " + data.subscriptions().size() + " 个\n本地配置  " + locals + " 份\n应用分流  " + applications
+                + " 项\n绕过 TUN  " + bypassed + " 项\n自定义分类  " + categories + " 个\n节点收藏  " + favorites + " 项"
+                + "\n\n将替换全部配置及其个人规则、订阅列表、分类、收藏和订阅自动更新／节点列表偏好。"
                 + "\n\n请先停止 TUN。恢复后不会自动启动 TUN；通知、图标、系统授权、开机与热点设置保留本机选择。";
             AlertDialog dialog = textDialog("恢复备份 · 内容预览", summary)
                 .setNegativeButton("取消", (view, which) -> dismissBackgroundResult(background.backup))
@@ -3689,15 +3892,15 @@ public final class MainActivity extends ThemedActivity {
 
     private boolean isActive() { return status != null && status.active(); }
 
-    private boolean canApplySubscription() {
-        return !busy && canApplySubscription(status);
+    private boolean canApplyProfile() {
+        return !busy && canApplyProfile(status);
     }
 
-    private boolean canPreviewSubscription() {
-        return canApplySubscription() && !background.preview.running() && background.preview.outcome() == null;
+    private boolean canPreviewProfile() {
+        return canApplyProfile() && !background.preview.running() && background.preview.outcome() == null;
     }
 
-    private static boolean canApplySubscription(Module.Status current) {
+    private static boolean canApplyProfile(Module.Status current) {
         return current != null && current.installed() && current.enabled
             && (current.state.equals("stopped") || current.state.equals("running"));
     }
@@ -3733,8 +3936,10 @@ public final class MainActivity extends ThemedActivity {
         addSubscriptionButton.setEnabled(!busy && noSubscriptions);
         currentConfigCard.setVisibility(active == null && !needsSubscription ? View.VISIBLE : View.GONE);
         configGuide.setVisibility(installed && status.profile ? View.GONE : View.VISIBLE);
+        String activeLocal = localProfiles.stream().filter(RoutingStore.LocalProfile::active).map(RoutingStore.LocalProfile::name)
+            .findFirst().orElse("");
         String current = active != null ? "当前订阅 · " + active.name()
-            : installed && status.profile ? "本地配置已就绪"
+            : installed && status.profile ? (activeLocal.isEmpty() ? "本地配置已就绪" : "当前本地配置 · " + activeLocal)
             : noSubscriptions ? "还没有订阅，点击下方“添加订阅”开始使用。" : "尚未启用订阅";
         profileSummary.setText(installed && status.profile ? current : "尚未导入配置");
         SubscriptionUpdateStatus.Result update = active == null ? null : SubscriptionUpdateStatus.load(appPreferences(), active.address());
@@ -3742,14 +3947,15 @@ public final class MainActivity extends ThemedActivity {
             + SubscriptionUsage.load(appPreferences(), active.address()).summary() + "\n" + update.summary(this)));
         if (busy) refreshButton.setText("处理中…");
         else refreshButton.setText(installed ? "刷新状态" : "检测环境");
-        boolean canImport = !busy && enabled && !isActive();
-        importButton.setEnabled(canImport);
+        importButton.setEnabled(canPreviewProfile());
+        localProfilesButton.setVisibility(localProfiles.isEmpty() ? View.GONE : View.VISIBLE);
+        localProfilesButton.setEnabled(canPreviewProfile());
         subscriptionButton.setEnabled(!busy && subscriptions != null && !savingSubscription());
         subscriptionButton.setText(noSubscriptions ? "添加订阅" : "管理订阅");
         boolean subscribed = active != null && installed && status.profile;
         updateButton.setVisibility(subscribed ? View.VISIBLE : View.GONE);
         updateButton.setText(update != null && update.failed() ? "重试当前订阅" : "更新当前订阅");
-        updateButton.setEnabled(subscribed && canPreviewSubscription());
+        updateButton.setEnabled(subscribed && canPreviewProfile());
         cancelSubscriptionButton.setVisibility(background.preview.cancellable() || background.usage.cancellable() ? View.VISIBLE : View.GONE);
         cancelSubscriptionButton.setText(background.preview.cancellable() && background.usage.cancellable() ? "取消订阅请求…"
             : background.preview.cancellable() ? "取消订阅配置下载" : "取消用量读取");

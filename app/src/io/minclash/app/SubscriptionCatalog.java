@@ -51,6 +51,7 @@ final class SubscriptionCatalog {
         if (entries.stream().anyMatch(saved -> saved.address().equals(entry.address()))) {
             throw new IOException("此订阅已在列表中。");
         }
+        routing.forgetSubscription(entry.address());
         entries.add(entry);
         save(entries);
     }

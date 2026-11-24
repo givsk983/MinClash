@@ -32,7 +32,17 @@ final class BackupArchive {
     private static final byte[] MAGIC = "MINCLASH-BACKUP\n".getBytes(StandardCharsets.US_ASCII);
     private static final int ITERATIONS = 210_000;
     record Data(RoutingStore.State state, List<SubscriptionCatalog.Entry> subscriptions,
-                Map<String, Object> preferences, long createdAt, String appVersion) {}
+                Map<String, Object> preferences, long createdAt, String appVersion,
+                List<RoutingStore.State> inactiveProfiles) {
+        Data(RoutingStore.State state, List<SubscriptionCatalog.Entry> subscriptions,
+             Map<String, Object> preferences, long createdAt, String appVersion) {
+            this(state, subscriptions, preferences, createdAt, appVersion, Collections.emptyList());
+        }
+
+        Data {
+            inactiveProfiles = Collections.unmodifiableList(new ArrayList<>(inactiveProfiles));
+        }
+    }
     static final class PasswordFailure extends IOException {
         PasswordFailure() { super("密码不正确，或备份文件已损坏。"); }
     }
@@ -121,19 +131,7 @@ final class BackupArchive {
             String text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(payload)).toString();
             checkDepth(text);
             JSONObject object = new JSONObject(text);
-            if (!(object.get("version") instanceof Integer version) || version < 1 || version > 3) throw new IOException("备份数据版本不受支持。");
-            String source = string(object.get("source"), Profile.MAX_BYTES);
-            byte[] normalized = Profile.normalize(source.getBytes(StandardCharsets.UTF_8));
-            JSONObject applications = object.getJSONObject("applications");
-            if (applications.length() > 20000) throw new IOException();
-            Map<String, String> rules = new TreeMap<>();
-            for (java.util.Iterator<String> keys = applications.keys(); keys.hasNext();) {
-                String name = keys.next();
-                rules.put(name, string(applications.get(name), 4096));
-            }
-            List<PersonalRules.Rule> personal = PersonalRules.parse(version == 1 ? null : object.getJSONArray("personalRules"));
-            Set<String> bypassed = version < 3 ? Set.of() : TunBypass.parse(object.getJSONArray("bypassedApps"));
-            Profile.withPersonalRules(normalized, rules, personal, bypassed);
+            if (!(object.get("version") instanceof Integer version) || version < 1 || version > 4) throw new IOException("备份数据版本不受支持。");
             List<SubscriptionCatalog.Entry> subscriptions = new ArrayList<>();
             Set<String> addresses = new HashSet<>();
             JSONArray entries = object.getJSONArray("subscriptions");
@@ -148,12 +146,53 @@ final class BackupArchive {
             }
             String active = string(object.get("active"), 8192);
             if (!active.isEmpty() && !addresses.contains(active)) throw new IOException();
+            RoutingStore.State state = readProfile(object, version, active);
+            List<RoutingStore.State> inactive = new ArrayList<>();
+            if (version >= 4) {
+                JSONArray profiles = object.getJSONArray("inactiveProfiles");
+                if (profiles.length() > 1000) throw new IOException();
+                Set<String> subscriptionsWithProfiles = new HashSet<>();
+                Set<String> localIds = new HashSet<>();
+                if (active.isEmpty()) localIds.add(state.localId() == null ? RoutingStore.LEGACY_LOCAL_ID : state.localId());
+                else subscriptionsWithProfiles.add(active);
+                for (int i = 0; i < profiles.length(); i++) {
+                    JSONObject profile = profiles.getJSONObject(i);
+                    String address = string(profile.get("subscription"), 8192);
+                    RoutingStore.State saved = readProfile(profile, version, address);
+                    if (address.isEmpty()) {
+                        if (saved.localId() == null || !localIds.add(saved.localId())) throw new IOException();
+                    } else if (!addresses.contains(address) || !subscriptionsWithProfiles.add(address)) throw new IOException();
+                    inactive.add(saved);
+                }
+            }
             Map<String, Object> settings = preferences(object.getJSONObject("preferences"));
-            return new Data(new RoutingStore.State(normalized, rules, active, personal, bypassed), Collections.unmodifiableList(subscriptions),
-                Collections.unmodifiableMap(settings), object.getLong("createdAt"), string(object.get("appVersion"), 64));
+            return new Data(state, Collections.unmodifiableList(subscriptions), Collections.unmodifiableMap(settings),
+                object.getLong("createdAt"), string(object.get("appVersion"), 64), inactive);
         } catch (Exception invalid) {
             throw new IOException("备份内容无效、版本不兼容或配置无法使用，未修改现有数据。", invalid);
         } finally { Arrays.fill(payload, (byte) 0); }
+    }
+
+    private static RoutingStore.State readProfile(JSONObject object, int version, String address) throws Exception {
+        String source = string(object.get("source"), Profile.MAX_BYTES);
+        byte[] normalized = Profile.normalize(source.getBytes(StandardCharsets.UTF_8));
+        JSONObject applications = object.getJSONObject("applications");
+        if (applications.length() > 20000) throw new IOException();
+        Map<String, String> rules = new TreeMap<>();
+        for (java.util.Iterator<String> keys = applications.keys(); keys.hasNext();) {
+            String name = keys.next();
+            rules.put(name, string(applications.get(name), 4096));
+        }
+        List<PersonalRules.Rule> personal = PersonalRules.parse(version == 1 ? null : object.getJSONArray("personalRules"));
+        Set<String> bypassed = version < 3 ? Set.of() : TunBypass.parse(object.getJSONArray("bypassedApps"));
+        String localId = null, localName = null;
+        if (version >= 4 && (object.has("localId") || object.has("localName"))) {
+            localId = string(object.get("localId"), 64);
+            localName = string(object.get("localName"), 128);
+            if (!address.isEmpty() || !localId.matches("[A-Za-z0-9_-]+") || localName.trim().isEmpty()) throw new IOException();
+        }
+        Profile.withPersonalRules(normalized, rules, personal, bypassed);
+        return new RoutingStore.State(normalized, rules, address, personal, bypassed, localId, localName);
     }
 
     static JSONObject json(Data data) throws Exception {
@@ -166,12 +205,23 @@ final class BackupArchive {
         for (SubscriptionCatalog.Entry entry : data.subscriptions()) {
             subscriptions.put(new JSONObject().put("name", entry.name()).put("address", entry.address()));
         }
-        return new JSONObject().put("version", 3).put("personalRules", PersonalRules.json(data.state().rules()))
-            .put("bypassedApps", new JSONArray(data.state().bypassedApps()))
+        JSONArray profiles = new JSONArray();
+        for (RoutingStore.State state : data.inactiveProfiles()) {
+            profiles.put(writeProfile(state).put("subscription", subscription(state)));
+        }
+        return writeProfile(data.state()).put("version", 4).put("active", subscription(data.state()))
             .put("createdAt", data.createdAt()).put("appVersion", data.appVersion())
-            .put("source", new String(data.state().source(), StandardCharsets.UTF_8))
-            .put("applications", new JSONObject(data.state().applications())).put("active", data.state().subscription())
-            .put("subscriptions", subscriptions).put("preferences", settings);
+            .put("subscriptions", subscriptions).put("preferences", settings).put("inactiveProfiles", profiles);
+    }
+
+    private static JSONObject writeProfile(RoutingStore.State state) throws Exception {
+        return new JSONObject().put("source", new String(state.source(), StandardCharsets.UTF_8))
+            .put("applications", new JSONObject(state.applications())).put("personalRules", PersonalRules.json(state.rules()))
+            .put("bypassedApps", new JSONArray(state.bypassedApps())).put("localId", state.localId()).put("localName", state.localName());
+    }
+
+    private static String subscription(RoutingStore.State state) {
+        return state.subscription() == null ? "" : state.subscription();
     }
 
     private static Map<String, Object> preferences(JSONObject settings) throws Exception {

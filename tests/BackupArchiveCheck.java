@@ -1,9 +1,11 @@
 package io.minclash.app;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -71,11 +73,54 @@ public final class BackupArchiveCheck {
             data.preferences(), 1, "0.1.7"), "duplicate subscription");
         rejectData(new BackupArchive.Data(new RoutingStore.State("invalid yaml".getBytes(StandardCharsets.UTF_8), Map.of(), ""),
             List.of(), data.preferences(), 1, "0.1.7"), "invalid source YAML");
+        profiles(data, password);
+        legacy(data);
         boundedInput();
         rollback();
         journal();
         Arrays.fill(password, '\0');
-        System.out.println("PASS: encrypted/plain backups, Unicode round trips, randomization, wrong passwords, tampering, bounded input, schema validation and rollback failures.");
+        System.out.println("PASS: encrypted/plain backups, independent profile rules, legacy archives, Unicode round trips, randomization, wrong passwords, tampering, bounded input, schema validation and rollback failures.");
+    }
+
+    private static void profiles(BackupArchive.Data base, char[] password) throws Exception {
+        byte[] source = base.state().source();
+        RoutingStore.State first = new RoutingStore.State(source, Map.of("com.example.local", "DIRECT"), "", List.of(),
+            Set.of(), "first", "本地一.yaml");
+        RoutingStore.State second = new RoutingStore.State(source, Map.of(), "", List.of(PersonalRules.create("DOMAIN", "example.test", "US")),
+            Set.of("com.example.bypassed"), "second", "本地二.yaml");
+        BackupArchive.Data multiple = new BackupArchive.Data(first, base.subscriptions(), base.preferences(), 1, "0.1.7",
+            List.of(base.state(), second));
+        BackupArchive.Data restored = BackupArchive.decode(BackupArchive.encode(multiple, password), password);
+        roundTrip(multiple, restored);
+        require(restored.state().localId().equals("first") && restored.state().localName().equals("本地一.yaml"), "active local metadata survives");
+        require(restored.inactiveProfiles().size() == 2, "all saved configurations survive");
+        RoutingStore.State restoredSubscription = restored.inactiveProfiles().get(0);
+        RoutingStore.State restoredLocal = restored.inactiveProfiles().get(1);
+        require(restoredSubscription.subscription().equals(base.state().subscription())
+            && restoredSubscription.applications().equals(base.state().applications()), "inactive subscription retains its own application rules");
+        require(restoredLocal.localId().equals(second.localId()) && restoredLocal.localName().equals(second.localName())
+            && restoredLocal.rules().equals(second.rules()) && restoredLocal.bypassedApps().equals(second.bypassedApps()),
+            "inactive local profile retains its own name, rules and exclusions");
+        rejectData(new BackupArchive.Data(first, base.subscriptions(), base.preferences(), 1, "0.1.7", List.of(first)), "duplicate active local identity");
+        rejectData(new BackupArchive.Data(first, List.of(), base.preferences(), 1, "0.1.7", List.of(base.state())), "inactive subscription absent from catalog");
+    }
+
+    private static void legacy(BackupArchive.Data base) throws Exception {
+        for (int version = 1; version <= 3; version++) {
+            var object = BackupArchive.json(base).put("version", version);
+            object.remove("inactiveProfiles");
+            if (version < 3) object.remove("bypassedApps");
+            if (version == 1) object.remove("personalRules");
+            byte[] payload = object.toString().getBytes(StandardCharsets.UTF_8);
+            ByteArrayOutputStream archive = new ByteArrayOutputStream();
+            archive.write("MINCLASH-BACKUP\n".getBytes(StandardCharsets.US_ASCII));
+            archive.write(new byte[] {1, 0});
+            archive.write(MessageDigest.getInstance("SHA-256").digest(payload));
+            archive.write(payload);
+            var restored = BackupArchive.decode(archive.toByteArray(), new char[0]);
+            roundTrip(base, restored);
+            require(restored.inactiveProfiles().isEmpty(), "legacy archive has only the original active profile");
+        }
     }
 
     private static BackupArchive.Data sample() throws Exception {

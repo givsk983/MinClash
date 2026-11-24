@@ -15,6 +15,7 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -58,8 +59,15 @@ final class BackupStore {
         for (Map.Entry<String, ?> entry : preferences.getAll().entrySet()) {
             if (BackupArchive.portableKey(entry.getKey())) settings.put(entry.getKey(), entry.getValue());
         }
-        return new BackupArchive.Data(new RoutingStore.State(state.source(), state.applications(), catalog.activeAddress(), state.rules(), state.bypassedApps()),
-            catalog.entries(), settings, System.currentTimeMillis(), version);
+        Set<String> savedAddresses = new HashSet<>();
+        for (SubscriptionCatalog.Entry entry : catalog.entries()) savedAddresses.add(entry.address());
+        List<RoutingStore.State> inactive = new ArrayList<>();
+        for (RoutingStore.State profile : routing.inactiveProfiles()) {
+            if (profile.localId() != null || savedAddresses.contains(profile.subscription())) inactive.add(profile);
+        }
+        return new BackupArchive.Data(new RoutingStore.State(state.source(), state.applications(), catalog.activeAddress(),
+            state.rules(), state.bypassedApps(), state.localId(), state.localName()), catalog.entries(), settings,
+            System.currentTimeMillis(), version, inactive);
     }
 
     String stamp() throws Exception {
@@ -84,6 +92,7 @@ final class BackupStore {
     void restore(BackupArchive.Data data, String expectedStamp) throws Exception {
         recoverPending();
         routing.checkExperimentalAccess(data.state());
+        for (RoutingStore.State profile : data.inactiveProfiles()) routing.checkExperimentalAccess(profile);
         Module.Status before = Module.status();
         if (!before.installed() || !before.enabled || before.phase() != Module.Phase.STOPPED) {
             throw new IOException("请先安装并启用模块、停止 TUN，再恢复备份。");
@@ -100,7 +109,7 @@ final class BackupStore {
         replacement.put("subscription", data.state().subscription());
         writeJournal(snapshot);
         transaction(() -> writeSettings(replacement), () -> {
-            routing.applyBackup(data.state());
+            routing.applyBackup(data.state(), data.inactiveProfiles());
             clearJournal();
         }, () -> rollback(snapshot));
     }

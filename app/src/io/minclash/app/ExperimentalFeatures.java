@@ -37,6 +37,7 @@ final class ExperimentalFeatures {
         RoutingStore.State withoutBypass = routing.withoutBypass(before);
         boolean protection = needsProtectionOff(before);
         if (withoutBypass == null && !protection) {
+            routing.clearInactiveBypass();
             saveOff(context);
             return before;
         }
@@ -55,6 +56,7 @@ final class ExperimentalFeatures {
         try {
             if (withoutBypass != null) routing.apply(withoutBypass);
             if (protection) Module.run(Module.Command.PROTECTION_OFF, null);
+            routing.clearInactiveBypass();
             saveOff(context);
         } catch (Exception error) {
             failure = error;
