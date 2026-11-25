@@ -85,9 +85,17 @@ final class Controller {
         request("PATCH", "/configs", "{\"find-process-mode\":\"always\"}");
     }
 
-    private static List<Group> selectable(List<Group> groups) {
+    static List<Group> selectable(List<Group> groups) {
         List<Group> visible = new ArrayList<>();
-        for (Group group : groups) if (group.selectable()) visible.add(group);
+        boolean privatePaused = groups.stream().anyMatch(group -> group.hidden() && group.name().equals(Profile.PRIVATE_OUTLET));
+        for (Group group : groups) {
+            if (!group.selectable()) continue;
+            if (privatePaused && group.options().contains(Profile.PRIVATE_OUTLET)) {
+                List<String> options = new ArrayList<>(group.options());
+                options.removeIf(Profile.PRIVATE_OUTLET::equals);
+                if (!options.isEmpty()) visible.add(new Group(group.name(), group.current(), options, group.automatic(), true, false));
+            } else visible.add(group);
+        }
         return visible;
     }
 
@@ -149,7 +157,7 @@ final class Controller {
         String outlet = chain.get(chain.size() - 1);
         String probeOutlet = switch (outlet) {
             case "DIRECT", "REJECT", "REJECT-DROP" -> null;
-            default -> outlet;
+            default -> probeOutlet(chain, outlet);
         };
         return new Overview(mode, outletLabel(outlet), probeOutlet);
     }
@@ -167,15 +175,26 @@ final class Controller {
         String outlet = route.get(route.size() - 1);
         if (outlet.equals("DIRECT")) return new OutletProbe(OutletState.DIRECT, 0);
         if (outlet.equals("REJECT") || outlet.equals("REJECT-DROP")) return new OutletProbe(OutletState.REJECTED, 0);
-        int delay = testDelay(outlet, NetworkCheck.GOOGLE);
+        int delay = testDelay(probeOutlet(route, outlet), NetworkCheck.GOOGLE);
         return new OutletProbe(delay > 0 ? OutletState.HTTPS_OK : OutletState.HTTPS_FAILED, delay);
     }
 
     static int testDelay(String outlet, NetworkCheck target) throws Exception {
-        String path = "/proxies/" + Uri.encode(outlet) + "/delay?timeout=3500&expected="
-            + target.expectedStatus + "&url=" + Uri.encode(target.endpoint.toString());
+        return testDelay(outlet, "", target);
+    }
+
+    static int testDelay(String outlet, String provider, NetworkCheck target) throws Exception {
+        String node = Uri.encode(outlet);
+        String path = provider.isEmpty() ? "/proxies/" + node + "/delay"
+            : "/providers/proxies/" + Uri.encode(provider) + "/" + node + "/healthcheck";
+        path += "?timeout=3500&expected=" + target.expectedStatus + "&url=" + Uri.encode(target.endpoint.toString());
         try { return new JSONObject(probe(path)).getInt("delay"); }
         catch (IOException error) { return 0; }
+    }
+
+    static String probeOutlet(List<String> route, String outlet) {
+        // The group is addressable by the controller even when its selected inline node is not.
+        return route.contains(Profile.PRIVATE_OUTLET) ? Profile.PRIVATE_OUTLET : outlet;
     }
 
     static Overview overview() throws Exception {

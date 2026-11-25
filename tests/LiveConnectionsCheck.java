@@ -2,6 +2,7 @@ package io.minclash.app;
 
 import java.io.IOException;
 import java.time.Instant;
+import java.util.Map;
 import java.util.Set;
 import org.json.JSONObject;
 
@@ -48,21 +49,54 @@ public final class LiveConnectionsCheck {
               {"id":"00000000-0000-0000-0000-000000000003","start":"2026-11-18T10:00:00Z","metadata":{"process":"com.example.app","uid":112345}},
               {"id":"00000000-0000-0000-0000-000000000004","start":"2026-11-18T10:00:01Z","metadata":{"process":"com.example.app","uid":12345}},
               {"id":"00000000-0000-0000-0000-000000000005","metadata":{"process":"com.example.app","uid":12345}},
-              {"id":"invalid","start":"2026-11-18T10:00:00Z","metadata":{"uid":12345}}
+              {"id":"invalid","start":"2026-11-18T10:00:00Z","metadata":{"uid":12345}},
+              {"id":"00000000-0000-0000-0000-000000000006","start":"2026-11-18T10:00:00Z","metadata":{"process":"com.example.game:service","uid":12346}},
+              {"id":"00000000-0000-0000-0000-000000000007","start":"2026-11-18T10:00:00Z","metadata":{"process":"com.example.shared:service","uid":12345}},
+              {"id":"00000000-0000-0000-0000-000000000008","start":"2026-11-18T10:00:02Z","metadata":{"process":"com.example.game","uid":12346}},
+              {"id":"00000000-0000-0000-0000-000000000009","start":"2026-11-18T10:00:00Z","metadata":{"process":"com.example.other","uid":12347}}
             ]}
             """);
         Instant cutoff = Instant.parse("2026-11-18T10:00:01Z");
         Set<String> owned = Set.of("00000000-0000-0000-0000-000000000001");
-        require(LiveConnections.olderConnectionIds(beforeAndAfter, "com.example.app", 12345, false, cutoff).equals(owned),
+        Map<String, LiveConnections.AppIdentity> shared = Map.of("com.example.app", new LiveConnections.AppIdentity(12345, false));
+        require(LiveConnections.olderConnectionIds(beforeAndAfter, shared, cutoff).equals(Map.of("com.example.app", owned)),
             "shared UID requires a matching process and the current profile's UID");
-        require(LiveConnections.olderConnectionIds(beforeAndAfter, "com.example.app", 12345, true, cutoff).equals(
-            Set.of("00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002")),
-            "unique UID can attribute old connections; ambiguous time, malformed IDs and new connections are skipped");
+        JSONObject uniqueSnapshot = new JSONObject(beforeAndAfter.toString());
+        uniqueSnapshot.getJSONArray("connections").remove(7); // The UID is shared in the batch fixture below.
+        Map<String, LiveConnections.AppIdentity> single = Map.of("com.example.app", new LiveConnections.AppIdentity(12345, true));
+        require(LiveConnections.olderConnectionIds(uniqueSnapshot, single, cutoff).equals(Map.of("com.example.app",
+            Set.of("00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"))),
+            "unique UID can attribute one without a reported process name");
+        Map<String, LiveConnections.AppIdentity> selected = Map.of(
+            "com.example.app", new LiveConnections.AppIdentity(12345, false),
+            "com.example.shared", new LiveConnections.AppIdentity(12345, false),
+            "com.example.game", new LiveConnections.AppIdentity(12346, true),
+            "com.example.idle", new LiveConnections.AppIdentity(12348, true));
+        require(LiveConnections.olderConnectionIds(beforeAndAfter, selected, cutoff).equals(Map.of(
+            "com.example.app", owned,
+            "com.example.shared", Set.of("00000000-0000-0000-0000-000000000007"),
+            "com.example.game", Set.of("00000000-0000-0000-0000-000000000006"))),
+            "a single batch excludes unselected, new, ambiguous, and invalid connections");
+        require(LiveConnections.runningApps("""
+              UID NAME
+                0 init
+              12345 com.example.app:worker
+              12345 com.example.sharedDifferent
+              112345 com.example.shared
+              12346 custom.process.name
+              12347 com.example.other
+              12348x com.example.idle
+            """, selected).equals(Set.of("com.example.app", "com.example.game")),
+            "running status uses matching process names or unique UIDs and excludes a different Android profile");
+        try {
+            LiveConnections.runningApps("permission denied", selected);
+            throw new AssertionError("unavailable process status must remain unknown");
+        } catch (IOException expected) { }
         try {
             LiveConnections.describe(new JSONObject("{\"connections\":{}}"), "com.example.app", -1);
             throw new AssertionError("invalid snapshot accepted");
         } catch (IOException expected) { }
-        System.out.println("PASS: live connection attribution, actual outlets, and empty snapshots.");
+        System.out.println("PASS: live connection attribution, batched old connections, and Android process status.");
     }
 
     private static void require(boolean condition, String name) {

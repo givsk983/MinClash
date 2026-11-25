@@ -23,8 +23,9 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
 
     static SubscriptionPreview compare(SubscriptionCatalog.Entry entry, byte[] source, int generation, boolean adding,
                                        RoutingStore.State baseline, RoutingStore.State rules, List<Controller.Group> selections) throws IOException {
-        Profile.PreviewLayout candidate = Profile.previewLayout(source);
-        Set<String> before = baseline == null ? Collections.emptySet() : Profile.previewLayout(baseline.source()).nodes();
+        RoutingStore.State next = forCandidate(entry, source, rules);
+        Profile.PreviewLayout candidate = Profile.previewLayout(next.sourceWithPrivateNodes());
+        Set<String> before = baseline == null ? Collections.emptySet() : Profile.previewLayout(baseline.sourceWithPrivateNodes()).nodes();
         Set<String> added = new TreeSet<>(candidate.nodes());
         added.removeAll(before);
         Set<String> removed = new TreeSet<>(before);
@@ -46,7 +47,7 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
         Comparison comparison = new Comparison(Collections.unmodifiableSet(candidate.groups().keySet()),
             Collections.unmodifiableSet(added), Collections.unmodifiableSet(removed),
             selections == null ? null : Collections.unmodifiableList(lost));
-        return describe(entry, source, generation, adding, comparison, forCandidate(entry, source, rules), Map.of());
+        return describe(entry, source, generation, adding, comparison, next, Map.of());
     }
 
     boolean conflicts() { return !missingTargets.isEmpty(); }
@@ -63,8 +64,12 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
         return required.stream().filter(name -> !protectionAliases.containsKey(name)).collect(java.util.stream.Collectors.toList());
     }
 
+    List<String> protectionReplacementTargets(String alias) throws IOException {
+        return Profile.protectionAliasTargets(rules.sourceWithPrivateNodes(), alias);
+    }
+
     SubscriptionPreview withProtectionAlias(String alias, String target) throws IOException {
-        byte[] adjusted = Profile.withProtectionAlias(source, alias, target);
+        byte[] adjusted = Profile.withProtectionAlias(source, alias, target, rules.sourceWithPrivateNodes());
         Set<String> groups = new TreeSet<>(comparison.groups());
         groups.add(alias);
         Comparison updated = new Comparison(groups, comparison.added(), comparison.removed(), comparison.lost());
@@ -77,6 +82,7 @@ record SubscriptionPreview(SubscriptionCatalog.Entry entry, byte[] source, int g
     List<String> replacementTargets(String oldTarget) {
         if (!missingTargets.contains(oldTarget)) return Collections.emptyList();
         List<String> targets = new ArrayList<>(new TreeSet<>(comparison.groups()));
+        if (!rules.privateNodesEnabled() && !rules.privateNodes().isEmpty()) targets.remove(Profile.PRIVATE_OUTLET);
         targets.removeIf(name -> name.equals("DIRECT") || name.equals("REJECT") || name.length() > 4096 || !name.matches("[^\\r\\n,]+"));
         targets.add("DIRECT");
         if (!rules.applications().containsValue(oldTarget)) targets.add("REJECT");

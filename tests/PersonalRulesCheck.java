@@ -42,6 +42,7 @@ public final class PersonalRulesCheck {
             && rules.get(2).equals(ip.line()) && rules.get(3).equals(v6.line()) && rules.get(4).equals("MATCH,DIRECT"), "app > ordered personal > subscription priority");
         require(ip.line().endsWith(",no-resolve"), "IP rules do not force DNS lookup");
         require(((List<?>) ((Map<?, ?>) new Yaml().load(new String(source, StandardCharsets.UTF_8))).get("rules")).size() == 1, "source kept separate");
+        byte[] edited = checkYamlRules(source, apps, personal);
         reject(() -> Profile.withPersonalRules(source, apps, List.of(domain, domain)));
         reject(() -> Profile.withPersonalRules(source, apps, List.of(new PersonalRules.Rule("DOMAIN", "example.com", "missing"))));
         RoutingStore.State state = new RoutingStore.State(source, apps, "https://example.test/config", personal);
@@ -69,7 +70,32 @@ public final class PersonalRulesCheck {
         Files.createDirectories(Path.of(args[0]));
         Files.write(Path.of(args[0], "personal-rules.yaml"), merged);
         Files.write(Path.of(args[0], "personal-rules-no-apps.yaml"), Profile.withPersonalRules(source, Map.of(), personal));
-        System.out.println("PASS: domain/IP validation, priority and ordering, state migration, subscription conflicts, edit preservation and old/new backups.");
+        Files.write(Path.of(args[0], "edited-yaml-rules.yaml"), edited);
+        System.out.println("PASS: native YAML rule editing, domain/IP validation, priority and ordering, state migration, subscription conflicts and old/new backups.");
+    }
+
+    private static byte[] checkYamlRules(byte[] source, Map<String, String> apps, List<PersonalRules.Rule> personal) throws Exception {
+        List<String> replacement = List.of("AND,((NETWORK,UDP),(DST-PORT,443)),REJECT", "DOMAIN,example.net,US", "MATCH,DIRECT");
+        byte[] edited = Profile.withYamlRules(source, replacement);
+        require(Profile.yamlRules(edited).equals(replacement), "native rules are read in order with the original syntax");
+        require(Profile.yamlRules(source).equals(List.of("MATCH,DIRECT")), "editing produces a new source");
+        Yaml yaml = new Yaml();
+        Map<?, ?> before = yaml.load(new String(source, StandardCharsets.UTF_8));
+        Map<?, ?> after = yaml.load(new String(edited, StandardCharsets.UTF_8));
+        before.remove("rules");
+        after.remove("rules");
+        require(before.equals(after), "editing native rules preserves all other YAML fields");
+        byte[] rendered = Profile.withPersonalRules(edited, apps, personal);
+        List<String> merged = Profile.yamlRules(rendered);
+        require(merged.subList(4, merged.size()).equals(replacement)
+            && merged.get(0).equals("PROCESS-NAME,com.example.app,US") && merged.get(1).equals(personal.get(0).line()),
+            "native rule edits keep application and personal rule precedence");
+        byte[] noRules = "proxy-groups: []\n".getBytes(StandardCharsets.UTF_8);
+        require(Profile.yamlRules(noRules).isEmpty() && Profile.yamlRules(Profile.withYamlRules(noRules, replacement)).equals(replacement),
+            "a profile without a rules section can add its first rule");
+        require(Profile.yamlRules(Profile.withYamlRules(source, List.of())).isEmpty(), "deleting all native rules leaves an empty list");
+        reject(() -> Profile.yamlRules("rules: [true]\n".getBytes(StandardCharsets.UTF_8)));
+        return rendered;
     }
     private interface Attempt { void run() throws Exception; }
     private static void reject(Attempt attempt) throws Exception {

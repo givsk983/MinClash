@@ -121,6 +121,9 @@ public final class MainActivity extends ThemedActivity {
     private Button repairDnsButton;
     private Button proxyDnsButton;
     private Switch autoUpdateSwitch;
+    private Switch privateNodesSwitch;
+    private Button editPrivateNodesButton;
+    private TextView privateNodesSummary;
     private Switch experimentalSwitch;
     private View experimentalRouting;
     private TextView autoUpdateSummary;
@@ -139,6 +142,7 @@ public final class MainActivity extends ThemedActivity {
     private boolean subscriptionNotificationSettingsOpened;
     private SubscriptionCatalog subscriptionCatalog;
     private SubscriptionCatalog.Snapshot subscriptions;
+    private RoutingStore.PrivateNodesSettings privateNodesSettings;
     private List<RoutingStore.LocalProfile> localProfiles = Collections.emptyList();
     private ProxyModeRow modeRow;
     private OverviewActionRow groupsRow;
@@ -148,13 +152,20 @@ public final class MainActivity extends ThemedActivity {
     private OverviewActionRow connectionsRow;
     private TrafficCard trafficCard;
     private record RulesScreen(RoutingStore.State state, int generation, List<String> targets) {}
+    private record ProfileRulesTarget(String name, String id, boolean subscription) implements java.io.Serializable {}
+    private record YamlRulesScreen(ProfileRulesTarget target, RoutingStore.SavedProfile profile, List<String> rules) {}
+    private record PrivateNodesScreen(SubscriptionCatalog.Entry entry, RoutingStore.SavedProfile profile) {}
+    private record YamlRulesSaved(String message) {}
+    private record ProfileAppRouting(ProfileRulesTarget target, RoutingStore.SavedProfile profile, AppRouting.Screen screen) {}
     private record ProxyDnsScreen(RoutingStore.State state, List<String> targets, boolean eligible) {}
     private record ProxyDnsSaved(RoutingStore.ApplyMethod method, Module.Status status) {}
-    private record AppRoutingSaved(RoutingStore.ApplyMethod method, List<AppRouting.Entry> apps, java.time.Instant cutoff) {}
+    private record AppRoutingSaved(RoutingStore.ApplyMethod method, boolean active, List<AppRouting.Entry> apps, java.time.Instant cutoff) {}
+    private record DisconnectApps(List<LiveConnections.DisconnectApp> apps, java.time.Instant cutoff) {}
     private record AppConnectionsClosed(int count) {}
     private record PersonalRulesSaved(RoutingStore.ApplyMethod method, RulesScreen screen) {}
     private String routingFilter = AppCategories.APPS;
     private String routingQuery = "";
+    private ProfileRulesTarget pendingAppRoutingTarget;
     private final AppRouting.Loader routingLoader = new AppRouting.Loader();
     private record RoutingSnapshot(AppRouting.Screen screen, int epoch, int version, long time) {}
     private record RoutingRead(boolean root, int epoch, CompletableFuture<RoutingSnapshot> result) {}
@@ -398,6 +409,8 @@ public final class MainActivity extends ThemedActivity {
         LinearLayout commonSettings = settingsNavigation.group("常用");
         LinearLayout notificationPage = settingsNavigation.page(commonSettings, "notification", "通知栏控制", "连接、网速与快捷切换");
         settingsNavigation.action(commonSettings, "subscription", "订阅显示与提醒", "额度布局与到期通知", this::showSubscriptionSettings);
+        LinearLayout privateNodesPage = settingsNavigation.page(commonSettings, "private-nodes", "私人节点", "为指定应用选用自己的节点");
+        buildPrivateNodesSettings(privateNodesPage);
         settingsNavigation.action(commonSettings, "appearance", "外观", "桌面图标", this::showAppearance);
         LinearLayout connectionSettings = settingsNavigation.group("连接");
         settingsNavigation.action(connectionSettings, "protection", "应用防泄漏保护 · 开发中", "指定应用使用代理，断线时暂停联网", () -> startActivity(new Intent(this, ProtectionActivity.class)));
@@ -692,6 +705,7 @@ public final class MainActivity extends ThemedActivity {
         if (savedInstanceState != null) {
             pendingUpdate = (AppUpdate.Release) savedInstanceState.getSerializable("pendingUpdate");
             pendingLocalReplacement = savedInstanceState.getString("pendingLocalReplacement");
+            pendingAppRoutingTarget = (ProfileRulesTarget) savedInstanceState.getSerializable("pendingAppRoutingTarget");
         }
         if (autoUpdateSwitch.isChecked() && !SubscriptionUpdateJob.schedule(this, true)) {
             appPreferences().edit().putBoolean(SubscriptionUpdateJob.ENABLED, false).apply();
@@ -708,6 +722,7 @@ public final class MainActivity extends ThemedActivity {
         state.putInt("page", selectedPage);
         state.putSerializable("pendingUpdate", pendingUpdate);
         state.putString("pendingLocalReplacement", pendingLocalReplacement);
+        state.putSerializable("pendingAppRoutingTarget", pendingAppRoutingTarget);
         settingsNavigation.save(state);
         super.onSaveInstanceState(state);
     }
@@ -1265,17 +1280,20 @@ public final class MainActivity extends ThemedActivity {
 
     private void refreshSubscriptionCatalog() {
         try {
-            List<RoutingStore.LocalProfile> locals = new ArrayList<>();
-            SubscriptionCatalog.Snapshot loaded = RoutingMutations.run(this, () -> {
+            record CatalogView(SubscriptionCatalog.Snapshot subscriptions, List<RoutingStore.LocalProfile> locals,
+                               RoutingStore.PrivateNodesSettings privateNodes) {}
+            CatalogView loaded = RoutingMutations.run(this, () -> {
                 RoutingMutations.recoverPending(this);
-                locals.addAll(new RoutingStore(this).localProfileEntries());
-                return subscriptionCatalog.load();
+                RoutingStore routing = new RoutingStore(this);
+                SubscriptionCatalog.Snapshot catalog = subscriptionCatalog.load();
+                return new CatalogView(catalog, routing.localProfileEntries(), routing.privateNodesSettings(catalog.activeAddress()));
             });
-            SubscriptionReminders.reconcile(getApplicationContext(), loaded);
+            SubscriptionReminders.reconcile(getApplicationContext(), loaded.subscriptions());
             main.post(() -> {
                 if (isDestroyed()) return;
-                subscriptions = loaded;
-                localProfiles = locals;
+                subscriptions = loaded.subscriptions();
+                localProfiles = loaded.locals();
+                privateNodesSettings = loaded.privateNodes();
                 render();
                 handleSubscriptionReminderIntent();
             });
@@ -1536,15 +1554,21 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void trackManagement(AlertDialog dialog) {
+        trackManagement(dialog, () -> {});
+    }
+
+    private void trackManagement(AlertDialog dialog, Runnable onDismiss) {
         if (managementDialog != null && managementDialog != dialog) managementDialog.dismiss();
         managementDialog = dialog;
         dialog.setOnDismissListener(view -> {
             if (managementDialog == dialog) managementDialog = null;
+            onDismiss.run();
             main.post(this::deliverBackgroundResults);
         });
     }
 
     private void showSubscriptionActions(SubscriptionCatalog.Entry entry) {
+        ProfileRulesTarget target = new ProfileRulesTarget(entry.name(), entry.address(), true);
         boolean active = entry.address().equals(subscriptions.activeAddress());
         boolean failed = SubscriptionUpdateStatus.load(appPreferences(), entry.address()).failed();
         String use = active ? (failed ? "重试更新订阅" : "更新订阅") : "切换到此订阅";
@@ -1554,6 +1578,9 @@ public final class MainActivity extends ThemedActivity {
             actions.add(use);
             if (!active) actions.add(download);
         }
+        actions.add("管理 YAML 规则");
+        actions.add("私人节点");
+        actions.add("应用分流");
         actions.add("重命名");
         actions.add("流量与有效期");
         if (!active) actions.add("删除");
@@ -1561,14 +1588,137 @@ public final class MainActivity extends ThemedActivity {
             .setItems(actions.toArray(new String[0]), (dialog, index) -> {
                 String action = actions.get(index);
                 switch (action) {
+                    case "管理 YAML 规则" -> openYamlRules(target);
+                    case "私人节点" -> openPrivateNodes(entry, target);
+                    case "应用分流" -> openAppRouting(target);
                     case "流量与有效期" -> showUsage(entry);
                     case "重命名" -> renameSubscription(entry);
                     case "删除" -> trackManagement(new AlertDialog.Builder(this).setTitle("删除订阅")
-                        .setMessage("删除「" + entry.name() + "」及其个人规则？")
+                         .setMessage("删除「" + entry.name() + "」及其私人节点和个人规则？")
                         .setNegativeButton("取消", null).setPositiveButton("删除", (view, which) -> deleteSubscription(entry)).show());
                     default -> activateSubscription(entry, !active && !action.equals(download));
                 }
             }).setNegativeButton("返回", (dialog, which) -> showSubscriptions()).show());
+    }
+
+    private void openPrivateNodes(SubscriptionCatalog.Entry entry, ProfileRulesTarget target) {
+        execute("", () -> RoutingMutations.run(this, () -> new PrivateNodesScreen(entry, readRulesProfile(target))));
+    }
+
+    private void buildPrivateNodesSettings(LinearLayout page) {
+        LinearLayout controls = card(page, 0);
+        privateNodesSwitch = new Switch(this);
+        privateNodesSwitch.setText("启用私人节点");
+        privateNodesSwitch.setTextColor(TEXT);
+        privateNodesSwitch.setTextSize(16);
+        privateNodesSwitch.setMinHeight(dp(48));
+        privateNodesSwitch.setOnCheckedChangeListener((view, enabled) -> {
+            if (updatingSwitch || busy || subscriptions == null || privateNodesSettings == null
+                || enabled == privateNodesSettings.enabled()) return;
+            String address = subscriptions.activeAddress();
+            boolean hasNodes = privateNodesSettings.hasNodes();
+            mutate(enabled ? "私人节点已开启。" : "私人节点已关闭。", hasNodes, () -> {
+                try {
+                    new RoutingStore(this).setPrivateNodesEnabled(address, enabled);
+                    return hasNodes ? Module.status() : null;
+                } finally {
+                    refreshSubscriptionCatalog();
+                }
+            });
+        });
+        add(controls, privateNodesSwitch, 0);
+        privateNodesSummary = label("请先下载并使用一份订阅", 13, MUTED, false);
+        add(controls, privateNodesSummary, 6);
+        editPrivateNodesButton = button("编辑当前订阅的私人节点", false);
+        editPrivateNodesButton.setOnClickListener(view -> {
+            SubscriptionCatalog.Entry entry = subscriptions == null ? null : subscriptions.active();
+            if (entry != null) openPrivateNodes(entry, new ProfileRulesTarget(entry.name(), entry.address(), true));
+        });
+        add(controls, editPrivateNodesButton, 12);
+        add(controls, label("关闭后，「私人出口」会隐藏。使用该出口的受保护应用会暂停联网，规则模式下分流到该出口的流量也会暂停。",
+            13, MUTED, false), 10);
+
+        LinearLayout guide = card(page, 14);
+        add(guide, label("怎么让一个应用走私人节点？", 17, TEXT, true), 0);
+        add(guide, label("节点是你购买的代理。添加后，「私人出口」会把这些节点放在一个列表里，方便你手动选一个。",
+            13, MUTED, false), 8);
+        add(guide, label("开启开关，再点「编辑当前订阅的私人节点」。粘贴服务商提供的 Mihomo / Clash 节点 YAML，例如配置文件中 proxies 开头的节点列表。",
+            13, TEXT, false), 12);
+        TextView example = label("proxies:\n  - name: 示例节点\n    type: socks5\n    server: proxy.example.com\n    port: 1080",
+            12, MUTED, false);
+        example.setTypeface(android.graphics.Typeface.MONOSPACE);
+        example.setPadding(dp(12), dp(10), dp(12), dp(10));
+        example.setBackground(shape(BG, 10, true));
+        add(guide, example, 8);
+        add(guide, label("上面只演示格式。请粘贴服务商给你的完整节点内容。", 12, MUTED, false), 6);
+        add(guide, label("在「概览」启动 TUN，切到规则模式。打开「代理组与节点 → 私人出口」，选中你想用的节点。",
+            13, TEXT, false), 10);
+        add(guide, label("在「配置 → 应用分流」找到要单独使用的应用，选择「私人出口」并保存。重新打开该应用，让它用新出口建立连接。",
+            13, TEXT, false), 10);
+        add(guide, label("普通应用继续按订阅规则联网，订阅刷新会保留私人节点。只有分享链接时，可以向服务商索取 Mihomo / Clash YAML。",
+            13, MUTED, false), 12);
+    }
+
+    private void showPrivateNodes(PrivateNodesScreen screen) {
+        LinearLayout form = column();
+        form.setPadding(dp(20), dp(8), dp(20), dp(12));
+        add(form, label(screen.entry().name(), 15, TEXT, true), 0);
+        add(form, label("粘贴 Mihomo 节点 YAML。订阅刷新后仍会保留，可在应用分流中选择「私人出口」。清空后保存可移除节点。",
+            13, MUTED, false), 8);
+        if (!screen.profile().state().privateNodesEnabled()) {
+            add(form, label("保存后，可在「设置 → 私人节点」为当前订阅开启。", 13, MUTED, false), 8);
+        }
+        EditText input = subscriptionInput("粘贴单个节点或 proxies 列表", InputType.TYPE_CLASS_TEXT
+            | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        input.setHorizontallyScrolling(false);
+        input.setMinLines(5);
+        input.setMaxLines(10);
+        input.setGravity(Gravity.TOP | Gravity.START);
+        input.setTypeface(android.graphics.Typeface.MONOSPACE);
+        input.setSaveEnabled(false);
+        input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        input.setText(screen.profile().state().privateNodes());
+        add(form, input, 12);
+        TextView feedback = label("", 13, TEXT, false);
+        feedback.setVisibility(View.GONE);
+        add(form, feedback, 8);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(form);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("私人节点").setView(scroll)
+            .setNegativeButton("取消", null).setPositiveButton("保存", null).create();
+        dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+        dialog.show();
+        trackManagement(dialog);
+        Button save = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        save.setOnClickListener(view -> {
+            if (busy) return;
+            String yaml = input.getText().toString();
+            feedback.setText("正在保存私人节点…");
+            feedback.setVisibility(View.VISIBLE);
+            save.setEnabled(false);
+            input.setEnabled(false);
+            dialog.setCancelable(false);
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setEnabled(false);
+            mutate("", screen.profile().active(), () -> {
+                try {
+                    new RoutingStore(this).savePrivateNodes(screen.profile(), yaml);
+                    return screen.profile().active() ? Module.status() : null;
+                } finally {
+                    refreshSubscriptionCatalog();
+                }
+            }, error -> {
+                if (error == null || error instanceof RoutingStore.SelectionRestoreFailure) {
+                    dialog.dismiss();
+                    showMessage(error == null ? "私人节点已保存。" : error.getMessage());
+                    return;
+                }
+                feedback.setText(error.getMessage() == null ? "无法保存私人节点，请重试。" : error.getMessage());
+                save.setEnabled(true);
+                input.setEnabled(true);
+                dialog.setCancelable(true);
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setEnabled(true);
+            });
+        });
     }
 
     private void showUsage(SubscriptionCatalog.Entry entry) {
@@ -1894,7 +2044,7 @@ public final class MainActivity extends ThemedActivity {
             active, rules, selections);
         RoutingStore.State copyFrom = target == null && active != null && (!active.applications().isEmpty() || !active.rules().isEmpty())
             ? active : null;
-        return new BackgroundWork.ProfilePreview(changes, copyFrom, routing.missingProtectionTargets(current, source),
+        return new BackgroundWork.ProfilePreview(changes, copyFrom, routing.missingProtectionTargets(current, changes.rules().sourceWithPrivateNodes()),
             profileNotice, cachedSubscription);
     }
 
@@ -2030,7 +2180,7 @@ public final class MainActivity extends ThemedActivity {
 
     private void chooseProtectionReplacement(BackgroundWork.ProfilePreview result, SubscriptionPreview preview, String alias) {
         try {
-            List<String> targets = Profile.protectionAliasTargets(preview.source(), alias);
+            List<String> targets = preview.protectionReplacementTargets(alias);
             AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("为「" + alias + "」选择代理组")
                 .setNegativeButton("返回预览", null);
             if (targets.isEmpty()) dialog.setMessage("新配置中没有可用于此保护出口的代理组。");
@@ -2090,12 +2240,15 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void showLocalProfileActions(RoutingStore.LocalProfile entry) {
-        String[] actions = entry.active() ? new String[] {"替换 YAML"}
-            : new String[] {"切换到此配置", "替换 YAML 并使用", "删除"};
+        ProfileRulesTarget target = new ProfileRulesTarget(entry.name(), entry.id(), false);
+        String[] actions = entry.active() ? new String[] {"管理 YAML 规则", "应用分流", "替换 YAML"}
+            : new String[] {"切换到此配置", "管理 YAML 规则", "应用分流", "替换 YAML 并使用", "删除"};
         trackManagement(new AlertDialog.Builder(this).setTitle(entry.name())
             .setItems(actions, (dialog, which) -> {
                 switch (actions[which]) {
                     case "切换到此配置" -> previewLocalProfile(null, entry.id());
+                    case "管理 YAML 规则" -> openYamlRules(target);
+                    case "应用分流" -> openAppRouting(target);
                     case "删除" -> confirmDeleteLocalProfile(entry);
                     default -> pickProfile(entry.id());
                 }
@@ -2240,7 +2393,7 @@ public final class MainActivity extends ThemedActivity {
             return;
         }
         if (request == APP_LIST_SETTINGS) {
-            refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false));
+            resumeAppRouting();
             return;
         }
         if (request == EXPORT_MODULE && result == RESULT_OK && data != null && data.getData() != null) {
@@ -2705,7 +2858,7 @@ public final class MainActivity extends ThemedActivity {
         }
         showPolicyList("代理组与节点", groups.size() + " 个代理组 · 点击查看可选节点", "搜索代理组或当前出口", items,
             (dialog, index) -> { dialog.dismiss(); showNodes(ordered.get(index), groups, null); }, null, null,
-            index -> ordered.get(index).name(), false);
+            index -> ordered.get(index).name(), false, "");
     }
 
     private String groupRoute(Controller.Group group, List<Controller.Group> groups) {
@@ -2715,6 +2868,21 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void showNodes(Controller.Group group, List<Controller.Group> groups, Runnable browseGroups) {
+        if (Profile.PRIVATE_OUTLET.equals(group.name())) {
+            execute("", () -> {
+                RoutingStore.State state = new RoutingStore(this).load();
+                String provider = state.privateNodesEnabled() && !state.privateNodes().isEmpty()
+                    ? Profile.privateProviderName(state.source()) : "";
+                return new PrivateNodePicker(group, groups, browseGroups, provider);
+            });
+            return;
+        }
+        showNodes(group, groups, browseGroups, "");
+    }
+
+    private record PrivateNodePicker(Controller.Group group, List<Controller.Group> groups, Runnable browseGroups, String provider) {}
+
+    private void showNodes(Controller.Group group, List<Controller.Group> groups, Runnable browseGroups, String provider) {
         List<PolicyItem> items = new ArrayList<>();
         for (int i = 0; i < group.options().size(); i++) {
             String option = group.options().get(i);
@@ -2733,7 +2901,7 @@ public final class MainActivity extends ThemedActivity {
                 dialog.dismiss();
                 String option = group.options().get(index);
                 if (!option.equals(group.current())) selectNode(group.name(), option);
-            }, group.automatic() ? () -> selectNode(group.name(), null) : null, browseGroups, group.options()::get, true);
+            }, group.automatic() ? () -> selectNode(group.name(), null) : null, browseGroups, group.options()::get, true, provider);
     }
 
     private record PolicyItem(String title, String detail, String badge, boolean selected, boolean navigates,
@@ -2741,13 +2909,13 @@ public final class MainActivity extends ThemedActivity {
 
     private void showPolicyList(String title, String subtitle, String hint, List<PolicyItem> items,
                                 BiConsumer<AlertDialog, Integer> onPick, Runnable reset, Runnable browseGroups,
-                                java.util.function.IntFunction<String> testName, boolean nodePicker) {
+                                java.util.function.IntFunction<String> testName, boolean nodePicker, String provider) {
         if (policyDialog != null) policyDialog.dismiss();
         LinearLayout header = column();
         header.setPadding(dp(20), dp(20), dp(20), dp(8));
         add(header, label(title, 20, TEXT, true), 0);
         add(header, label(subtitle, 12, MUTED, false), 8);
-        PolicyAdapter adapter = new PolicyAdapter(items, testName, nodePicker);
+        PolicyAdapter adapter = new PolicyAdapter(items, testName, nodePicker, provider);
         if (nodePicker) adapter.addControls(header);
         EditText search = new EditText(this);
         search.setSingleLine(true);
@@ -2809,7 +2977,7 @@ public final class MainActivity extends ThemedActivity {
         private TextView progress;
         private final Runnable update = this::refreshItems;
 
-        PolicyAdapter(List<PolicyItem> items, java.util.function.IntFunction<String> testName, boolean nodePicker) {
+        PolicyAdapter(List<PolicyItem> items, java.util.function.IntFunction<String> testName, boolean nodePicker, String provider) {
             this.source = items;
             this.testName = testName;
             this.nodePicker = nodePicker;
@@ -2818,7 +2986,7 @@ public final class MainActivity extends ThemedActivity {
             favorites = new LinkedHashSet<>(appPreferences().getStringSet(favoritesKey, java.util.Collections.emptySet()));
             sortByDelay = appPreferences().getBoolean("node_sort_delay", false);
             hideFailed = appPreferences().getBoolean("node_hide_failed", false);
-            tests = new NodeLatencyBatch(name -> Controller.testDelay(name, NetworkCheck.GOOGLE), () -> main.post(update));
+            tests = new NodeLatencyBatch(name -> Controller.testDelay(name, provider, NetworkCheck.GOOGLE), () -> main.post(update));
             measurement = tests.snapshot();
         }
 
@@ -3017,14 +3185,34 @@ public final class MainActivity extends ThemedActivity {
     }
 
     private void openAppRouting() {
+        openAppRouting(null);
+    }
+
+    private void openAppRouting(ProfileRulesTarget target) {
         routingFilter = AppCategories.APPS;
         routingQuery = "";
         boolean allowRoot = appPreferences().getBoolean(ROOT_INVENTORY, false);
         if (InstalledAppsAccess.needsRequest(this)) {
-            requestPermissions(new String[] {InstalledAppsAccess.RUNTIME_PERMISSION}, REQUEST_APP_LIST);
+            requestAppRoutingPermission(target);
             return;
         }
-        loadAppRouting(allowRoot, false);
+        loadAppRouting(allowRoot, false, target);
+    }
+
+    private void requestAppRoutingPermission(ProfileRulesTarget target) {
+        pendingAppRoutingTarget = target;
+        requestPermissions(new String[] {InstalledAppsAccess.RUNTIME_PERMISSION}, REQUEST_APP_LIST);
+    }
+
+    private void openAppRoutingSettings(ProfileRulesTarget target) {
+        pendingAppRoutingTarget = target;
+        try {
+            startActivityForResult(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:" + getPackageName())), APP_LIST_SETTINGS);
+        } catch (android.content.ActivityNotFoundException error) {
+            pendingAppRoutingTarget = null;
+            showMessage("无法打开系统应用设置。");
+        }
     }
 
     @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
@@ -3041,21 +3229,27 @@ public final class MainActivity extends ThemedActivity {
             render();
             return;
         }
-        if (request == REQUEST_APP_LIST) refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false));
+        if (request == REQUEST_APP_LIST) resumeAppRouting();
         if (request == REQUEST_WEBRTC_APP_LIST) {
             routingLoader.invalidate();
             openWebRtcRules();
         }
     }
 
-    private void refreshAppRouting(boolean allowRoot) {
-        invalidateAppRouting();
-        loadAppRouting(allowRoot, false);
+    private void resumeAppRouting() {
+        ProfileRulesTarget target = pendingAppRoutingTarget;
+        pendingAppRoutingTarget = null;
+        refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false), target);
     }
 
-    private void enableRootRouting() {
+    private void refreshAppRouting(boolean allowRoot, ProfileRulesTarget target) {
         invalidateAppRouting();
-        loadAppRouting(true, true);
+        loadAppRouting(allowRoot, false, target);
+    }
+
+    private void enableRootRouting(ProfileRulesTarget target) {
+        invalidateAppRouting();
+        loadAppRouting(true, true, target);
     }
 
     private void invalidateAppRouting() {
@@ -3102,7 +3296,18 @@ public final class MainActivity extends ThemedActivity {
         return result;
     }
 
-    private void loadAppRouting(boolean allowRoot, boolean rememberRoot) {
+    private void loadAppRouting(boolean allowRoot, boolean rememberRoot, ProfileRulesTarget target) {
+        if (target != null) {
+            Module.Status current = status;
+            execute("", false, () -> {
+                RoutingStore.SavedProfile profile = RoutingMutations.run(this, () -> readRulesProfile(target));
+                return new ProfileAppRouting(target, profile, routingLoader.load(this, allowRoot, current, profile.state()));
+            }, error -> {
+                if (error != null) showMessage(error.getMessage() == null ? "无法读取这份配置的应用分流。" : error.getMessage());
+                else if (rememberRoot) appPreferences().edit().putBoolean(ROOT_INVENTORY, true).apply();
+            });
+            return;
+        }
         AppRouting.Screen cached = cachedAppRouting(allowRoot);
         if (cached != null && (!cached.systemInventoryEmpty() || cached.rootInventory()) && !rememberRoot) {
             showAppRouting(cached);
@@ -3144,7 +3349,7 @@ public final class MainActivity extends ThemedActivity {
             + (missing == 0 ? "。" : "；" + missing + " 个读取失败" + (denied ? "，存在权限拒绝。" : "。"));
     }
 
-    private void showAppPermissions(AppRouting.Screen screen, AlertDialog listDialog) {
+    private void showAppPermissions(AppRouting.Screen screen, AlertDialog listDialog, ProfileRulesTarget target) {
         if (busy) return;
         boolean requestable = InstalledAppsAccess.needsRequest(this);
         String query = Build.VERSION.SDK_INT < 30 ? "此 Android 版本无需单独申请"
@@ -3163,39 +3368,38 @@ public final class MainActivity extends ThemedActivity {
             .setNegativeButton("关闭", null)
             .setNeutralButton("应用设置", (dialog, which) -> {
                 listDialog.dismiss();
-                try {
-                    startActivityForResult(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                        Uri.parse("package:" + getPackageName())), APP_LIST_SETTINGS);
-                } catch (android.content.ActivityNotFoundException error) { showMessage("无法打开系统应用设置。"); }
+                openAppRoutingSettings(target);
             })
             .setPositiveButton(requestable ? "申请权限" : rootOption ? "用 Root 补充读取" : "重新读取", (dialog, which) -> {
                 listDialog.dismiss();
-                if (requestable) requestPermissions(new String[] {InstalledAppsAccess.RUNTIME_PERMISSION}, REQUEST_APP_LIST);
-                else if (rootOption) enableRootRouting();
-                else refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false));
+                if (requestable) requestAppRoutingPermission(target);
+                else if (rootOption) enableRootRouting(target);
+                else refreshAppRouting(appPreferences().getBoolean(ROOT_INVENTORY, false), target);
             }).show();
     }
 
     private void showAppRouting(AppRouting.Screen screen) {
-        if (screen.systemInventoryEmpty() && !screen.rootInventory()) {
+        showAppRouting(screen, null);
+    }
+
+    private void showAppRouting(AppRouting.Screen screen, ProfileAppRouting scoped) {
+        ProfileRulesTarget target = scoped == null ? null : scoped.target();
+        boolean active = scoped == null || scoped.profile().active();
+        if (screen.systemInventoryEmpty() && !screen.rootInventory() && (scoped == null || screen.applications().isEmpty())) {
             String reason = !InstalledAppsAccess.supportsRequest(this)
                 ? "此系统没有可弹窗申请的应用列表权限；已声明的查询权限在安装时授予，但普通查询仍未返回其他应用。"
                 : InstalledAppsAccess.needsRequest(this) ? "读取应用列表权限尚未授予，普通查询未返回其他应用。"
                 : "读取应用列表权限已授予，但普通查询仍未返回其他应用。";
-            TextView title = routingTitle(true);
+            TextView title = target == null ? routingTitle(true) : label("应用分流 · " + target.name(), 20, TEXT, true);
             title.setPaddingRelative(dp(20), 0, dp(20), 0);
             AlertDialog unavailable = new AlertDialog.Builder(this).setCustomTitle(title)
                 .setMessage("未能读取应用列表。\n\n" + reason
                     + "\n\n可前往应用设置检查权限，或使用现有 Root 授权读取。选择 Root 后会记住此选择，每次仍先尝试普通查询。")
                 .setNegativeButton("取消", null)
-                .setNeutralButton("应用设置", (dialog, which) -> {
-                    try {
-                        startActivityForResult(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.parse("package:" + getPackageName())), APP_LIST_SETTINGS);
-                    } catch (android.content.ActivityNotFoundException error) { showMessage("无法打开系统应用设置。"); }
-                })
-                .setPositiveButton("用 Root 读取", (dialog, which) -> enableRootRouting()).show();
-            title.setOnClickListener(view -> openPersonalRules(unavailable));
+                .setNeutralButton("应用设置", (dialog, which) -> openAppRoutingSettings(target))
+                .setPositiveButton("用 Root 读取", (dialog, which) -> enableRootRouting(target)).show();
+            if (target == null) title.setOnClickListener(view -> openPersonalRules(unavailable));
+            trackManagement(unavailable);
             return;
         }
         LinearLayout content = column();
@@ -3203,13 +3407,14 @@ public final class MainActivity extends ThemedActivity {
         content.setPadding(dp(20), dp(18), dp(20), dp(8));
         LinearLayout heading = new LinearLayout(this);
         heading.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = routingTitle(true);
+        TextView title = target == null ? routingTitle(true) : label("应用分流", 20, TEXT, true);
+        title.setAccessibilityHeading(true);
         heading.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
         Button permission = button("权限", false);
         permission.setTextSize(12);
         permission.setMinHeight(dp(32));
         permission.setPadding(dp(10), dp(6), dp(10), dp(6));
-        permission.setOnClickListener(view -> showAppPermissions(screen, listDialog[0]));
+        permission.setOnClickListener(view -> showAppPermissions(screen, listDialog[0], target));
         LinearLayout.LayoutParams permissionParams = new LinearLayout.LayoutParams(-2, -2);
         permissionParams.rightMargin = dp(6);
         heading.addView(permission, permissionParams);
@@ -3229,12 +3434,14 @@ public final class MainActivity extends ThemedActivity {
             .setPositiveButton("知道了", null).show());
         heading.addView(info, new LinearLayout.LayoutParams(-2, -2));
         add(content, heading, 0);
+        if (target != null) add(content, label(target.name(), 13, TEXT, true), 4);
         TextView count = label("", 12, MUTED, false);
         add(content, count, 8);
-        add(content, label("可连续修改多个应用，最后保存并应用。"
-            + (ExperimentalFeatures.enabled(this) ? "绕过设置统一短暂重连一次。" : ""), 12, MUTED, false), 6);
+        String notice = active ? "可连续修改多个应用，最后保存并应用。" : "保存后在切换到此配置时生效。";
+        if (active && ExperimentalFeatures.enabled(this)) notice += "绕过设置统一短暂重连一次。";
+        add(content, label(notice, 12, MUTED, false), 6);
         TextView iconHint = label("图标按需加载 · 点此查看权限与读取状态", 11, MUTED, false);
-        iconHint.setOnClickListener(view -> showAppPermissions(screen, listDialog[0]));
+        iconHint.setOnClickListener(view -> showAppPermissions(screen, listDialog[0], target));
         add(content, iconHint, 4);
         TextView saveHint = label("", 12, AMBER, false);
         saveHint.setVisibility(View.GONE);
@@ -3296,7 +3503,8 @@ public final class MainActivity extends ThemedActivity {
             @Override public void afterTextChanged(Editable text) {}
         });
         AlertDialog dialog = new AlertDialog.Builder(this).setCustomTitle(content)
-            .setCancelable(false).setAdapter(adapter, null).setNegativeButton("关闭", null).setPositiveButton("保存并应用", null)
+            .setCancelable(false).setAdapter(adapter, null).setNegativeButton(target == null ? "关闭" : "返回", null)
+            .setPositiveButton(active ? "保存并应用" : "保存", null)
             .setNeutralButton("重新应用绕过", null).create();
         listDialog[0] = dialog;
         routingIcons.observe(() -> {
@@ -3305,7 +3513,7 @@ public final class MainActivity extends ThemedActivity {
         });
         filter.run();
         dialog.show();
-        dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setVisibility(ExperimentalFeatures.enabled(this) ? View.VISIBLE : View.GONE);
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setVisibility(active && ExperimentalFeatures.enabled(this) ? View.VISIBLE : View.GONE);
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             if (busy || pending.isEmpty() && !reapply[0]) return;
             Map<String, AppRouting.Choice> edits = new TreeMap<>(pending);
@@ -3313,7 +3521,7 @@ public final class MainActivity extends ThemedActivity {
             List<AppRouting.Entry> changed = screen.applications().stream()
                 .filter(app -> edits.containsKey(app.packageName())).collect(java.util.stream.Collectors.toList());
             showMessage("");
-            saveHint.setText("正在保存并应用，请稍候…");
+            saveHint.setText(active ? "正在保存并应用，请稍候…" : "正在保存应用分流…");
             saveHint.setTextColor(MUTED);
             saveHint.setVisibility(View.VISIBLE);
             for (int which : new int[]{AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_NEUTRAL})
@@ -3322,21 +3530,10 @@ public final class MainActivity extends ThemedActivity {
             title.setEnabled(false);
             categoryButton.setEnabled(false);
             manageCategories.setEnabled(false);
-            mutate("", true, () -> {
-                RoutingMutations.recoverPending(this);
-                RoutingStore routing = new RoutingStore(this);
-                RoutingStore.State latest = routing.load();
-                Map<String, String> rules = new TreeMap<>(latest.applications());
-                Set<String> bypassed = new java.util.TreeSet<>(latest.bypassedApps());
-                for (var edit : edits.entrySet()) {
-                    String name = edit.getKey(); AppRouting.Choice choice = edit.getValue();
-                    rules.remove(name); bypassed.remove(name);
-                    if (choice.bypassed()) bypassed.add(name);
-                    else if (!choice.target().isEmpty()) rules.put(name, choice.target());
-                }
+            mutate("", active, () -> {
                 java.time.Instant cutoff = java.time.Instant.now();
-                var method = routing.apply(latest.withApplications(rules).withBypassedApps(bypassed), recreateTun);
-                return new AppRoutingSaved(method, changed, cutoff);
+                var method = new RoutingStore(this).saveAppRouting(scoped == null ? null : scoped.profile(), edits, recreateTun);
+                return new AppRoutingSaved(method, active, changed, cutoff);
             }, error -> {
                 // A successful commit must not become a failed save because a later list refresh failed.
                 if (error == null || error instanceof RoutingStore.SelectionRestoreFailure) {
@@ -3359,15 +3556,19 @@ public final class MainActivity extends ThemedActivity {
                 }
             });
         });
+        Runnable closeList = () -> {
+            dialog.dismiss();
+            if (target != null) showRuleProfiles(target);
+        };
         Runnable closeRouting = () -> {
             if (busy || !dialog.isShowing()) return;
-            if (pending.isEmpty() && !reapply[0]) dialog.dismiss();
+            if (pending.isEmpty() && !reapply[0]) closeList.run();
             else new AlertDialog.Builder(this).setTitle("放弃未应用的分流修改？")
-                .setNegativeButton("继续编辑", null).setPositiveButton("放弃", (d,w) -> dialog.dismiss()).show();
+                .setNegativeButton("继续编辑", null).setPositiveButton("放弃", (d,w) -> closeList.run()).show();
         };
         dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> closeRouting.run());
         bindAppRoutingBack(dialog, closeRouting);
-        title.setOnClickListener(view -> {
+        if (target == null) title.setOnClickListener(view -> {
             if (busy) return;
             if (pending.isEmpty() && !reapply[0]) openPersonalRules(dialog);
             else new AlertDialog.Builder(this).setTitle("切换前放弃未应用的分流修改？")
@@ -3385,7 +3586,7 @@ public final class MainActivity extends ThemedActivity {
         dialog.getListView().setOnItemClickListener((parent, view, index, id) -> {
             if (busy) return;
             AppRouting.Entry app = adapter.getItem(index);
-            if (app != null) showAppTarget(screen, app, dialog, choice -> {
+            if (app != null) showAppTarget(screen, app, active, choice -> {
                 AppRouting.Choice original = new AppRouting.Choice(screen.state().applications().getOrDefault(app.packageName(), ""), screen.state().bypassedApps().contains(app.packageName()));
                 if (original.equals(choice)) pending.remove(app.packageName()); else pending.put(app.packageName(), choice);
                 filter.run();
@@ -3404,12 +3605,12 @@ public final class MainActivity extends ThemedActivity {
             OnBackInvokedDispatcher dispatcher = dialog.getOnBackInvokedDispatcher();
             OnBackInvokedCallback callback = closeRouting::run;
             dispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback);
-            dialog.setOnDismissListener(ignored -> {
+            trackManagement(dialog, () -> {
                 dispatcher.unregisterOnBackInvokedCallback(callback);
                 routingIcons.stopObserving();
             });
         } else {
-            dialog.setOnDismissListener(ignored -> routingIcons.stopObserving());
+            trackManagement(dialog, routingIcons::stopObserving);
         }
     }
 
@@ -3634,15 +3835,15 @@ public final class MainActivity extends ThemedActivity {
         }
     }
 
-    private void showAppTarget(AppRouting.Screen screen, AppRouting.Entry app, AlertDialog listDialog, java.util.function.Consumer<AppRouting.Choice> stage) {
+    private void showAppTarget(AppRouting.Screen screen, AppRouting.Entry app, boolean active, java.util.function.Consumer<AppRouting.Choice> stage) {
         boolean offersBypass = ExperimentalFeatures.enabled(this) && (app.bypassed() || app.installed() && !app.system());
         List<AppRouting.Choice> choices = AppRouting.choices(screen.targets(), offersBypass);
         String[] labels = choices.stream().map(choice -> choice.label() + (choice.bypassed() ? " · 开发中" : "")).toArray(String[]::new);
         int[] chosen = {choices.indexOf(new AppRouting.Choice(app.target(), app.bypassed()))};
-        new AlertDialog.Builder(this).setTitle(app.label() + " · 出口")
-            .setSingleChoiceItems(labels, chosen[0], (dialog, index) -> chosen[0] = index)
-            .setNeutralButton("当前连接", (dialog, which) -> showAppConnections(app))
-            .setNegativeButton("取消", null).setPositiveButton("暂存", (dialog, which) -> {
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle(app.label() + " · 出口")
+            .setSingleChoiceItems(labels, chosen[0], (view, index) -> chosen[0] = index);
+        if (active) dialog.setNeutralButton("当前连接", (view, which) -> showAppConnections(app));
+        dialog.setNegativeButton("取消", null).setPositiveButton("暂存", (view, which) -> {
                 if (chosen[0] < 0) return;
                 AppRouting.Choice choice = choices.get(chosen[0]);
                 if (choice.bypassed() == app.bypassed() && choice.target().equals(app.target())) return;
@@ -3705,7 +3906,7 @@ public final class MainActivity extends ThemedActivity {
 
     private RulesScreen readPersonalRules() throws Exception {
         RoutingStore.State state = new RoutingStore(this).load();
-        List<String> targets = Profile.routingTargets(state.source());
+        List<String> targets = state.selectableRoutingTargets();
         targets.add("REJECT");
         return new RulesScreen(state, RoutingStore.generation(), targets);
     }
@@ -3816,9 +4017,11 @@ public final class MainActivity extends ThemedActivity {
         });
         add(form, label("出口", 12, MUTED, true), 12);
         android.widget.Spinner target = new android.widget.Spinner(this);
-        target.setAdapter(ui.spinner(
-            screen.targets().stream().map(Controller::outletLabel).toArray(String[]::new)));
-        target.setSelection(original == null ? 0 : Math.max(0, screen.targets().indexOf(original.target())));
+        List<String> targets = new ArrayList<>(screen.targets());
+        if (original != null && !targets.contains(original.target())) targets.add(0, "");
+        target.setAdapter(ui.spinner(targets.stream().map(name -> name.isEmpty() ? "请选择策略" : Controller.outletLabel(name))
+            .toArray(String[]::new)));
+        target.setSelection(original == null ? 0 : Math.max(0, targets.indexOf(original.target())));
         add(form, target, 4);
         add(form, label("域名不填写协议、路径或通配符。IP 规则不额外触发域名解析，单个 IP 可省略前缀长度。", 12, MUTED, false), 10);
         ScrollView scroll = new ScrollView(this);
@@ -3828,8 +4031,10 @@ public final class MainActivity extends ThemedActivity {
         trackManagement(dialog);
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
             try {
+                String selected = targets.get(target.getSelectedItemPosition());
+                if (selected.isEmpty()) throw new IOException("请选择新的分流策略。");
                 PersonalRules.Rule rule = PersonalRules.create(PersonalRules.TYPES[type.getSelectedItemPosition()],
-                    value.getText().toString(), screen.targets().get(target.getSelectedItemPosition()));
+                    value.getText().toString(), selected);
                 List<PersonalRules.Rule> changed = new ArrayList<>(screen.state().rules());
                 if (index < 0) changed.add(rule); else changed.set(index, rule);
                 if (changed.size() > 2000) throw new IOException("自定义规则最多 2000 条。");
@@ -3861,9 +4066,189 @@ public final class MainActivity extends ThemedActivity {
         };
     }
 
+    private RoutingStore.SavedProfile readRulesProfile(ProfileRulesTarget target) throws Exception {
+        RoutingStore.SavedProfile profile = new RoutingStore(this).savedProfile(target.id(), target.subscription());
+        if (profile == null) throw new IOException(target.subscription() ? "此订阅还没有保存的 YAML，请先下载并使用一次。"
+            : "这份本地配置已不存在，请重新打开配置列表。");
+        return profile;
+    }
+
+    private void showRuleProfiles(ProfileRulesTarget target) {
+        if (target.subscription()) showSubscriptions(); else showLocalProfiles();
+    }
+
+    private void openYamlRules(ProfileRulesTarget target) {
+        execute("", () -> RoutingMutations.run(this, () -> {
+            RoutingStore.SavedProfile profile = readRulesProfile(target);
+            return new YamlRulesScreen(target, profile, Profile.yamlRules(profile.state().source()));
+        }));
+    }
+
+    private final class YamlRulesEditor {
+        private final YamlRulesScreen screen;
+        private final List<String> rules;
+        private String query = "";
+        private int firstVisible;
+
+        YamlRulesEditor(YamlRulesScreen screen) {
+            this.screen = screen;
+            rules = new ArrayList<>(screen.rules());
+        }
+
+        void show() {
+            AppUi ui = new AppUi(MainActivity.this);
+            LinearLayout heading = column();
+            heading.setPadding(dp(20), dp(16), dp(20), dp(10));
+            add(heading, label("YAML 规则", 20, TEXT, true), 0);
+            add(heading, label(screen.target().name(), 15, TEXT, true), 4);
+            String notice = screen.profile().active() ? "规则按列表顺序匹配。运行中的 TUN 可能短暂重连。"
+                : "规则按列表顺序匹配，切换到此配置时生效。";
+            if (screen.target().subscription()) notice += "\n更新订阅后将使用服务商的新规则。";
+            add(heading, label(notice, 12, MUTED, false), 6);
+            EditText search = ui.search("搜索规则类型、目标或出口");
+            search.setText(query);
+            add(heading, search, 10);
+            TextView count = label("", 12, MUTED, false);
+            add(heading, count, 6);
+
+            AppUi.Summaries adapter = ui.new Summaries();
+            Runnable filter = () -> {
+                String needle = query.trim().toLowerCase(Locale.ROOT);
+                List<AppUi.Summary> rows = new ArrayList<>();
+                for (int i = 0; i < rules.size(); i++) {
+                    String rule = rules.get(i);
+                    if (!rule.toLowerCase(Locale.ROOT).contains(needle)) continue;
+                    int comma = rule.indexOf(',');
+                    String type = comma < 0 ? "规则" : rule.substring(0, comma);
+                    rows.add(new AppUi.Summary(type, rule, "#" + (i + 1), i));
+                }
+                adapter.empty(rules.isEmpty() ? "此配置的 YAML 没有规则" : "没有匹配的规则");
+                adapter.set(rows);
+                count.setText(needle.isEmpty() ? "共 " + rules.size() + " 条" : "匹配 " + rows.size() + " / " + rules.size() + " 条");
+            };
+            filter.run();
+            search.addTextChangedListener(new TextWatcher() {
+                public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+                public void onTextChanged(CharSequence s, int start, int before, int count) {
+                    query = s.toString();
+                    filter.run();
+                }
+                public void afterTextChanged(Editable value) {}
+            });
+
+            AlertDialog dialog = new AlertDialog.Builder(MainActivity.this).setCustomTitle(heading).setAdapter(adapter, null)
+                .setNegativeButton("返回", (view, which) -> close())
+                .setNeutralButton("添加规则", (view, which) -> edit(-1))
+                .setPositiveButton("保存", null).show();
+            dialog.setCanceledOnTouchOutside(false);
+            dialog.setOnCancelListener(view -> close());
+            ui.styleList(dialog);
+            enableSearchKeyboard(dialog);
+            trackManagement(dialog);
+            dialog.getListView().setSelection(Math.min(firstVisible, adapter.getCount() - 1));
+            dialog.getListView().setOnItemClickListener((parent, view, position, id) -> {
+                AppUi.Summary row = adapter.getItem(position);
+                if (row == null) return;
+                firstVisible = dialog.getListView().getFirstVisiblePosition();
+                actions(row.sourceIndex());
+            });
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(!rules.equals(screen.rules()));
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> save(dialog, search, count));
+        }
+
+        private void actions(int index) {
+            List<String> actions = new ArrayList<>();
+            actions.add("编辑");
+            if (index > 0) actions.add("上移");
+            if (index + 1 < rules.size()) actions.add("下移");
+            actions.add("删除");
+            trackManagement(new AlertDialog.Builder(MainActivity.this).setTitle("第 " + (index + 1) + " 条规则")
+                .setItems(actions.toArray(new String[0]), (view, which) -> {
+                    switch (actions.get(which)) {
+                        case "编辑" -> { edit(index); return; }
+                        case "上移" -> Collections.swap(rules, index, index - 1);
+                        case "下移" -> Collections.swap(rules, index, index + 1);
+                        case "删除" -> rules.remove(index);
+                    }
+                    show();
+                }).setNegativeButton("返回", (view, which) -> show()).setOnCancelListener(view -> show()).show());
+        }
+
+        private void edit(int index) {
+            LinearLayout form = column();
+            form.setPadding(dp(20), dp(8), dp(20), dp(12));
+            EditText input = subscriptionInput("DOMAIN-SUFFIX,example.com,DIRECT", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+            input.setSingleLine(false);
+            input.setMaxLines(5);
+            if (index >= 0) input.setText(rules.get(index));
+            add(form, input, 0);
+            add(form, label("填写一条 Mihomo 规则，例如 DOMAIN-SUFFIX,example.com,DIRECT", 12, MUTED, false), 8);
+            AlertDialog dialog = new AlertDialog.Builder(MainActivity.this).setTitle(index < 0 ? "添加 YAML 规则" : "编辑 YAML 规则")
+                .setView(form).setNegativeButton("取消", (view, which) -> show()).setOnCancelListener(view -> show())
+                .setPositiveButton("确定", null).show();
+            trackManagement(dialog);
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                String rule = input.getText().toString().trim();
+                if (rule.indexOf(',') <= 0 || rule.indexOf('\n') >= 0 || rule.indexOf('\r') >= 0) {
+                    input.setError("请输入一行以逗号分隔的 Mihomo 规则。");
+                    return;
+                }
+                if (index >= 0) rules.set(index, rule);
+                else {
+                    int position = rules.size();
+                    if (position > 0 && rules.get(position - 1).trim().regionMatches(true, 0, "MATCH,", 0, 6)) position--;
+                    rules.add(position, rule);
+                    query = "";
+                    firstVisible = position;
+                }
+                show();
+            });
+        }
+
+        private void close() {
+            if (rules.equals(screen.rules())) {
+                showRuleProfiles(screen.target());
+                return;
+            }
+            trackManagement(new AlertDialog.Builder(MainActivity.this).setTitle("放弃未保存的 YAML 规则修改？")
+                .setNegativeButton("继续编辑", (view, which) -> show()).setOnCancelListener(view -> show())
+                .setPositiveButton("放弃", (view, which) -> showRuleProfiles(screen.target())).show());
+        }
+
+        private void save(AlertDialog dialog, EditText search, TextView count) {
+            if (busy) return;
+            dialog.setCancelable(false);
+            dialog.getListView().setEnabled(false);
+            search.setEnabled(false);
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setEnabled(false);
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setEnabled(false);
+            count.setText("正在保存 YAML 规则…");
+            boolean active = screen.profile().active();
+            List<String> changed = List.copyOf(rules);
+            execute("", active, () -> {
+                RoutingStore.ApplyMethod method = new RoutingStore(MainActivity.this).saveYamlRules(screen.profile(), changed);
+                return new YamlRulesSaved(active ? "YAML 规则" + routingFeedback(method) : "YAML 规则已保存，切换到此配置时生效。");
+            }, error -> {
+                if (error == null || error instanceof RoutingStore.SelectionRestoreFailure) {
+                    dialog.dismiss();
+                    if (error != null) showMessage(error.getMessage());
+                    return;
+                }
+                dialog.setCancelable(true);
+                dialog.getListView().setEnabled(true);
+                search.setEnabled(true);
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setEnabled(true);
+                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setEnabled(true);
+                count.setText(error.getMessage() == null ? "无法保存 YAML 规则，请重试。" : error.getMessage());
+            });
+        }
+    }
+
     private void showAppRoutingSaved(AppRoutingSaved saved) {
         AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("应用分流已保存")
-            .setMessage(routingFeedback(saved.method())).setNegativeButton("关闭", null);
+            .setMessage(saved.active() ? routingFeedback(saved.method()) : "切换到此配置时生效。").setNegativeButton("关闭", null);
         if (!saved.apps().isEmpty() && saved.method() != RoutingStore.ApplyMethod.SAVED) {
             dialog.setPositiveButton("查看当前连接", (view, which) ->
                 pickRoutingApp("选择要查看的应用", saved.apps(), this::showAppConnections));
@@ -3872,7 +4257,8 @@ public final class MainActivity extends ThemedActivity {
             List<AppRouting.Entry> installed = saved.apps().stream().filter(AppRouting.Entry::installed)
                 .collect(java.util.stream.Collectors.toList());
             if (!installed.isEmpty()) dialog.setNeutralButton("断开旧连接", (view, which) ->
-                pickRoutingApp("选择要断开旧连接的应用", installed, app -> confirmDisconnectOld(app, saved.cutoff())));
+                execute("", () -> new DisconnectApps(LiveConnections.inspectDisconnect(installed, this,
+                    appPreferences().getBoolean(ROOT_INVENTORY, false), saved.cutoff()), saved.cutoff())));
         }
         dialog.show();
     }
@@ -3888,15 +4274,61 @@ public final class MainActivity extends ThemedActivity {
             .setNegativeButton("取消", null).show();
     }
 
-    private void confirmDisconnectOld(AppRouting.Entry app, java.time.Instant cutoff) {
-        new AlertDialog.Builder(this).setTitle("断开 " + app.label() + " 的旧连接？")
-            .setMessage(app.packageName() + "\n只处理保存前建立、能确认属于此应用的连接。应用可能会自动重连。")
-            .setNegativeButton("取消", null).setPositiveButton("断开", (confirm, which) ->
-                mutate("", () -> {
-                    int count = LiveConnections.disconnectBefore(app.packageName(), getPackageManager(), cutoff);
-                    ProxyNotificationService.connectionChanged(this);
-                    return new AppConnectionsClosed(count);
-                })).show();
+    private void showDisconnectApps(DisconnectApps screen) {
+        LinearLayout heading = column();
+        heading.setPadding(dp(20), dp(16), dp(20), dp(8));
+        add(heading, label("断开旧连接", 20, TEXT, true), 0);
+        TextView notice = label("勾选要处理的应用。规则模式下，只断开保存前建立且能确认归属的连接。应用可能会自动重连。",
+            13, MUTED, false);
+        add(heading, notice, 8);
+        String[] rows = screen.apps().stream().map(row -> {
+            String process = switch (row.process()) {
+                case RUNNING -> "检测到进程";
+                case NO_PROCESS -> "未检测到进程";
+                case UNKNOWN -> "进程状态未知";
+            };
+            String connections = row.oldConnections() < 0 ? "旧连接未知" : row.oldConnections() + " 条旧连接";
+            return row.app().label() + "\n" + process + " · " + connections;
+        }).toArray(String[]::new);
+        Set<String> selected = new LinkedHashSet<>();
+        AlertDialog dialog = new AlertDialog.Builder(this).setCustomTitle(heading)
+            .setMultiChoiceItems(rows, null, (picker, index, checked) -> {
+                String name = screen.apps().get(index).app().packageName();
+                if (checked) selected.add(name); else selected.remove(name);
+                Button action = ((AlertDialog) picker).getButton(AlertDialog.BUTTON_POSITIVE);
+                action.setEnabled(!selected.isEmpty());
+                action.setText(selected.isEmpty() ? "断开所选" : "断开所选（" + selected.size() + "）");
+            }).setNegativeButton("取消", null).setPositiveButton("断开所选", null).show();
+        trackManagement(dialog);
+        Button action = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        Button cancel = dialog.getButton(AlertDialog.BUTTON_NEGATIVE);
+        action.setEnabled(false);
+        action.setOnClickListener(view -> {
+            if (selected.isEmpty() || busy) return;
+            List<String> targets = List.copyOf(selected);
+            notice.setText("正在断开所选应用的旧连接…");
+            notice.setTextColor(MUTED);
+            dialog.setCancelable(false);
+            dialog.getListView().setEnabled(false);
+            action.setEnabled(false);
+            cancel.setEnabled(false);
+            mutate("", false, () -> {
+                int count = LiveConnections.disconnectBefore(targets, this, appPreferences().getBoolean(ROOT_INVENTORY, false), screen.cutoff());
+                ProxyNotificationService.connectionChanged(this);
+                return new AppConnectionsClosed(count);
+            }, error -> {
+                if (error == null) {
+                    dialog.dismiss();
+                    return;
+                }
+                notice.setText(error.getMessage() == null ? "暂时无法断开旧连接，请重试。" : error.getMessage());
+                notice.setTextColor(AMBER);
+                dialog.setCancelable(true);
+                dialog.getListView().setEnabled(true);
+                action.setEnabled(true);
+                cancel.setEnabled(true);
+            });
+        });
     }
 
     private void showAppConnections(AppRouting.Entry app) {
@@ -4026,10 +4458,16 @@ public final class MainActivity extends ThemedActivity {
                         if (result instanceof String logs) showLogs(logs);
                         if (result instanceof DiagnosticReport report) showDiagnosticReport(report.text());
                         if (result instanceof Controller.Groups groups) showGroups(groups.values());
+                        if (result instanceof PrivateNodePicker picker) showNodes(picker.group(), picker.groups(), picker.browseGroups(), picker.provider());
                         if (result instanceof WebRtcRules rules) showWebRtcRules(rules);
                         if (result instanceof RulesScreen screen) showPersonalRules(screen);
+                        if (result instanceof YamlRulesScreen screen) new YamlRulesEditor(screen).show();
+                        if (result instanceof PrivateNodesScreen screen) showPrivateNodes(screen);
+                        if (result instanceof YamlRulesSaved saved) showMessage(saved.message());
+                        if (result instanceof ProfileAppRouting scoped) showAppRouting(scoped.screen(), scoped);
                         if (result instanceof ProxyDnsScreen screen) showProxyDns(screen);
                         if (result instanceof AppRoutingSaved saved) showAppRoutingSaved(saved);
+                        if (result instanceof DisconnectApps apps) showDisconnectApps(apps);
                         if (result instanceof AppConnectionsClosed closed)
                             showMessage(closed.count() == 0 ? "没有可确认的旧连接。" : "已处理 " + closed.count() + " 条旧连接。");
                         if (result instanceof PersonalRulesSaved saved) {
@@ -4100,6 +4538,16 @@ public final class MainActivity extends ThemedActivity {
         updatingSwitch = true;
         experimentalSwitch.setChecked(experimental);
         experimentalSwitch.setEnabled(!busy);
+        boolean privateEnabled = privateNodesSettings != null && privateNodesSettings.enabled();
+        privateNodesSwitch.setChecked(privateEnabled);
+        privateNodesSwitch.setEnabled(!busy && privateNodesSettings != null
+            && (!privateNodesSettings.hasNodes() || canApplyProfile(status)));
+        editPrivateNodesButton.setEnabled(!busy && privateNodesSettings != null);
+        SubscriptionCatalog.Entry privateEntry = subscriptions == null ? null : subscriptions.active();
+        privateNodesSummary.setText(privateNodesSettings == null || privateEntry == null ? "请先下载并使用一份订阅"
+            : "当前订阅 · " + privateEntry.name() + (privateNodesSettings.hasNodes() ? "\n已保存私人节点" : "\n尚未添加私人节点"));
+        settingsNavigation.summary("private-nodes", privateNodesSettings == null ? "为指定应用选用自己的节点"
+            : privateEnabled ? "当前订阅已开启" : "当前订阅已关闭");
         updatingSwitch = false;
         boolean installed = status != null && status.installed();
         boolean pending = status != null && status.hasPendingModule();

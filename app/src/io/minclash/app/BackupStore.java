@@ -66,7 +66,9 @@ final class BackupStore {
             if (profile.localId() != null || savedAddresses.contains(profile.subscription())) inactive.add(profile);
         }
         return new BackupArchive.Data(new RoutingStore.State(state.source(), state.applications(), catalog.activeAddress(),
-            state.rules(), state.bypassedApps(), state.localId(), state.localName(), state.proxyDnsTarget()), catalog.entries(), settings,
+            state.rules(), state.bypassedApps(), state.localId(), state.localName(), state.proxyDnsTarget(), state.privateNodes(),
+            state.privateNodesEnabled()),
+            catalog.entries(), settings,
             System.currentTimeMillis(), version, inactive);
     }
 

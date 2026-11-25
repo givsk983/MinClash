@@ -61,6 +61,10 @@ final class AppRouting {
 
         Screen load(Context context, boolean allowRoot, Module.Status status) throws Exception {
             RoutingStore.State state = new RoutingStore(context).load();
+            return load(context, allowRoot, status == null ? Module.status() : status, state);
+        }
+
+        Screen load(Context context, boolean allowRoot, Module.Status status, RoutingStore.State state) throws Exception {
             Inventory inventory = inventory(context, allowRoot);
             Map<String, Entry> entries = new TreeMap<>();
             for (Entry app : inventory.entries()) {
@@ -78,8 +82,8 @@ final class AppRouting {
             Collator collator = Collator.getInstance();
             applications.sort(Comparator.comparing((Entry app) -> !app.assigned())
                 .thenComparing(Entry::label, collator).thenComparing(Entry::packageName));
-            return new Screen(state, applications, Profile.routingTargets(state.source()),
-                status == null ? Module.status() : status, inventory.root(), inventory.empty(), allowRoot);
+            return new Screen(state, applications, state.selectableRoutingTargets(), status,
+                inventory.root(), inventory.empty(), allowRoot);
         }
 
         List<Entry> installedApps(Context context, boolean allowRoot) throws Exception {

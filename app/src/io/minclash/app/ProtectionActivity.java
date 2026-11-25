@@ -30,7 +30,7 @@ public final class ProtectionActivity extends ThemedActivity {
         Module.Status status;
         List<ProtectionInventory.App> installed = new ArrayList<>();
         final ProtectionInventory inventory = new ProtectionInventory();
-        List<String> targets = new ArrayList<>();
+        RoutingStore.ProtectionTargets targets = new RoutingStore.ProtectionTargets(List.of(), List.of());
         boolean busy, inventoryChanged, advanced;
         java.util.Set<String> bypassed = java.util.Set.of();
         long lastRead;
@@ -197,11 +197,12 @@ public final class ProtectionActivity extends ThemedActivity {
     }
     private void message(String text){new AlertDialog.Builder(this).setMessage(text).setPositiveButton("知道了",null).show();}
     private void chooseTarget(String current,java.util.function.Consumer<String> selected){
-        if(model.targets.isEmpty()){message("没有可选的代理出口，请先导入订阅或配置。保护需要指定代理，不能选择直连。");return;}
-        String[] names=model.targets.toArray(new String[0]);new AlertDialog.Builder(this).setTitle("选择代理出口").setSingleChoiceItems(names,model.targets.indexOf(current),(d,w)->{d.dismiss();selected.accept(names[w]);}).setNegativeButton("取消",null).show();
+        List<String> targets = model.targets.selectable();
+        if(targets.isEmpty()){message("没有可选的代理出口，请先导入订阅或配置。保护需要指定代理，不能选择直连。");return;}
+        String[] names=targets.toArray(new String[0]);new AlertDialog.Builder(this).setTitle("选择代理出口").setSingleChoiceItems(names,targets.indexOf(current),(d,w)->{d.dismiss();selected.accept(names[w]);}).setNegativeButton("取消",null).show();
     }
     private void chooseApp(){
-        if (model.targets.isEmpty()) { message("请先导入订阅或配置，准备一个可用的代理出口。"); return; }
+        if (model.targets.selectable().isEmpty()) { message("请先导入订阅或配置，准备一个可用的代理出口。"); return; }
         LinearLayout box=ui.column();box.setPadding(ui.dp(16),0,ui.dp(16),0);
         EditText search=ui.search("搜索应用名称或包名");ui.add(box,search,0);
         android.widget.TextView count=ui.label("",13,AppUi.MUTED,false);ui.add(box,count,8);
@@ -233,7 +234,7 @@ public final class ProtectionActivity extends ThemedActivity {
         }));
     }
     private boolean stageApps(List<ProtectionPolicy.App> apps) {
-        try { model.draft.putApps(apps,model.targets); model.dirty=true;render();return true; }
+        try { model.draft.putApps(apps,model.targets.selectable()); model.dirty=true;render();return true; }
         catch(Exception error){message(error.getMessage());return false;}
     }
     private void showHelp() {
@@ -244,13 +245,13 @@ public final class ProtectionActivity extends ThemedActivity {
     }
     private void setProtectedApp(ProtectionPolicy.App app) {
         try {
-            model.draft.putApp(app, model.targets);
+            model.draft.putApp(app, model.targets.selectable());
             model.dirty = true;
             render();
         } catch (Exception error) { message(error.getMessage()); }
     }
     private void confirmApply(boolean off){
-        if (!off) try { model.draft.validate(model.targets); }
+        if (!off) try { model.draft.validate(model.targets.configured()); }
         catch (Exception error) { message(error.getMessage()); return; }
         new AlertDialog.Builder(this).setTitle(off?"关闭全部保护？":"应用防泄漏保护？")
             .setMessage(off?"关闭后，应用恢复按原有分流设置联网，部分连接可能直接使用本机网络。"
@@ -301,7 +302,10 @@ public final class ProtectionActivity extends ThemedActivity {
         }
         if (!off) {
             RoutingStore.State routing = new RoutingStore(context).loadIfAvailable(before);
-            if (routing != null) TunBypass.checkCurrent(context, routing.bypassedApps(), attempted);
+            if (routing != null) {
+                attempted.validate(routing.protectionTargets().configured());
+                TunBypass.checkCurrent(context, routing.bypassedApps(), attempted);
+            }
         }
         Module.run(off ? Module.Command.PROTECTION_OFF : Module.Command.PROTECTION_SET, request);
         if (!before.running()) return "";
@@ -323,21 +327,23 @@ public final class ProtectionActivity extends ThemedActivity {
         if(model.busy)return;final Model m=model;final android.content.Context context=getApplicationContext();m.busy=true;render();
         RoutingStore.WORKER.execute(()->{
             try{
-                Module.Status status=Module.status();m.main.post(()->m.status=status);JSONObject remote=null;ProtectionPolicy policy=null;List<String> targets=new ArrayList<>();List<ProtectionInventory.App> installed=m.installed;String inventoryError="";
+                Module.Status status=Module.status();m.main.post(()->m.status=status);JSONObject remote=null;ProtectionPolicy policy=null;List<ProtectionInventory.App> installed=m.installed;String inventoryError="";
+                RoutingStore.ProtectionTargets targets = new RoutingStore.ProtectionTargets(List.of(), List.of());
                 if(status.functionalRevision()>=9 && status.protection){
                     remote=new JSONObject(Module.run(Module.Command.PROTECTION_GET,null));policy=ProtectionPolicy.parse(remote.getJSONObject("policy"));
                     try {
                         if(status.profile){
                             RoutingStore.State routing = new RoutingStore(context).load();
                             m.main.post(() -> m.bypassed = routing.bypassedApps());
-                            for(String t:Profile.routingTargets(routing.source()))if(ProtectionPolicy.safeTarget(t))targets.add(t);
+                            targets = routing.protectionTargets();
                         }
                     } catch (Exception e) { inventoryError="代理出口暂时无法读取，请刷新后再添加保护；已有保护设置仍可查看或关闭。"; }
                     final JSONObject snapshot = remote;
                     final ProtectionPolicy snapshotPolicy = policy;
+                    final RoutingStore.ProtectionTargets snapshotTargets = targets;
                     final String targetWarning = inventoryError;
                     m.main.post(() -> {
-                        m.status = status; m.remote = snapshot; m.targets = targets; m.inventoryError = targetWarning;
+                        m.status = status; m.remote = snapshot; m.targets = snapshotTargets; m.inventoryError = targetWarning;
                         if(m.acceptSnapshot(snapshotPolicy,replace))m.error="设置已保存，请核对保护状态。\n"+m.error;
                         m.render();
                     });
@@ -347,7 +353,8 @@ public final class ProtectionActivity extends ThemedActivity {
                 }
                 final JSONObject r=remote;final ProtectionPolicy p=policy;final String warning=inventoryError;
                 final List<ProtectionInventory.App> apps = installed;
-                m.main.post(()->{m.status=status;m.remote=r;m.targets=targets;m.installed=apps;m.inventoryError=warning;
+                final RoutingStore.ProtectionTargets choices = targets;
+                m.main.post(()->{m.status=status;m.remote=r;m.targets=choices;m.installed=apps;m.inventoryError=warning;
                     if(r == null && m.acceptSnapshot(p,replace))m.error="设置已在模块保存，但本次应用尚未确认完成。请核对保护状态。\n"+m.error;
                     m.lastRead=android.os.SystemClock.elapsedRealtime();m.busy=false;m.render();
                     if(m.inventoryChanged && m.activity!=null){m.inventoryChanged=false;m.activity.refresh(false);}

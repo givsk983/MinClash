@@ -193,7 +193,12 @@ final class BackupArchive {
         }
         String proxyDnsTarget = version >= 4 && object.has("proxyDnsTarget")
             ? string(object.get("proxyDnsTarget"), 256) : "";
-        RoutingStore.State state = new RoutingStore.State(normalized, rules, address, personal, bypassed, localId, localName, proxyDnsTarget);
+        String privateNodes = version >= 4 && object.has("privateNodes")
+            ? Profile.normalizePrivateNodes(string(object.get("privateNodes"), Profile.MAX_BYTES)) : "";
+        Object nodesEnabled = version >= 4 ? object.opt("privateNodesEnabled") : null;
+        if (nodesEnabled != null && !(nodesEnabled instanceof Boolean)) throw new IOException();
+        RoutingStore.State state = new RoutingStore.State(normalized, rules, address, personal, bypassed, localId, localName,
+            proxyDnsTarget, privateNodes, Boolean.TRUE.equals(nodesEnabled));
         RoutingStore.render(state);
         return state;
     }
@@ -222,6 +227,8 @@ final class BackupArchive {
             .put("applications", new JSONObject(state.applications())).put("personalRules", PersonalRules.json(state.rules()))
             .put("bypassedApps", new JSONArray(state.bypassedApps())).put("localId", state.localId()).put("localName", state.localName());
         if (!state.proxyDnsTarget().isEmpty()) profile.put("proxyDnsTarget", state.proxyDnsTarget());
+        if (!state.privateNodes().isEmpty()) profile.put("privateNodes", state.privateNodes());
+        if (state.privateNodesEnabled()) profile.put("privateNodesEnabled", true);
         return profile;
     }
 

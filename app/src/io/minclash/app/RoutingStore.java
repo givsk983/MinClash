@@ -45,7 +45,12 @@ final class RoutingStore {
     }
 
     record State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules,
-                 Set<String> bypassedApps, String localId, String localName, String proxyDnsTarget) {
+                 Set<String> bypassedApps, String localId, String localName, String proxyDnsTarget, String privateNodes,
+                 boolean privateNodesEnabled) {
+        State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules,
+              Set<String> bypassedApps, String localId, String localName, String proxyDnsTarget) {
+            this(source, applications, subscription, rules, bypassedApps, localId, localName, proxyDnsTarget, "", false);
+        }
         State(byte[] source, Map<String, String> applications, String subscription, List<PersonalRules.Rule> rules,
               Set<String> bypassedApps, String localId, String localName) {
             this(source, applications, subscription, rules, bypassedApps, localId, localName, "");
@@ -68,27 +73,61 @@ final class RoutingStore {
             rules = Collections.unmodifiableList(new ArrayList<>(rules));
             bypassedApps = Collections.unmodifiableSet(new TreeSet<>(bypassedApps));
             Objects.requireNonNull(proxyDnsTarget);
+            Objects.requireNonNull(privateNodes);
         }
         State withSource(byte[] source, String subscription) {
             boolean local = subscription == null || subscription.isEmpty();
+            boolean sameSubscription = !local && Objects.equals(this.subscription, subscription);
             return new State(source, applications, subscription, rules, bypassedApps,
-                local ? localId : null, local ? localName : null, proxyDnsTarget);
+                local ? localId : null, local ? localName : null, proxyDnsTarget,
+                sameSubscription ? privateNodes : "", sameSubscription && privateNodesEnabled);
         }
         State withApplications(Map<String, String> applications) {
-            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, proxyDnsTarget);
+            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, proxyDnsTarget, privateNodes, privateNodesEnabled);
         }
         State withRules(List<PersonalRules.Rule> rules) {
-            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, proxyDnsTarget);
+            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, proxyDnsTarget, privateNodes, privateNodesEnabled);
         }
         State withBypassedApps(Set<String> packages) {
-            return new State(source, applications, subscription, rules, packages, localId, localName, proxyDnsTarget);
+            return new State(source, applications, subscription, rules, packages, localId, localName, proxyDnsTarget, privateNodes, privateNodesEnabled);
         }
         State withProxyDns(String target) {
-            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, target);
+            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, target, privateNodes, privateNodesEnabled);
+        }
+        State withPrivateNodes(String nodes) {
+            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, proxyDnsTarget, nodes, privateNodesEnabled);
+        }
+        State withPrivateNodesEnabled(boolean enabled) {
+            return new State(source, applications, subscription, rules, bypassedApps, localId, localName, proxyDnsTarget, privateNodes, enabled);
+        }
+        byte[] sourceWithPrivateNodes() throws IOException {
+            if ((!privateNodes.isEmpty() || privateNodesEnabled) && (subscription == null || subscription.isEmpty())) {
+                throw new IOException("私人节点需保存到一份订阅。");
+            }
+            return Profile.withPrivateNodes(source, privateNodes, privateNodesEnabled);
+        }
+        List<String> selectableRoutingTargets() throws IOException {
+            // The raw source still includes any similarly named group supplied by the subscription itself.
+            return Profile.routingTargets(privateNodesEnabled ? sourceWithPrivateNodes() : source);
+        }
+
+        ProtectionTargets protectionTargets() throws IOException {
+            List<String> configured = Profile.routingTargets(sourceWithPrivateNodes());
+            configured.removeIf(target -> !ProtectionPolicy.safeTarget(target));
+            if (privateNodesEnabled || privateNodes.isEmpty()) return new ProtectionTargets(configured, configured);
+
+            List<String> selectable = new ArrayList<>(configured);
+            selectable.remove(Profile.PRIVATE_OUTLET);
+            return new ProtectionTargets(configured, selectable);
         }
     }
 
+    record ProtectionTargets(List<String> configured, List<String> selectable) {}
     record LocalProfile(String id, String name, boolean active) {}
+    record PrivateNodesSettings(boolean enabled, boolean hasNodes) {}
+    record SavedProfile(State state, int inactiveIndex) {
+        boolean active() { return inactiveIndex < 0; }
+    }
 
     private final AtomicFile file;
     private final ProfileApplyJournal journal;
@@ -115,6 +154,7 @@ final class RoutingStore {
             RoutingMutations.recoverPending(context);
             State latest = load();
             if (!identity(latest).equals(identity(expected)) || !Arrays.equals(latest.source(), expected.source())
+                || !latest.privateNodes().equals(expected.privateNodes())
                 || !latest.proxyDnsTarget().equals(expected.proxyDnsTarget())) {
                 throw new IOException("当前配置或 DNS 出口已变化，请重新打开 DNS 查询出口。");
             }
@@ -145,12 +185,16 @@ final class RoutingStore {
         if (object == null) return null;
         String activeAddress = object.isNull("subscription") ? legacyAddress() : object.getString("subscription");
         if (address.equals(activeAddress)) return activeState(object);
-        JSONArray profiles = object.optJSONArray(INACTIVE_PROFILES);
-        if (profiles != null) for (int index = 0; index < profiles.length(); index++) {
-            JSONObject profile = profiles.getJSONObject(index);
-            if (address.equals(profile.optString("subscription"))) return decodeState(profile);
-        }
-        return null;
+        return inactiveProfile(object, "subscription", address);
+    }
+
+    PrivateNodesSettings privateNodesSettings(String address) throws Exception {
+        if (address.isEmpty()) return null;
+        JSONObject saved = readObject();
+        if (saved == null) return null;
+        String active = saved.isNull("subscription") ? legacyAddress() : saved.getString("subscription");
+        if (!address.equals(active)) return null;
+        return new PrivateNodesSettings(saved.optBoolean("privateNodesEnabled"), !saved.optString("privateNodes").isEmpty());
     }
 
     State forLocalProfile(String id) throws Exception {
@@ -160,12 +204,146 @@ final class RoutingStore {
             return object == null ? installedState(Module.readProfile()) : activeState(object);
         }
         if (object == null) return null;
-        JSONArray profiles = object.optJSONArray(INACTIVE_PROFILES);
+        return inactiveProfile(object, "localId", id);
+    }
+
+    private static State inactiveProfile(JSONObject saved, String key, String id) throws Exception {
+        JSONArray profiles = saved.optJSONArray(INACTIVE_PROFILES);
+        int index = inactiveProfileIndex(profiles, key, id);
+        return index < 0 ? null : decodeState(profiles.getJSONObject(index));
+    }
+
+    private static int inactiveProfileIndex(JSONArray profiles, String key, String id) throws Exception {
         if (profiles != null) for (int index = 0; index < profiles.length(); index++) {
-            JSONObject profile = profiles.getJSONObject(index);
-            if (id.equals(profile.optString("localId"))) return decodeState(profile);
+            if (id.equals(profiles.getJSONObject(index).optString(key))) return index;
         }
-        return null;
+        return -1;
+    }
+
+    SavedProfile savedProfile(String id, boolean subscription) throws Exception {
+        return savedProfile(readObject(), id, subscription);
+    }
+
+    private SavedProfile savedProfile(JSONObject saved, String id, boolean subscription) throws Exception {
+        String address = saved == null || saved.isNull("subscription") ? legacyAddress() : saved.getString("subscription");
+        String localId = saved == null ? LEGACY_LOCAL_ID : saved.optString("localId", LEGACY_LOCAL_ID);
+        boolean active = subscription ? id.equals(address) : address.isEmpty() && id.equals(localId);
+        if (active) {
+            if (saved != null) return new SavedProfile(activeState(saved), -1);
+            return Module.status().profile ? new SavedProfile(installedState(Module.readProfile()), -1) : null;
+        }
+        JSONArray profiles = saved == null ? null : saved.optJSONArray(INACTIVE_PROFILES);
+        int index = inactiveProfileIndex(profiles, subscription ? "subscription" : "localId", id);
+        return index < 0 ? null : new SavedProfile(decodeState(profiles.getJSONObject(index)), index);
+    }
+
+    private SavedProfile requireSameProfile(JSONObject saved, SavedProfile expected) throws Exception {
+        State original = expected.state();
+        boolean subscription = !original.subscription().isEmpty();
+        SavedProfile latest = savedProfile(saved, subscription ? original.subscription() : original.localId(), subscription);
+        if (latest == null || latest.active() != expected.active() || !Arrays.equals(latest.state().source(), original.source())) {
+            throw new IOException("这份配置已变化，请重新打开规则列表后再编辑。");
+        }
+        return latest;
+    }
+
+    private ApplyMethod saveInactive(JSONObject saved, SavedProfile profile, State changed) throws Exception {
+        saved.getJSONArray(INACTIVE_PROFILES).put(profile.inactiveIndex(), encodeState(changed));
+        byte[] bytes = saved.toString().getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > BackupArchive.MAX_BYTES) throw new IOException("已保存的配置超过 16 MiB，请删除不再使用的配置后重试。");
+        restoreSnapshot(bytes);
+        return ApplyMethod.SAVED;
+    }
+
+    ApplyMethod savePrivateNodes(SavedProfile expected, String input) throws Exception {
+        return RoutingMutations.run(context, () -> {
+            RoutingMutations.recoverPending(context);
+            String address = expected.state().subscription();
+            if (address == null || address.isEmpty()) throw new IOException("请选择一份订阅。");
+            JSONObject saved = readObject();
+            SavedProfile latest = savedProfile(saved, address, true);
+            if (latest == null || !latest.state().privateNodes().equals(expected.state().privateNodes())) {
+                throw new IOException("私人节点已变化，请重新打开编辑器。");
+            }
+            String nodes = Profile.normalizePrivateNodes(input);
+            State state = latest.state();
+            if (nodes.equals(state.privateNodes())) return ApplyMethod.UNCHANGED;
+            if (nodes.isEmpty() && (state.applications().containsValue(Profile.PRIVATE_OUTLET)
+                || state.rules().stream().anyMatch(rule -> rule.target().equals(Profile.PRIVATE_OUTLET))
+                || state.proxyDnsTarget().equals(Profile.PRIVATE_OUTLET)
+                || Profile.yamlRules(state.source()).stream().anyMatch(rule -> ruleTargetsPrivateOutlet(rule)))) {
+                throw new IOException("「私人出口」仍有分流规则或 DNS 设置在使用，请先为它们更换出口。");
+            }
+            State changed = state.withPrivateNodes(nodes);
+            if (latest.active()) return apply(changed);
+
+            byte[] merged = render(changed);
+            Module.Status status = Module.status();
+            if (status.enabled && status.validate) Module.run(Module.Command.VALIDATE, merged);
+            return saveInactive(saved, latest, changed);
+        });
+    }
+
+    ApplyMethod setPrivateNodesEnabled(String address, boolean enabled) throws Exception {
+        return RoutingMutations.run(context, () -> {
+            RoutingMutations.recoverPending(context);
+            State current = read();
+            if (current == null || address.isEmpty() || !address.equals(current.subscription())) {
+                throw new IOException("当前订阅已变化，请重新打开私人节点设置。");
+            }
+            if (current.privateNodesEnabled() == enabled) return ApplyMethod.UNCHANGED;
+            State changed = current.withPrivateNodesEnabled(enabled);
+            if (!current.privateNodes().isEmpty()) return apply(changed);
+            save(changed);
+            return ApplyMethod.SAVED;
+        });
+    }
+
+    private static boolean ruleTargetsPrivateOutlet(String rule) {
+        return Arrays.stream(rule.split(",")).anyMatch(part -> part.trim().equals(Profile.PRIVATE_OUTLET));
+    }
+
+    ApplyMethod saveYamlRules(SavedProfile expected, List<String> rules) throws Exception {
+        return RoutingMutations.run(context, () -> {
+            RoutingMutations.recoverPending(context);
+            JSONObject saved = readObject();
+            SavedProfile latest = requireSameProfile(saved, expected);
+            byte[] source = Profile.withYamlRules(latest.state().source(), rules);
+            State changed = latest.state().withSource(source, latest.state().subscription());
+            if (latest.active()) return apply(changed);
+
+            byte[] merged = render(changed);
+            Module.Status status = Module.status();
+            if (status.enabled && status.validate) Module.run(Module.Command.VALIDATE, merged);
+            return saveInactive(saved, latest, changed);
+        });
+    }
+
+    ApplyMethod saveAppRouting(SavedProfile expected, Map<String, AppRouting.Choice> edits, boolean recreateTun) throws Exception {
+        return RoutingMutations.run(context, () -> {
+            RoutingMutations.recoverPending(context);
+            JSONObject saved = expected == null ? null : readObject();
+            SavedProfile latest = expected == null ? new SavedProfile(load(), -1) : requireSameProfile(saved, expected);
+            State state = latest.state();
+            Map<String, String> rules = new TreeMap<>(state.applications());
+            Set<String> bypassed = new TreeSet<>(state.bypassedApps());
+            for (var edit : edits.entrySet()) {
+                String name = edit.getKey();
+                AppRouting.Choice choice = edit.getValue();
+                if (Profile.PRIVATE_OUTLET.equals(choice.target()) && !state.selectableRoutingTargets().contains(choice.target())) {
+                    throw new IOException("私人出口当前不可选，请重新打开应用分流。");
+                }
+                rules.remove(name);
+                bypassed.remove(name);
+                if (choice.bypassed()) bypassed.add(name);
+                else if (!choice.target().isEmpty()) rules.put(name, choice.target());
+            }
+            State changed = state.withApplications(rules).withBypassedApps(bypassed);
+            if (latest.active()) return apply(changed, recreateTun);
+            checkExperimentalAccess(changed);
+            render(changed);
+            return saveInactive(saved, latest, changed);
+        });
     }
 
     List<LocalProfile> localProfileEntries() throws Exception {
@@ -363,9 +541,14 @@ final class RoutingStore {
         TunBypass.validate(bypassed, applications);
         Object proxyDns = object.opt("proxyDnsTarget");
         if (proxyDns != null && !(proxyDns instanceof String)) throw new IOException("DNS 查询出口无效。");
+        Object nodes = object.opt("privateNodes");
+        if (nodes != null && !(nodes instanceof String)) throw new IOException("私人节点设置无效。");
+        Object nodesEnabled = object.opt("privateNodesEnabled");
+        if (nodesEnabled != null && !(nodesEnabled instanceof Boolean)) throw new IOException("私人节点开关无效。");
         return new State(Profile.normalize(object.getString("source").getBytes(StandardCharsets.UTF_8)), applications,
             object.optString("subscription", null), PersonalRules.parse(version == 1 ? null : object.getJSONArray("personalRules")),
-            bypassed, object.optString("localId", null), object.optString("localName", null), proxyDns == null ? "" : (String) proxyDns);
+            bypassed, object.optString("localId", null), object.optString("localName", null), proxyDns == null ? "" : (String) proxyDns,
+            nodes == null ? "" : (String) nodes, Boolean.TRUE.equals(nodesEnabled));
     }
 
     private JSONObject readObject() throws Exception {
@@ -398,6 +581,8 @@ final class RoutingStore {
         object.put("localId", state.localId());
         object.put("localName", state.localName());
         if (!state.proxyDnsTarget().isEmpty()) object.put("proxyDnsTarget", state.proxyDnsTarget());
+        if (!state.privateNodes().isEmpty()) object.put("privateNodes", state.privateNodes());
+        if (state.privateNodesEnabled()) object.put("privateNodesEnabled", true);
         return object;
     }
 
@@ -504,7 +689,7 @@ final class RoutingStore {
     }
 
     static byte[] render(State state) throws IOException {
-        byte[] merged = Profile.withPersonalRules(state.source(), state.applications(), state.rules(), state.bypassedApps());
+        byte[] merged = Profile.withPersonalRules(state.sourceWithPrivateNodes(), state.applications(), state.rules(), state.bypassedApps());
         return state.proxyDnsTarget().isEmpty() ? merged : Profile.withProxyDns(merged, state.proxyDnsTarget());
     }
 
@@ -550,11 +735,11 @@ final class RoutingStore {
         if (state != null) {
             state = identify(state, current == null ? "" : current.subscription());
             boolean profileChanged = current == null || !identity(current).equals(identity(state))
-                || !Arrays.equals(current.source(), state.source());
+                || !Arrays.equals(current.source(), state.source()) || !current.privateNodes().equals(state.privateNodes());
             if (!state.bypassedApps().isEmpty() || before.protection && profileChanged) {
                 ProtectionPolicy protection = protectionPolicy(before);
                 if (profileChanged) {
-                    List<String> missing = missingProtectionTargets(protection, state.source());
+                    List<String> missing = missingProtectionTargets(protection, merged);
                     if (!missing.isEmpty()) throw new IOException("新配置缺少防泄漏保护需要的代理组「"
                         + String.join("」、「", missing) + "」。请重新预览配置并选择可用的保护出口。");
                 }
@@ -698,6 +883,7 @@ final class RoutingStore {
             && saved != null && changed != null && installed != null
             && saved.bypassedApps().equals(changed.bypassedApps())
             && saved.proxyDnsTarget().equals(changed.proxyDnsTarget())
+            && saved.privateNodes().equals(changed.privateNodes()) && saved.privateNodesEnabled() == changed.privateNodesEnabled()
             && Objects.equals(saved.subscription(), changed.subscription()) && Objects.equals(saved.localId(), changed.localId())
             && Arrays.equals(saved.source(), changed.source())
             && Arrays.equals(installed, render(saved));

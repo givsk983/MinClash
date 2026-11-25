@@ -34,6 +34,7 @@ import org.yaml.snakeyaml.nodes.Tag;
 
 final class Profile {
     static final int MAX_BYTES = 2 * 1024 * 1024;
+    static final String PRIVATE_OUTLET = "私人出口";
     static final class MissingRoutingTarget extends IOException {
         MissingRoutingTarget(String message) { super(message); }
     }
@@ -292,6 +293,135 @@ final class Profile {
         return new ArrayList<>(names);
     }
 
+    static String normalizePrivateNodes(String input) throws IOException {
+        if (input.trim().isEmpty()) return "";
+        SequenceNode nodes = privateNodeList(input);
+        StringWriter output = new StringWriter();
+        new Yaml().serialize(nodes, output);
+        return output.toString();
+    }
+
+    private static SequenceNode privateNodeList(String input) throws IOException {
+        if (input.getBytes(StandardCharsets.UTF_8).length > MAX_BYTES) throw new TooLarge();
+        try {
+            Node parsed = new Yaml(routingOptions()).compose(new StringReader(input));
+            if (parsed instanceof MappingNode mapping) {
+                Node wrapped = field(mapping, "proxies");
+                if (wrapped != null) {
+                    if (mapping.getValue().size() != 1) throw new IOException("请只粘贴 YAML 中的 proxies 节点列表。");
+                    parsed = wrapped;
+                } else {
+                    parsed = new SequenceNode(Tag.SEQ, List.of(mapping), org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK);
+                }
+            }
+            if (!(parsed instanceof SequenceNode nodes) || nodes.getValue().isEmpty()) {
+                throw new IOException("请粘贴单个 Mihomo 节点或非空的 proxies 列表。");
+            }
+            Set<String> names = new HashSet<>(List.of(PRIVATE_OUTLET, "DIRECT", "REJECT", "REJECT-DROP",
+                "COMPATIBLE", "PASS", "PASS-RULE", "GLOBAL"));
+            int index = 0;
+            for (Node node : nodes.getValue()) {
+                index++;
+                if (!(node instanceof MappingNode proxy) || !isProxyNode(proxy)) {
+                    throw new IOException("第 " + index + " 个私人节点缺少有效的代理类型。");
+                }
+                keysOf(proxy);
+                String name = text(field(proxy, "name"));
+                if (name.trim().isEmpty() || name.contains("\n") || name.contains("\r") || !names.add(name)) {
+                    throw new IOException("第 " + index + " 个私人节点的名称为空、重复或为保留名称。");
+                }
+            }
+            return nodes;
+        } catch (MarkedYAMLException error) {
+            int line = error.getProblemMark() == null ? 0 : error.getProblemMark().getLine() + 1;
+            throw new IOException(line > 0 ? "私人节点 YAML 第 " + line + " 行格式有误。" : "私人节点 YAML 格式有误。");
+        } catch (YAMLException error) {
+            throw new IOException("无法读取私人节点 YAML。");
+        }
+    }
+
+    static byte[] withPrivateNodes(byte[] source, String input, boolean enabled) throws IOException {
+        if (input.isEmpty()) return source;
+        MappingNode root = routingRoot(source);
+        Yaml yaml = new Yaml();
+        Node existingGroups = field(root, "proxy-groups");
+        if (!emptyField(existingGroups) && !(existingGroups instanceof SequenceNode)) {
+            throw new IOException("订阅的代理组格式有误。");
+        }
+        Map<String, MappingNode> groupNames = namedEntries(existingGroups);
+        Set<String> proxyNames = namedEntries(field(root, "proxies")).keySet();
+        if (groupNames.containsKey(PRIVATE_OUTLET) || proxyNames.contains(PRIVATE_OUTLET)) {
+            throw new IOException("订阅已使用「私人出口」这个名称，无法合并私人节点。");
+        }
+
+        List<Node> groups = new ArrayList<>();
+        if (existingGroups instanceof SequenceNode list) groups.addAll(list.getValue());
+        Map<String, Object> selector = new LinkedHashMap<>();
+        selector.put("name", PRIVATE_OUTLET);
+        selector.put("type", "select");
+        selector.put("empty-fallback", "REJECT");
+        if (enabled) {
+            String provider = addPrivateProvider(root, yaml, privateNodeList(input), groupNames.keySet(), groups);
+            selector.put("use", List.of(provider));
+        } else {
+            // Keep existing app and domain rules valid without falling back to a public exit.
+            selector.put("hidden", true);
+            selector.put("proxies", List.of("REJECT"));
+        }
+        groups.add(yaml.represent(selector));
+        setField(root, yaml, "proxy-groups", new SequenceNode(Tag.SEQ, groups, org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK));
+        StringWriter output = new StringWriter();
+        yaml.serialize(root, output);
+        byte[] merged = output.toString().getBytes(StandardCharsets.UTF_8);
+        if (merged.length > MAX_BYTES) throw new TooLarge();
+        return merged;
+    }
+
+    static String privateProviderName(byte[] source) throws IOException {
+        MappingNode root = routingRoot(source);
+        return privateProviderName(providerNames(field(root, "proxy-providers")), namedEntries(field(root, "proxy-groups")).keySet());
+    }
+
+    private static String privateProviderName(Set<String> providers, Set<String> groups) {
+        String name = "minclash-private-nodes";
+        while (providers.contains(name) || groups.contains(name)) name += "-local";
+        return name;
+    }
+
+    private static String addPrivateProvider(MappingNode root, Yaml yaml, SequenceNode nodes,
+                                             Set<String> groupNames, List<Node> groups) throws IOException {
+        Node existingProviders = field(root, "proxy-providers");
+        if (!emptyField(existingProviders) && !(existingProviders instanceof MappingNode)) {
+            throw new IOException("订阅的代理集合格式有误。");
+        }
+        Set<String> providerNames = providerNames(existingProviders);
+        String provider = privateProviderName(providerNames, groupNames);
+        List<String> originalProviders = new ArrayList<>(providerNames);
+        Collections.sort(originalProviders);
+        for (int index = 0; index < groups.size(); index++) {
+            if (!(groups.get(index) instanceof MappingNode group)) continue;
+            boolean all = enabled(group, "include-all");
+            if (!all && !enabled(group, "include-all-providers")) continue;
+            // Expand only the original providers so automatic subscription groups never select private nodes.
+            MappingNode isolated = new MappingNode(Tag.MAP, new ArrayList<>(group.getValue()), group.getFlowStyle());
+            if (all) {
+                setField(isolated, yaml, "include-all", yaml.represent(false));
+                setField(isolated, yaml, "include-all-proxies", yaml.represent(true));
+            }
+            setField(isolated, yaml, "include-all-providers", yaml.represent(false));
+            setField(isolated, yaml, "use", yaml.represent(originalProviders));
+            groups.set(index, isolated);
+        }
+
+        MappingNode inline = (MappingNode) yaml.represent(Map.of("type", "inline"));
+        setField(inline, yaml, "payload", nodes);
+        List<NodeTuple> providers = new ArrayList<>();
+        if (existingProviders instanceof MappingNode mapping) providers.addAll(mapping.getValue());
+        providers.add(new NodeTuple(yaml.represent(provider), inline));
+        setField(root, yaml, "proxy-providers", new MappingNode(Tag.MAP, providers, org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK));
+        return provider;
+    }
+
     static List<String> proxyDnsTargets(byte[] content) throws IOException {
         if (content.length > MAX_BYTES) throw new TooLarge();
         return proxyDnsTargets(routingRoot(content));
@@ -362,14 +492,19 @@ final class Profile {
 
     static List<String> protectionAliasTargets(byte[] content, String alias) throws IOException {
         if (content.length > MAX_BYTES) throw new TooLarge();
-        return protectionAliasOptions(routingRoot(content), alias).targets();
+        return protectionAliasTargets(routingRoot(content), alias);
     }
 
     static byte[] withProtectionAlias(byte[] content, String alias, String target) throws IOException {
-        if (content.length > MAX_BYTES) throw new TooLarge();
+        return withProtectionAlias(content, alias, target, content);
+    }
+
+    static byte[] withProtectionAlias(byte[] content, String alias, String target, byte[] effective) throws IOException {
+        if (content.length > MAX_BYTES || effective.length > MAX_BYTES) throw new TooLarge();
         MappingNode root = routingRoot(content);
-        ProtectionAliasOptions options = protectionAliasOptions(root, alias);
-        if (!safeAliasName(target) || !options.targets().contains(target)) {
+        // Validate against the applied groups and write the alias into the subscription source.
+        MappingNode candidate = content == effective ? root : routingRoot(effective);
+        if (!safeAliasName(target) || !protectionAliasTargets(candidate, alias).contains(target)) {
             throw new IOException("请选择新配置中可用的代理组作为防泄漏出口。");
         }
         Yaml yaml = new Yaml();
@@ -379,9 +514,14 @@ final class Profile {
         selector.put("hidden", true);
         selector.put("proxies", List.of(target));
         selector.put("empty-fallback", "REJECT");
-        List<Node> groups = new ArrayList<>(options.groups().getValue());
+        List<Node> groups = new ArrayList<>();
+        var style = org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK;
+        if (field(root, "proxy-groups") instanceof SequenceNode configured) {
+            groups.addAll(configured.getValue());
+            style = configured.getFlowStyle();
+        }
         groups.add(yaml.represent(selector));
-        setField(root, yaml, "proxy-groups", new SequenceNode(Tag.SEQ, groups, options.groups().getFlowStyle()));
+        setField(root, yaml, "proxy-groups", new SequenceNode(Tag.SEQ, groups, style));
         StringWriter output = new StringWriter();
         yaml.serialize(root, output);
         byte[] updated = output.toString().getBytes(StandardCharsets.UTF_8);
@@ -389,12 +529,10 @@ final class Profile {
         return updated;
     }
 
-    private record ProtectionAliasOptions(SequenceNode groups, List<String> targets) {}
-
-    private static ProtectionAliasOptions protectionAliasOptions(MappingNode root, String alias) throws IOException {
+    private static List<String> protectionAliasTargets(MappingNode root, String alias) throws IOException {
         if (!safeAliasName(alias)) throw new IOException("防泄漏出口名称无效。");
         if (!(field(root, "proxy-groups") instanceof SequenceNode configured)) {
-            return new ProtectionAliasOptions(null, List.of());
+            return List.of();
         }
         Map<String, MappingNode> groups = namedEntries(configured);
         Map<String, MappingNode> nodes = namedEntries(field(root, "proxies"));
@@ -412,7 +550,7 @@ final class Profile {
                 targets.add(name);
             }
         });
-        return new ProtectionAliasOptions(configured, List.copyOf(targets));
+        return List.copyOf(targets);
     }
 
     private static boolean safeAliasName(String name) {
@@ -627,10 +765,38 @@ final class Profile {
 
     private static boolean enabled(MappingNode mapping, String key) {
         if (!(field(mapping, key) instanceof ScalarNode flag)) return false;
+        if (Tag.INT.equals(flag.getTag())) return !flag.getValue().replace("_", "").matches("[+-]?(?:0[xXoObB])?0+");
         return switch (flag.getValue().toLowerCase(Locale.ROOT)) {
             case "true", "yes", "on", "y" -> true;
             default -> false;
         };
+    }
+
+    static List<String> yamlRules(byte[] source) throws IOException {
+        Node value = field(routingRoot(source), "rules");
+        if (value == null || Tag.NULL.equals(value.getTag())) return List.of();
+        if (!(value instanceof SequenceNode entries)) throw new IOException("配置中的 rules 必须是规则列表。");
+        List<String> rules = new ArrayList<>();
+        for (Node entry : entries.getValue()) {
+            if (!(entry instanceof ScalarNode rule) || !Tag.STR.equals(rule.getTag())) {
+                throw new IOException("配置中第 " + (rules.size() + 1) + " 条 YAML 规则必须是文本。");
+            }
+            rules.add(rule.getValue());
+        }
+        return rules;
+    }
+
+    static byte[] withYamlRules(byte[] source, List<String> rules) throws IOException {
+        MappingNode root = routingRoot(source);
+        Yaml yaml = new Yaml();
+        List<Node> entries = new ArrayList<>(rules.size());
+        for (String rule : rules) entries.add(yaml.represent(rule));
+        setField(root, yaml, "rules", new SequenceNode(Tag.SEQ, entries, org.yaml.snakeyaml.DumperOptions.FlowStyle.BLOCK));
+        StringWriter output = new StringWriter();
+        yaml.serialize(root, output);
+        byte[] updated = output.toString().getBytes(StandardCharsets.UTF_8);
+        if (updated.length > MAX_BYTES) throw new TooLarge();
+        return updated;
     }
 
     // Always merge into the saved subscription source, never into an earlier merged profile.
@@ -727,14 +893,18 @@ final class Profile {
         }
     }
 
-    private static MappingNode routingRoot(byte[] content) throws IOException {
+    private static LoaderOptions routingOptions() {
         LoaderOptions options = new LoaderOptions();
         options.setAllowDuplicateKeys(false);
         options.setMergeOnCompose(true);
         options.setNestingDepthLimit(40);
         options.setCodePointLimit(MAX_BYTES);
+        return options;
+    }
+
+    private static MappingNode routingRoot(byte[] content) throws IOException {
         try {
-            Node parsed = new Yaml(options).compose(new StringReader(new String(content, StandardCharsets.UTF_8)));
+            Node parsed = new Yaml(routingOptions()).compose(new StringReader(new String(content, StandardCharsets.UTF_8)));
             if (!(parsed instanceof MappingNode root)) throw new IOException("无法读取当前配置。");
             keysOf(root);
             return root;
